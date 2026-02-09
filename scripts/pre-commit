@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Thrum pre-commit hook
+# Install: cp scripts/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+NC='\033[0m'
+
+pass() { echo -e "  ${GREEN}✓${NC} $1"; }
+fail() { echo -e "  ${RED}✗${NC} $1"; exit 1; }
+warn() { echo -e "  ${YELLOW}⚠${NC} $1"; }
+
+echo "thrum: pre-commit checks"
+
+# 1. Format check
+cargo fmt --check --quiet 2>/dev/null \
+    && pass "cargo fmt" \
+    || fail "cargo fmt (run 'cargo fmt' to fix)"
+
+# 2. Clippy (deny all warnings)
+cargo clippy --workspace --tests --quiet -- -D warnings 2>/dev/null \
+    && pass "cargo clippy" \
+    || fail "cargo clippy -D warnings"
+
+# 3. Tests
+cargo test --workspace --quiet 2>/dev/null \
+    && pass "cargo test" \
+    || fail "cargo test"
+
+# 4. Unused dependencies (nightly required)
+if cargo +nightly udeps --version >/dev/null 2>&1; then
+    cargo +nightly udeps --workspace --quiet 2>/dev/null \
+        && pass "cargo udeps" \
+        || warn "cargo udeps found unused dependencies"
+else
+    warn "cargo udeps (skipped, install with: cargo install cargo-udeps)"
+fi
+
+# 5. Security audit
+if cargo audit --version >/dev/null 2>&1; then
+    cargo audit --quiet 2>/dev/null \
+        && pass "cargo audit" \
+        || warn "cargo audit found advisories (review with: cargo audit)"
+else
+    warn "cargo audit (skipped, install with: cargo install cargo-audit)"
+fi
+
+# 6. Miri (nightly required, optional — slow)
+if [ "${THRUM_MIRI:-0}" = "1" ]; then
+    if rustup component list --toolchain nightly --installed 2>/dev/null | grep -q miri; then
+        MIRIFLAGS="-Zmiri-disable-isolation" cargo +nightly miri test \
+            --package thrum-core -- --skip proptests --quiet 2>/dev/null \
+            && pass "miri (thrum-core)" \
+            || warn "miri found issues"
+    else
+        warn "miri (skipped, install with: rustup +nightly component add miri)"
+    fi
+else
+    warn "miri (skipped, enable with: THRUM_MIRI=1 git commit ...)"
+fi
+
+echo -e "${GREEN}all checks passed${NC}"

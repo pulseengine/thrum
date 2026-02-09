@@ -1,0 +1,88 @@
+# Minimal pipeline configuration.
+#
+# Only Gate 1 (quality) is enabled. Gates 2 and 3 are disabled.
+# Copy to configs/pipeline.toml:
+#   cp examples/minimal/pipeline.toml configs/pipeline.toml
+
+[gates.quality]
+description = "Gate 1: Code quality (fmt, clippy, test)"
+checks = ["cargo_fmt", "cargo_clippy", "cargo_test"]
+required = true
+
+[gates.proof]
+description = "Gate 2: Formal verification"
+checks = []
+required = false
+
+[gates.integration]
+description = "Gate 3: Integration testing"
+required = false
+
+[release]
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+]
+
+[release.artifacts]
+verification_report = true
+test_report = true
+checksums = "sha256"
+
+[budget]
+ceiling_usd = 1000.0
+per_session_timeout_secs = 300
+
+[budget.allocation]
+implementation_opus = 600.0
+planning_opus = 100.0
+reviews_sonnet = 100.0
+integration_sonnet = 100.0
+buffer = 100.0
+
+[[backends]]
+name = "claude-code"
+type = "agent"
+command = "claude"
+prompt_args = ["-p", "{prompt}", "--output-format", "json"]
+model = "claude-opus-4-6"
+enabled = true
+
+[[backends]]
+name = "anthropic-api"
+type = "chat"
+provider = "anthropic"
+model = "claude-sonnet-4-5-20250929"
+api_key_env = "ANTHROPIC_API_KEY"
+enabled = true
+
+[roles.implementer]
+backend = "opus"
+prompt_template = "agents/implementer.md"
+budget_usd = 6.0
+timeout_secs = 600
+
+[roles.reviewer]
+backend = "sonnet"
+prompt_template = "agents/reviewer.md"
+budget_usd = 1.0
+timeout_secs = 300
+
+[roles.planner]
+backend = "opus"
+prompt_template = "agents/planner.md"
+budget_usd = 1.0
+timeout_secs = 300
+
+[sandbox]
+backend = "none"
+memory_limit_mb = 4096
+cpu_limit = 2.0
+network = false
+
+[subsample]
+enabled = false
+gate1_ratio = 1.0
+gate2_ratio = 1.0
+gate3_ratio = 1.0
+seed_strategy = "task-id"

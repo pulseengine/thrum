@@ -1,0 +1,86 @@
+IEC 62304 Compliance
+====================
+
+PulseEngine can target IEC 62304 (Medical Device Software Lifecycle Processes)
+for medical device applications where the toolchain compiles safety-critical
+software.
+
+Software Safety Classification
+-------------------------------
+
+.. list-table::
+   :header-rows: 1
+
+   * - Class
+     - Hazard
+     - Required Activities
+   * - Class A
+     - No injury possible
+     - Planning, requirements, release, maintenance
+   * - Class B
+     - Non-serious injury
+     - + Architecture, integration testing, system testing
+   * - Class C
+     - Serious injury/death
+     - + Detailed design, unit verification, full risk management
+
+SOUP Management (§8.1.2)
+--------------------------
+
+IEC 62304 requires tracking of all Software of Unknown Provenance:
+
+.. list-table::
+   :header-rows: 1
+
+   * - SOUP Item
+     - Version
+     - Safety Relevance
+     - Known Anomalies
+   * - wasmparser
+     - 0.241 (loom) / 0.219 (synth, meld)
+     - Yes: parsing affects correctness
+     - Version drift across repos
+   * - z3
+     - 0.19
+     - Yes: verification correctness
+     - Forked version in loom (WASI support)
+   * - libgit2
+     - 0.19 (via git2)
+     - No: tooling only
+     - None relevant
+
+Process Mapping
+---------------
+
+The automator's pipeline maps to IEC 62304 lifecycle processes:
+
+.. list-table::
+   :header-rows: 1
+
+   * - IEC 62304 Process
+     - Automator Stage
+     - Output
+   * - §5.1 Development planning
+     - Planner agent
+     - Task queue with priorities
+   * - §5.2 Requirements analysis
+     - Task creation with acceptance criteria
+     - ``req`` needs
+   * - §5.3 Architectural design
+     - Planner architecture decisions
+     - ``arch`` needs
+   * - §5.4 Detailed design
+     - Implementer agent
+     - ``design`` needs
+   * - §5.5 Unit implementation
+     - Implementer agent
+     - ``impl`` needs
+   * - §5.6 Software verification
+     - Gate 1 + Gate 2
+     - ``utest``, ``proof`` needs
+   * - §5.7 Integration testing
+     - Gate 3
+     - ``itest`` needs
+   * - §5.8 Release
+     - Release pipeline
+     - ``rel`` needs

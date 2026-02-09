@@ -1,0 +1,124 @@
+# PulseEngine Safety Configuration
+# ISO 26262 Part 8 tool classification + OSS/SOUP tracking
+
+[[tools]]
+name = "loom"
+ti = "Ti2"      # Optimizer can introduce semantic errors
+td = "Td2"      # Z3 verification + downstream synth checking = medium detection
+is_oss = true
+repository_url = "https://github.com/example/loom"
+license = "Apache-2.0"
+
+[tools.classification]
+automotive = "AsilB"
+
+[[tools.use_cases]]
+description = "Optimize WebAssembly modules for size and performance"
+lifecycle_phase = "SWE.3"
+output_description = "Optimized WASM binary with preserved semantics"
+detection_measures = [
+    "Z3 SMT verification of each transformation",
+    "Differential testing (before/after comparison)",
+    "Dogfooding (loom optimizes itself)",
+    "Downstream synth verification",
+]
+
+[[tools]]
+name = "synth"
+ti = "Ti2"      # Code generator produces final binary
+td = "Td3"      # Last in chain, limited downstream detection
+is_oss = false
+repository_url = "https://github.com/example/synth"
+license = "Proprietary"
+
+[tools.classification]
+automotive = "AsilD"
+
+[[tools.use_cases]]
+description = "Synthesize ARM native code from WebAssembly"
+lifecycle_phase = "SWE.3"
+output_description = "ARM ELF binary (Cortex-M / AArch64)"
+detection_measures = [
+    "Z3 verification: WASM semantics ≡ ARM semantics per instruction",
+    "QEMU emulation testing",
+    "Renode hardware simulation",
+]
+
+[[tools]]
+name = "meld"
+ti = "Ti2"      # Fuser transforms component structure
+td = "Td2"      # loom verification downstream = medium detection
+is_oss = true
+repository_url = "https://github.com/example/meld"
+license = "Apache-2.0"
+
+[tools.classification]
+automotive = "Qm"
+
+[[tools.use_cases]]
+description = "Fuse WebAssembly components into single core module"
+lifecycle_phase = "SWE.3"
+output_description = "Single-module WASM with canonical ABI trampolines"
+detection_measures = [
+    "Rocq formal proofs of merge correctness",
+    "Property-based testing (proptest)",
+    "wasm-tools validate on output",
+    "Downstream loom optimization + Z3 verification",
+]
+
+# ─── SOUP Items (IEC 62304 §8.1.2) ─────────────────────────────────────
+
+[[soup_items]]
+name = "wasmparser"
+version = "0.241"
+manufacturer = "Bytecode Alliance"
+unique_id = "crates.io/wasmparser/0.241"
+requirements = [
+    "Parse all valid WebAssembly 1.0 and 2.0 binaries",
+    "Reject malformed binaries with clear errors",
+]
+compatibility = [
+    "Rust edition 2021+",
+    "wasm32-wasip2 target support",
+]
+
+[[soup_items]]
+name = "z3"
+version = "0.19"
+manufacturer = "Microsoft Research"
+unique_id = "crates.io/z3/0.19"
+requirements = [
+    "Sound SMT solving for QF_BV (quantifier-free bitvector) theory",
+    "Correct satisfiability/unsatisfiability determination",
+]
+compatibility = [
+    "Z3 system library 4.12+",
+    "macOS ARM and Linux x86_64",
+]
+
+[[soup_items]]
+name = "git2"
+version = "0.19"
+manufacturer = "rust-lang community"
+unique_id = "crates.io/git2/0.19"
+requirements = [
+    "Correct git operations (branch, merge, diff)",
+    "Consistent with CLI git behavior",
+]
+compatibility = [
+    "libgit2 1.8+",
+    "OpenSSL or LibreSSL for HTTPS",
+]
+
+[[soup_items]]
+name = "redb"
+version = "2"
+manufacturer = "Christopher Berner"
+unique_id = "crates.io/redb/2"
+requirements = [
+    "ACID transactions for task persistence",
+    "Crash recovery without data loss",
+]
+compatibility = [
+    "Pure Rust, no system dependencies",
+]

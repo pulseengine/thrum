@@ -1,0 +1,13 @@
+# Minimal single-repo configuration example.
+#
+# Copy to configs/repos.toml and customize paths and commands for your project:
+#   cp examples/minimal/repos.toml configs/repos.toml
+
+[[repo]]
+name = "my-project"
+path = "/path/to/my-project"
+build_cmd = "cargo build"
+test_cmd = "cargo test"
+lint_cmd = "cargo clippy -- -D warnings"
+fmt_cmd = "cargo fmt -- --check"
+# claude_md = "/path/to/my-project/CLAUDE.md"

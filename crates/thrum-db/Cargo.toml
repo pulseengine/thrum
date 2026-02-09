@@ -1,0 +1,24 @@
+[package]
+name = "thrum-db"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thrum-core = { workspace = true }
+redb = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+loom = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "task_store"
+harness = false

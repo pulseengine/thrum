@@ -1,0 +1,25 @@
+[package]
+name = "thrum-runner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thrum-core = { workspace = true }
+thrum-db = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+async-trait = { workspace = true }
+reqwest = { workspace = true }
+async-openai = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+git2 = { workspace = true }
+redb = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+bollard = { workspace = true }
+toml = { workspace = true }
+futures-util = { workspace = true }

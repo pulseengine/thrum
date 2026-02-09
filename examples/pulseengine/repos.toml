@@ -1,0 +1,42 @@
+# PulseEngine toolchain repository configuration.
+#
+# Three repos forming the meld -> loom -> synth pipeline:
+#   meld:  WASM component fusion
+#   loom:  WASM optimization (ASIL B safety target)
+#   synth: Native compilation (ASIL D safety target)
+#
+# Copy to configs/repos.toml to use:
+#   cp examples/pulseengine/repos.toml configs/repos.toml
+
+[[repo]]
+name = "Loom"
+path = "/Users/r/git/loom"
+build_cmd = "cargo build --release"
+test_cmd = "cargo test --release"
+lint_cmd = "cargo clippy -- -D warnings"
+fmt_cmd = "cargo fmt -- --check"
+verify_cmd = "LIBRARY_PATH=/opt/homebrew/lib cargo test --release -- z3"
+proofs_cmd = "bazel build //proofs:all_proofs"
+claude_md = "/Users/r/git/loom/CLAUDE.md"
+safety_target = "AsilB"
+
+[[repo]]
+name = "Meld"
+path = "/Users/r/git/unkown-project"
+build_cmd = "cargo build --release"
+test_cmd = "cargo test"
+lint_cmd = "cargo clippy -- -D warnings"
+fmt_cmd = "cargo fmt -- --check"
+proofs_cmd = "bazel build //proofs:all_proofs"
+claude_md = "/Users/r/git/unkown-project/CLAUDE.md"
+
+[[repo]]
+name = "Synth"
+path = "/Users/r/git/Synth"
+build_cmd = "cargo build --release"
+test_cmd = "cargo test"
+lint_cmd = "cargo clippy -- -D warnings"
+fmt_cmd = "cargo fmt -- --check"
+verify_cmd = "cargo test --release -- z3"
+claude_md = "/Users/r/git/Synth/CLAUDE.md"
+safety_target = "AsilD"

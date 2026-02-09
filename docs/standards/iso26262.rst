@@ -1,0 +1,71 @@
+ISO 26262 Compliance
+====================
+
+PulseEngine targets ISO 26262 (Road Vehicles — Functional Safety)
+for automotive applications.
+
+Relevant Parts
+--------------
+
+**Part 6: Product development at the software level**
+
+.. list-table::
+   :header-rows: 1
+
+   * - Clause
+     - Activity
+     - Automator Coverage
+   * - 6.7
+     - Software architectural design
+     - Planner agent → ``arch`` needs
+   * - 6.8
+     - Software unit design and implementation
+     - Implementer agent → ``impl`` needs
+   * - 6.9
+     - Software unit verification
+     - Gate 1 + Gate 2 → ``utest``, ``proof`` needs
+   * - 6.10
+     - Software integration and verification
+     - Gate 3 → ``itest`` needs
+   * - 6.11
+     - Software qualification testing
+     - Release pipeline → ``verif`` needs
+
+**Part 8: Supporting processes — Tool qualification**
+
+.. list-table::
+   :header-rows: 1
+
+   * - Clause
+     - Activity
+     - Automator Coverage
+   * - 8.11
+     - Confidence in use of software tools
+     - ``safety.rs`` TCL determination
+   * - 8.12
+     - Qualification of software components
+     - ``safety.rs`` OSS qualification records
+
+ASIL Decomposition
+------------------
+
+The toolchain safety targets:
+
+- **synth** (ASIL D): Generates final binary. Full qualification required.
+- **loom** (ASIL B): Optimization. ASIL decomposition from ASIL D with
+  synth providing independent verification.
+- **meld** (QM): Supporting tool. Qualification for tool confidence only.
+
+Traceability Requirements
+-------------------------
+
+ISO 26262-6 requires bidirectional traceability between:
+
+1. Software safety requirements ↔ Software architectural design
+2. Software architectural design ↔ Software units
+3. Software units ↔ Software unit verification
+4. Software safety requirements ↔ Software integration verification
+5. Software safety requirements ↔ Software qualification test
+
+The automator's sphinx-needs export provides this via the ``links`` field
+on each need, creating a complete traceability graph.
