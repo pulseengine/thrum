@@ -185,7 +185,9 @@ impl TaskStatus {
     pub fn is_claimable_retry(&self) -> bool {
         matches!(
             self,
-            TaskStatus::Gate1Failed { .. } | TaskStatus::Gate2Failed { .. }
+            TaskStatus::Gate1Failed { .. }
+                | TaskStatus::Gate2Failed { .. }
+                | TaskStatus::Rejected { .. }
         )
     }
 
