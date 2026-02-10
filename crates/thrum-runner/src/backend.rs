@@ -230,6 +230,7 @@ pub fn build_registry_from_config(
                     let mut backend =
                         crate::claude::ClaudeCliBackend::new(default_cwd.to_path_buf());
                     backend.timeout = timeout;
+                    backend.skip_permissions = true; // Required for non-interactive automation
                     registry.register(Box::new(backend));
                 } else if let Some(ref command) = cfg.command {
                     let prompt_args = cfg
