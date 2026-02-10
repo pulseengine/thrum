@@ -1,41 +1,12 @@
 # repos.toml -- Repository configuration for the Thrum engine.
 #
-# Define one or more [[repo]] entries for the repositories you want to manage.
-# Each repo needs at minimum: name, path, build_cmd, test_cmd, lint_cmd, fmt_cmd.
-# Optional fields: verify_cmd, proofs_cmd, claude_md, safety_target.
-#
-# For a working multi-repo example, see examples/pulseengine/repos.toml.
-# For a minimal single-repo setup, see examples/minimal/repos.toml.
+# Thrum manages itself. Bootstrap configuration.
 
 [[repo]]
-name = "my-project"
-path = "/path/to/my-project"
+name = "thrum"
+path = "/Users/r/git/automator"
 build_cmd = "cargo build"
 test_cmd = "cargo test"
-lint_cmd = "cargo clippy -- -D warnings"
+lint_cmd = "cargo clippy --workspace --tests -- -D warnings"
 fmt_cmd = "cargo fmt -- --check"
-
-# Optional: formal verification command (e.g., Z3 solver tests)
-# verify_cmd = "cargo test --release -- z3"
-
-# Optional: proof build command (e.g., Rocq/Coq, Bazel proofs)
-# proofs_cmd = "bazel build //proofs:all_proofs"
-
-# Optional: path to the repo's CLAUDE.md for agent prompt embedding
-# claude_md = "/path/to/my-project/CLAUDE.md"
-
-# Optional: functional safety target (AsilA, AsilB, AsilC, AsilD)
-# safety_target = "AsilB"
-
-# ── Additional repos ──────────────────────────────────────────────────
-#
-# [[repo]]
-# name = "another-project"
-# path = "/path/to/another-project"
-# build_cmd = "cargo build --release"
-# test_cmd = "cargo test --release"
-# lint_cmd = "cargo clippy -- -D warnings"
-# fmt_cmd = "cargo fmt -- --check"
-# verify_cmd = "cargo test --release -- z3"
-# claude_md = "/path/to/another-project/CLAUDE.md"
-# safety_target = "AsilD"
+claude_md = "/Users/r/git/automator/CLAUDE.md"
