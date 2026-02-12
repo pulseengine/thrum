@@ -8,4 +8,5 @@ pub mod openai_compat;
 pub mod parallel;
 pub mod sandbox;
 pub mod subprocess;
+pub mod watcher;
 pub mod worktree;

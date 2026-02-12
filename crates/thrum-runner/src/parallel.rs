@@ -348,13 +348,36 @@ fn unclaim_task(db: &redb::Database, task: &Task, category: ClaimCategory) -> Re
 ///
 /// This is the per-agent entrypoint, called from within a spawned tokio task.
 /// It delegates to the appropriate pipeline function based on claim category.
+///
+/// A [`FileWatcher`](crate::watcher::FileWatcher) is started on the repo
+/// working directory before the pipeline runs and stopped when it completes.
 async fn run_agent_task(ctx: &PipelineContext, task: Task, category: ClaimCategory) -> Result<()> {
     let task_store = TaskStore::new(&ctx.db);
     let gate_store = thrum_db::gate_store::GateStore::new(&ctx.db);
 
     let roles_ref = ctx.roles.as_deref();
 
-    match category {
+    // Start file watcher for real-time change detection
+    let agent_id = AgentId::generate(&task.repo, &task.id);
+    let repo_config = ctx.repos_config.get(&task.repo);
+    let watcher = if let Some(rc) = repo_config {
+        match crate::watcher::FileWatcher::start(
+            rc.path.clone(),
+            agent_id,
+            task.id.clone(),
+            ctx.event_bus.clone(),
+        ) {
+            Ok(w) => Some(w),
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to start file watcher, continuing without it");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let result = match category {
         ClaimCategory::RetryableFailed => {
             crate::parallel::pipeline::retry_task_pipeline(
                 &task_store,
@@ -395,7 +418,14 @@ async fn run_agent_task(ctx: &PipelineContext, task: Task, category: ClaimCatego
             )
             .await
         }
+    };
+
+    // Stop the file watcher now that the pipeline is done.
+    if let Some(w) = watcher {
+        w.stop().await;
     }
+
+    result
 }
 
 /// Pipeline functions extracted for sharing between sequential and parallel paths.
