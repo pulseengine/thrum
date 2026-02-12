@@ -176,6 +176,14 @@ impl TaskStatus {
         matches!(self, TaskStatus::AwaitingApproval { .. })
     }
 
+    /// Whether this task has a reviewable diff (in Reviewing or AwaitingApproval).
+    pub fn is_reviewable(&self) -> bool {
+        matches!(
+            self,
+            TaskStatus::Reviewing { .. } | TaskStatus::AwaitingApproval { .. }
+        )
+    }
+
     /// Whether this status is claimable as a new pending task.
     pub fn is_claimable_pending(&self) -> bool {
         matches!(self, TaskStatus::Pending)
