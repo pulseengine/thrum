@@ -280,6 +280,9 @@ struct PipelineConfig {
     /// Budget configuration for AI spending limits.
     #[serde(default)]
     budget: BudgetConfig,
+    /// Test subsampling: run a fraction of tests at Gate 1 for speed.
+    #[serde(default)]
+    subsample: Option<thrum_core::subsample::SubsampleConfig>,
 }
 
 /// Budget configuration from [budget] section in pipeline.toml.
@@ -434,6 +437,7 @@ async fn cmd_run_parallel(
             .as_ref()
             .map(|g| g.steps.clone())
             .unwrap_or_default(),
+        subsample: pipeline.subsample,
     });
 
     let config = EngineConfig {
@@ -495,6 +499,7 @@ async fn cmd_run(
         .as_ref()
         .map(|g| g.steps.clone())
         .unwrap_or_default();
+    let subsample = pipeline.subsample;
 
     // Load or create budget tracker
     let budget_tracker = {
@@ -535,6 +540,7 @@ async fn cmd_run(
                 &registry,
                 &event_bus,
                 &budget,
+                subsample.as_ref(),
                 task,
             )
             .await;
@@ -611,6 +617,7 @@ async fn cmd_run(
             None,
             &event_bus,
             &budget,
+            subsample.as_ref(),
             task,
         )
         .await;
@@ -820,17 +827,18 @@ async fn cmd_release(
     }
 
     // Step 2: Run all gates and collect reports
+    // Release gates always run at full coverage (no subsampling).
     let mut gate_reports = Vec::new();
     for repo in &repos_config.repo {
         println!("\nRunning gates for {}...", repo.name);
-        let g1 = run_gate(&GateLevel::Quality, repo)?;
+        let g1 = run_gate(&GateLevel::Quality, repo, None, None)?;
         println!(
             "  Gate 1 (Quality): {}",
             if g1.passed { "PASS" } else { "FAIL" }
         );
         gate_reports.push(serde_json::to_value(&g1)?);
 
-        let g2 = run_gate(&GateLevel::Proof, repo)?;
+        let g2 = run_gate(&GateLevel::Proof, repo, None, None)?;
         println!(
             "  Gate 2 (Proof): {}",
             if g2.passed { "PASS" } else { "FAIL" }
