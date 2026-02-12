@@ -2,6 +2,9 @@
 //! (OpenClawed, Telegram bots, CI/CD webhooks).
 //!
 //! Built with axum for async HTTP serving.
+//! Includes an embedded HTMX-powered dashboard at `/dashboard`.
+
+mod dashboard;
 
 use axum::{
     Json, Router,
@@ -30,11 +33,17 @@ impl ApiState {
     fn db(&self) -> Result<redb::Database, AppError> {
         thrum_db::open_db(&self.db_path).map_err(AppError::Internal)
     }
+
+    /// Open the database for dashboard handlers.
+    fn db_dashboard(&self) -> Result<redb::Database, anyhow::Error> {
+        thrum_db::open_db(&self.db_path)
+    }
 }
 
-/// Build the axum router with all API routes.
+/// Build the axum router with all API routes and the embedded dashboard.
 pub fn api_router(state: Arc<ApiState>) -> Router {
     Router::new()
+        // JSON API
         .route("/api/v1/health", get(health_check))
         .route("/api/v1/status", get(status))
         .route("/api/v1/tasks", get(list_tasks).post(create_task))
@@ -42,6 +51,8 @@ pub fn api_router(state: Arc<ApiState>) -> Router {
         .route("/api/v1/tasks/{id}/approve", post(approve_task))
         .route("/api/v1/tasks/{id}/reject", post(reject_task))
         .route("/api/v1/traces", get(list_traces))
+        // Embedded web dashboard
+        .merge(dashboard::dashboard_router())
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
         .with_state(state)
@@ -52,6 +63,7 @@ pub async fn serve(state: Arc<ApiState>, bind_addr: &str) -> anyhow::Result<()> 
     let app = api_router(state);
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     tracing::info!(%bind_addr, "starting API server");
+    tracing::info!("dashboard available at http://{bind_addr}/dashboard");
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -372,5 +384,153 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn dashboard_serves_html() {
+        let (state, _dir) = test_state();
+        let app = api_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/dashboard")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("Thrum Dashboard"));
+        assert!(html.contains("htmx.org"));
+    }
+
+    #[tokio::test]
+    async fn dashboard_css_served() {
+        let (state, _dir) = test_state();
+        let app = api_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/dashboard/assets/style.css")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let ct = response.headers().get("content-type").unwrap();
+        assert_eq!(ct, "text/css; charset=utf-8");
+    }
+
+    #[tokio::test]
+    async fn dashboard_status_partial() {
+        let (state, _dir) = test_state();
+        let app = api_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/dashboard/partials/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("status-grid"));
+        assert!(html.contains("Pending"));
+    }
+
+    #[tokio::test]
+    async fn dashboard_tasks_partial_empty() {
+        let (state, _dir) = test_state();
+        let app = api_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/dashboard/partials/tasks")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("No tasks in queue"));
+    }
+
+    #[tokio::test]
+    async fn dashboard_tasks_partial_with_tasks() {
+        let (state, _dir) = test_state();
+
+        // Insert a task directly
+        {
+            let db = thrum_db::open_db(&state.db_path).unwrap();
+            let store = TaskStore::new(&db);
+            let task = Task::new(RepoName::new("loom"), "Test task".into(), "desc".into());
+            store.insert(task).unwrap();
+        }
+
+        let app = api_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/dashboard/partials/tasks")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("task-table"));
+        assert!(html.contains("loom"));
+        assert!(html.contains("Test task"));
+        assert!(html.contains("pending"));
+    }
+
+    #[tokio::test]
+    async fn dashboard_activity_partial_empty() {
+        let (state, _dir) = test_state();
+        let app = api_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/dashboard/partials/activity")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("No activity yet"));
     }
 }
