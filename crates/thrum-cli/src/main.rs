@@ -21,10 +21,31 @@ use thrum_runner::claude::{ClaudeCliBackend, load_agent_prompt};
 use thrum_runner::parallel::{EngineConfig, PipelineContext};
 use tokio_util::sync::CancellationToken;
 
+/// Build version string including git commit and dirty state.
+fn long_version() -> &'static str {
+    const VERSION: &str = env!("CARGO_PKG_VERSION");
+    const COMMIT: &str = env!("THRUM_GIT_COMMIT");
+    const BRANCH: &str = env!("THRUM_GIT_BRANCH");
+    const DIRTY: &str = env!("THRUM_GIT_DIRTY");
+    const BUILD_TIME: &str = env!("THRUM_BUILD_TIME");
+
+    // Use a static OnceLock to build the string once
+    use std::sync::OnceLock;
+    static VERSION_STRING: OnceLock<String> = OnceLock::new();
+    VERSION_STRING.get_or_init(|| {
+        if DIRTY == "clean" {
+            format!("{VERSION} ({COMMIT} {BRANCH}) built {BUILD_TIME}")
+        } else {
+            format!("{VERSION} ({COMMIT} {BRANCH} {DIRTY}) built {BUILD_TIME}")
+        }
+    })
+}
+
 #[derive(Parser)]
 #[command(
     name = "thrum",
-    about = "Autonomous AI-driven development orchestrator"
+    about = "Autonomous AI-driven development orchestrator",
+    long_version = long_version(),
 )]
 struct Cli {
     /// Path to the database file.
