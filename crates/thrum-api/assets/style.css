@@ -1,0 +1,372 @@
+/* Thrum Dashboard — embedded CSS */
+
+:root {
+    --bg: #0f1117;
+    --surface: #1a1d27;
+    --surface-raised: #242836;
+    --border: #2e3345;
+    --text: #e1e4ed;
+    --text-muted: #8b90a0;
+    --accent: #6c8cff;
+    --accent-dim: #4a5a8a;
+    --green: #4ade80;
+    --red: #f87171;
+    --amber: #fbbf24;
+    --cyan: #22d3ee;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+    font-family: ui-monospace, 'Cascadia Code', 'Fira Code', monospace;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.6;
+    font-size: 14px;
+}
+
+.container {
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 24px 20px;
+}
+
+/* ── Header ────────────────────────────────── */
+
+header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding-bottom: 20px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 24px;
+}
+
+header h1 {
+    font-size: 20px;
+    font-weight: 600;
+    color: var(--accent);
+    letter-spacing: 0.5px;
+}
+
+header .version {
+    color: var(--text-muted);
+    font-size: 12px;
+}
+
+/* ── Status Counts ─────────────────────────── */
+
+.status-grid {
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+    margin-bottom: 24px;
+}
+
+.status-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px 20px;
+    min-width: 120px;
+    text-align: center;
+}
+
+.status-card .count {
+    font-size: 28px;
+    font-weight: 700;
+}
+
+.status-card .label {
+    font-size: 11px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    margin-top: 2px;
+}
+
+.status-card.pending .count     { color: var(--text-muted); }
+.status-card.active .count      { color: var(--cyan); }
+.status-card.approval .count    { color: var(--amber); }
+.status-card.merged .count      { color: var(--green); }
+.status-card.failed .count      { color: var(--red); }
+
+/* ── Section ───────────────────────────────── */
+
+.section {
+    margin-bottom: 24px;
+}
+
+.section h2 {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+    margin-bottom: 12px;
+}
+
+/* ── Task Table ────────────────────────────── */
+
+.task-table {
+    width: 100%;
+    border-collapse: collapse;
+    background: var(--surface);
+    border-radius: 8px;
+    overflow: hidden;
+    border: 1px solid var(--border);
+}
+
+.task-table th,
+.task-table td {
+    padding: 10px 14px;
+    text-align: left;
+    border-bottom: 1px solid var(--border);
+}
+
+.task-table th {
+    background: var(--surface-raised);
+    font-size: 11px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    font-weight: 600;
+}
+
+.task-table tr:last-child td {
+    border-bottom: none;
+}
+
+.task-table tr:hover td {
+    background: var(--surface-raised);
+}
+
+.task-id {
+    color: var(--accent);
+    font-weight: 600;
+}
+
+/* ── Status Badges ─────────────────────────── */
+
+.badge {
+    display: inline-block;
+    padding: 2px 10px;
+    border-radius: 12px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+}
+
+.badge-pending           { background: #2a2d3a; color: var(--text-muted); }
+.badge-claimed           { background: #1a2a3a; color: #60a5fa; }
+.badge-implementing      { background: #1a2a3a; color: var(--cyan); }
+.badge-reviewing         { background: #2a2a1a; color: var(--amber); }
+.badge-awaiting-approval { background: #2a2a1a; color: var(--amber); border: 1px solid var(--amber); }
+.badge-approved          { background: #1a2a1a; color: var(--green); }
+.badge-integrating       { background: #1a2a2a; color: var(--cyan); }
+.badge-merged            { background: #1a2a1a; color: var(--green); border: 1px solid var(--green); }
+.badge-gate1-failed,
+.badge-gate2-failed,
+.badge-gate3-failed      { background: #2a1a1a; color: var(--red); }
+.badge-rejected          { background: #2a1a1a; color: var(--red); border: 1px solid var(--red); }
+
+/* ── Action Buttons ────────────────────────── */
+
+.actions {
+    display: flex;
+    gap: 6px;
+}
+
+.btn {
+    padding: 4px 12px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-size: 12px;
+    font-family: inherit;
+    cursor: pointer;
+    transition: all 0.15s;
+    background: var(--surface-raised);
+    color: var(--text);
+}
+
+.btn:hover {
+    border-color: var(--accent);
+}
+
+.btn-approve {
+    border-color: var(--green);
+    color: var(--green);
+}
+
+.btn-approve:hover {
+    background: var(--green);
+    color: var(--bg);
+}
+
+.btn-reject {
+    border-color: var(--red);
+    color: var(--red);
+}
+
+.btn-reject:hover {
+    background: var(--red);
+    color: var(--bg);
+}
+
+/* ── Activity Log ──────────────────────────── */
+
+.activity-log {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px;
+    max-height: 300px;
+    overflow-y: auto;
+    font-size: 12px;
+}
+
+.log-entry {
+    padding: 4px 0;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    gap: 12px;
+}
+
+.log-entry:last-child {
+    border-bottom: none;
+}
+
+.log-time {
+    color: var(--text-muted);
+    white-space: nowrap;
+    flex-shrink: 0;
+}
+
+.log-level {
+    font-weight: 600;
+    width: 48px;
+    flex-shrink: 0;
+}
+
+.log-level.info  { color: var(--cyan); }
+.log-level.warn  { color: var(--amber); }
+.log-level.error { color: var(--red); }
+.log-level.debug { color: var(--text-muted); }
+
+.log-message {
+    color: var(--text);
+    word-break: break-word;
+}
+
+.log-target {
+    color: var(--accent-dim);
+    margin-left: auto;
+    white-space: nowrap;
+    flex-shrink: 0;
+    font-size: 11px;
+}
+
+/* ── Empty State ───────────────────────────── */
+
+.empty {
+    text-align: center;
+    color: var(--text-muted);
+    padding: 32px;
+    font-style: italic;
+}
+
+/* ── Reject Modal ──────────────────────────── */
+
+.modal-backdrop {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.6);
+    z-index: 100;
+    align-items: center;
+    justify-content: center;
+}
+
+.modal-backdrop.active {
+    display: flex;
+}
+
+.modal {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 24px;
+    width: 420px;
+    max-width: 90vw;
+}
+
+.modal h3 {
+    font-size: 16px;
+    margin-bottom: 12px;
+    color: var(--text);
+}
+
+.modal textarea {
+    width: 100%;
+    min-height: 100px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px;
+    color: var(--text);
+    font-family: inherit;
+    font-size: 13px;
+    resize: vertical;
+    margin-bottom: 14px;
+}
+
+.modal textarea:focus {
+    outline: none;
+    border-color: var(--accent);
+}
+
+.modal-actions {
+    display: flex;
+    gap: 8px;
+    justify-content: flex-end;
+}
+
+/* ── HTMX Indicator ───────────────────────── */
+
+.htmx-indicator {
+    display: none;
+}
+
+.htmx-request .htmx-indicator,
+.htmx-request.htmx-indicator {
+    display: inline-block;
+}
+
+.pulse {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--accent);
+    display: inline-block;
+    animation: pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes pulse {
+    0%, 100% { opacity: 0.3; }
+    50% { opacity: 1; }
+}
+
+/* ── Scrollbar ─────────────────────────────── */
+
+::-webkit-scrollbar {
+    width: 6px;
+}
+
+::-webkit-scrollbar-track {
+    background: var(--bg);
+}
+
+::-webkit-scrollbar-thumb {
+    background: var(--border);
+    border-radius: 3px;
+}

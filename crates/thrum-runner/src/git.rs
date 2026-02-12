@@ -125,13 +125,12 @@ impl GitRepo {
         Ok(patch)
     }
 
-    /// Merge the current branch into the default branch.
-    pub fn merge_to_main(&self) -> Result<String> {
-        let current = self.current_branch()?;
+    /// Merge the named branch into the default branch.
+    pub fn merge_branch_to_main(&self, branch: &str) -> Result<String> {
         let main = self.default_branch()?;
 
         // Get the commit to merge
-        let branch_ref = format!("refs/heads/{current}");
+        let branch_ref = format!("refs/heads/{branch}");
         let branch_commit = self.repo.revparse_single(&branch_ref)?.peel_to_commit()?;
         let annotated = self.repo.find_annotated_commit(branch_commit.id())?;
 
@@ -148,7 +147,7 @@ impl GitRepo {
         let tree_id = self.repo.index()?.write_tree()?;
         let tree = self.repo.find_tree(tree_id)?;
 
-        let merge_msg = format!("Merge branch '{current}' into {main}");
+        let merge_msg = format!("Merge branch '{branch}' into {main}");
         let oid = self.repo.commit(
             Some("HEAD"),
             &sig,

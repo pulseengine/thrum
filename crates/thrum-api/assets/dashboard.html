@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Thrum Dashboard</title>
+    <link rel="stylesheet" href="/dashboard/assets/style.css">
+    <script src="https://unpkg.com/htmx.org@2.0.4"
+            integrity="sha384-HGfztofotfshcF7+8n44JQL2oJmowVChPTg48S+jvZoztPfvwD79OC/LTtG6dMp+"
+            crossorigin="anonymous"></script>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>thrum</h1>
+            <div class="version">
+                <span class="htmx-indicator pulse" id="poll-indicator"></span>
+                dashboard
+            </div>
+        </header>
+
+        <!-- Status Counts — polls every 5s -->
+        <div id="status-counts"
+             hx-get="/dashboard/partials/status"
+             hx-trigger="load, every 5s"
+             hx-indicator="#poll-indicator">
+        </div>
+
+        <!-- Task Queue — polls every 5s -->
+        <div class="section">
+            <h2>Task Queue</h2>
+            <div id="task-table"
+                 hx-get="/dashboard/partials/tasks"
+                 hx-trigger="load, every 5s"
+                 hx-indicator="#poll-indicator">
+            </div>
+        </div>
+
+        <!-- Activity Log — polls every 5s -->
+        <div class="section">
+            <h2>Activity Log</h2>
+            <div id="activity-log"
+                 hx-get="/dashboard/partials/activity"
+                 hx-trigger="load, every 5s"
+                 hx-indicator="#poll-indicator">
+            </div>
+        </div>
+    </div>
+
+    <!-- Reject Modal -->
+    <div class="modal-backdrop" id="reject-modal">
+        <div class="modal">
+            <h3>Reject Task</h3>
+            <form id="reject-form" hx-swap="none">
+                <input type="hidden" name="task_id" id="reject-task-id">
+                <textarea name="feedback" placeholder="Feedback for the agent (required)..." required></textarea>
+                <div class="modal-actions">
+                    <button type="button" class="btn" onclick="closeRejectModal()">Cancel</button>
+                    <button type="submit" class="btn btn-reject">Reject</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <script>
+    // Reject modal logic — minimal JS, no build step
+    function openRejectModal(taskId) {
+        document.getElementById('reject-task-id').value = taskId;
+        document.getElementById('reject-modal').classList.add('active');
+        const form = document.getElementById('reject-form');
+        form.setAttribute('hx-post', '/dashboard/tasks/' + taskId + '/reject');
+        form.setAttribute('hx-target', '#task-row-' + taskId);
+        form.setAttribute('hx-swap', 'outerHTML');
+        htmx.process(form);
+        form.querySelector('textarea').value = '';
+        form.querySelector('textarea').focus();
+    }
+
+    function closeRejectModal() {
+        document.getElementById('reject-modal').classList.remove('active');
+    }
+
+    // Close modal after successful reject
+    document.body.addEventListener('htmx:afterRequest', function(event) {
+        if (event.detail.elt.id === 'reject-form' && event.detail.successful) {
+            closeRejectModal();
+        }
+    });
+    </script>
+</body>
+</html>

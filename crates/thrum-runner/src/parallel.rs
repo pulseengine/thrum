@@ -755,9 +755,12 @@ pub mod pipeline {
         }
 
         // --- Merge ---
-        tracing::info!("merging branch to main");
+        let branch = task.branch_name();
+        tracing::info!(branch = %branch, "merging branch to main");
         let git = GitRepo::open(&repo_config.path)?;
-        let commit_sha = git.merge_to_main().context("failed to merge branch")?;
+        let commit_sha = git
+            .merge_branch_to_main(&branch)
+            .context("failed to merge branch")?;
 
         emit_state_change(event_bus, &task, "integrating", "merged");
         task.status = TaskStatus::Merged {
