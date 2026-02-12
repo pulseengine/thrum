@@ -7,12 +7,14 @@
 //! - Graceful shutdown via CancellationToken
 
 use crate::backend::BackendRegistry;
+use crate::event_bus::EventBus;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use thrum_core::agent::{AgentId, AgentSession};
+use thrum_core::event::EventKind;
 use thrum_core::repo::ReposConfig;
 use thrum_core::task::{RepoName, Task};
 use thrum_db::task_store::{ClaimCategory, TaskStore};
@@ -55,6 +57,8 @@ pub struct PipelineContext {
     pub session_budget_usd: Option<f64>,
     pub roles: Option<Arc<thrum_core::role::RolesConfig>>,
     pub sandbox_config: Option<crate::sandbox::SandboxConfig>,
+    /// Event bus for real-time pipeline observability.
+    pub event_bus: EventBus,
 }
 
 /// Result of a single agent run.
@@ -94,6 +98,14 @@ pub async fn run_parallel(
         "parallel engine started"
     );
 
+    ctx.event_bus.emit(EventKind::EngineLog {
+        level: thrum_core::event::LogLevel::Info,
+        message: format!(
+            "parallel engine started (max_agents={}, per_repo={})",
+            config.max_agents, config.per_repo_limit
+        ),
+    });
+
     loop {
         if shutdown.is_cancelled() {
             tracing::info!("shutdown requested, stopping dispatch");
@@ -102,32 +114,7 @@ pub async fn run_parallel(
 
         // Reap completed agents
         while let Some(result) = join_set.try_join_next() {
-            match result {
-                Ok(agent_result) => {
-                    let elapsed = agent_result.session.elapsed_secs();
-                    match &agent_result.outcome {
-                        Ok(()) => {
-                            tracing::info!(
-                                agent = %agent_result.session.agent_id,
-                                task = %agent_result.session.task_id,
-                                elapsed_secs = elapsed,
-                                "agent completed successfully"
-                            );
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                agent = %agent_result.session.agent_id,
-                                task = %agent_result.session.task_id,
-                                error = %e,
-                                "agent failed"
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "agent task panicked");
-                }
-            }
+            reap_agent_result(result, &ctx.event_bus);
         }
 
         // Dispatch batch: try to claim and spawn agents
@@ -154,27 +141,7 @@ pub async fn run_parallel(
                     break;
                 }
                 Some(result) = join_set.join_next() => {
-                    // Reap immediately; will be processed at top of loop
-                    match result {
-                        Ok(agent_result) => {
-                            let elapsed = agent_result.session.elapsed_secs();
-                            match &agent_result.outcome {
-                                Ok(()) => tracing::info!(
-                                    agent = %agent_result.session.agent_id,
-                                    task = %agent_result.session.task_id,
-                                    elapsed_secs = elapsed,
-                                    "agent completed successfully"
-                                ),
-                                Err(e) => tracing::error!(
-                                    agent = %agent_result.session.agent_id,
-                                    task = %agent_result.session.task_id,
-                                    error = %e,
-                                    "agent failed"
-                                ),
-                            }
-                        }
-                        Err(e) => tracing::error!(error = %e, "agent task panicked"),
-                    }
+                    reap_agent_result(result, &ctx.event_bus);
                 }
                 _ = tokio::time::sleep(config.poll_interval) => {}
             }
@@ -188,31 +155,49 @@ pub async fn run_parallel(
             "waiting for in-flight agents to complete"
         );
         while let Some(result) = join_set.join_next().await {
-            match result {
-                Ok(agent_result) => {
-                    let elapsed = agent_result.session.elapsed_secs();
-                    match &agent_result.outcome {
-                        Ok(()) => tracing::info!(
-                            agent = %agent_result.session.agent_id,
-                            task = %agent_result.session.task_id,
-                            elapsed_secs = elapsed,
-                            "drained agent completed"
-                        ),
-                        Err(e) => tracing::error!(
-                            agent = %agent_result.session.agent_id,
-                            task = %agent_result.session.task_id,
-                            error = %e,
-                            "drained agent failed"
-                        ),
-                    }
-                }
-                Err(e) => tracing::error!(error = %e, "drained agent panicked"),
-            }
+            reap_agent_result(result, &ctx.event_bus);
         }
     }
 
     tracing::info!("parallel engine stopped");
+    ctx.event_bus.emit(EventKind::EngineLog {
+        level: thrum_core::event::LogLevel::Info,
+        message: "parallel engine stopped".into(),
+    });
     Ok(())
+}
+
+/// Log and emit events for a completed agent result.
+fn reap_agent_result(result: Result<AgentResult, tokio::task::JoinError>, event_bus: &EventBus) {
+    match result {
+        Ok(agent_result) => {
+            let elapsed = agent_result.session.elapsed_secs();
+            let success = agent_result.outcome.is_ok();
+            match &agent_result.outcome {
+                Ok(()) => tracing::info!(
+                    agent = %agent_result.session.agent_id,
+                    task = %agent_result.session.task_id,
+                    elapsed_secs = elapsed,
+                    "agent completed successfully"
+                ),
+                Err(e) => tracing::error!(
+                    agent = %agent_result.session.agent_id,
+                    task = %agent_result.session.task_id,
+                    error = %e,
+                    "agent failed"
+                ),
+            }
+            event_bus.emit(EventKind::AgentFinished {
+                agent_id: agent_result.session.agent_id,
+                task_id: agent_result.session.task_id,
+                success,
+                elapsed_secs: elapsed,
+            });
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "agent task panicked");
+        }
+    }
 }
 
 /// Try to dispatch agents for each claim category in priority order.
@@ -303,6 +288,12 @@ async fn dispatch_batch(
                 "dispatching agent"
             );
 
+            ctx.event_bus.emit(EventKind::AgentStarted {
+                agent_id: agent_id.clone(),
+                task_id: task.id.clone(),
+                repo: task.repo.clone(),
+            });
+
             let ctx = Arc::clone(ctx);
             let category_copy = category;
 
@@ -363,6 +354,7 @@ async fn run_agent_task(ctx: &PipelineContext, task: Task, category: ClaimCatego
                 &ctx.repos_config,
                 &ctx.agents_dir,
                 &ctx.registry,
+                &ctx.event_bus,
                 task,
             )
             .await
@@ -372,6 +364,7 @@ async fn run_agent_task(ctx: &PipelineContext, task: Task, category: ClaimCatego
                 &task_store,
                 &gate_store,
                 &ctx.repos_config,
+                &ctx.event_bus,
                 task,
             )
             .await
@@ -384,6 +377,7 @@ async fn run_agent_task(ctx: &PipelineContext, task: Task, category: ClaimCatego
                 &ctx.agents_dir,
                 &ctx.registry,
                 roles_ref,
+                &ctx.event_bus,
                 task,
             )
             .await
@@ -395,21 +389,34 @@ async fn run_agent_task(ctx: &PipelineContext, task: Task, category: ClaimCatego
 pub mod pipeline {
     use crate::backend::{AiBackend, AiRequest, BackendRegistry};
     use crate::claude::load_agent_prompt;
+    use crate::event_bus::EventBus;
     use crate::git::GitRepo;
     use anyhow::{Context, Result};
     use chrono::Utc;
     use std::path::{Path, PathBuf};
+    use thrum_core::event::EventKind;
     use thrum_core::gate::{run_gate, run_integration_gate};
     use thrum_core::repo::ReposConfig;
     use thrum_core::task::{CheckpointSummary, GateLevel, MAX_RETRIES, Task, TaskStatus};
     use thrum_db::gate_store::GateStore;
     use thrum_db::task_store::TaskStore;
 
+    /// Emit a task state change event.
+    fn emit_state_change(event_bus: &EventBus, task: &Task, from: &str, to: &str) {
+        event_bus.emit(EventKind::TaskStateChange {
+            task_id: task.id.clone(),
+            repo: task.repo.clone(),
+            from: from.to_string(),
+            to: to.to_string(),
+        });
+    }
+
     /// Full pipeline: Pending/Claimed → Implement → Gate1 → Review → Gate2 → AwaitingApproval.
     ///
     /// When `roles` is provided, backend selection uses role→backend resolution
     /// (enabling any coding agent to be swapped in via config). When `None`,
     /// falls back to capability-based selection (first Agent, first Chat).
+    #[allow(clippy::too_many_arguments)]
     pub async fn run_task_pipeline(
         task_store: &TaskStore<'_>,
         gate_store: &GateStore<'_>,
@@ -417,6 +424,7 @@ pub mod pipeline {
         agents_dir: &Path,
         registry: &BackendRegistry,
         roles: Option<&thrum_core::role::RolesConfig>,
+        event_bus: &EventBus,
         mut task: Task,
     ) -> Result<()> {
         let repo_config = repos_config
@@ -445,12 +453,14 @@ pub mod pipeline {
 
         // --- Implement ---
         let branch = task.branch_name();
+        let prev_status = task.status.label().to_string();
         task.status = TaskStatus::Implementing {
             branch: branch.clone(),
             started_at: Utc::now(),
         };
         task.updated_at = Utc::now();
         task_store.update(&task)?;
+        emit_state_change(event_bus, &task, &prev_status, "implementing");
 
         let git = GitRepo::open(&repo_config.path)?;
         git.create_branch(&branch)?;
@@ -496,10 +506,21 @@ pub mod pipeline {
 
         // --- Gate 1: Quality ---
         tracing::info!("running Gate 1: Quality");
+        event_bus.emit(EventKind::GateStarted {
+            task_id: task.id.clone(),
+            level: GateLevel::Quality,
+        });
         let gate1 = run_gate(&GateLevel::Quality, repo_config)?;
         gate_store.store(&task.id, &gate1)?;
+        event_bus.emit(EventKind::GateFinished {
+            task_id: task.id.clone(),
+            level: GateLevel::Quality,
+            passed: gate1.passed,
+            duration_secs: gate1.duration_secs,
+        });
 
         if !gate1.passed {
+            emit_state_change(event_bus, &task, "implementing", "gate1_failed");
             task.status = TaskStatus::Gate1Failed { report: gate1 };
             task.updated_at = Utc::now();
             task_store.update(&task)?;
@@ -569,6 +590,7 @@ pub mod pipeline {
 
         let review_result = reviewer.invoke(&review_request).await?;
 
+        emit_state_change(event_bus, &task, "implementing", "reviewing");
         task.status = TaskStatus::Reviewing {
             reviewer_output: review_result.content.clone(),
         };
@@ -577,10 +599,21 @@ pub mod pipeline {
 
         // --- Gate 2: Proofs ---
         tracing::info!("running Gate 2: Proof");
+        event_bus.emit(EventKind::GateStarted {
+            task_id: task.id.clone(),
+            level: GateLevel::Proof,
+        });
         let gate2 = run_gate(&GateLevel::Proof, repo_config)?;
         gate_store.store(&task.id, &gate2)?;
+        event_bus.emit(EventKind::GateFinished {
+            task_id: task.id.clone(),
+            level: GateLevel::Proof,
+            passed: gate2.passed,
+            duration_secs: gate2.duration_secs,
+        });
 
         if !gate2.passed {
+            emit_state_change(event_bus, &task, "reviewing", "gate2_failed");
             task.status = TaskStatus::Gate2Failed { report: gate2 };
             task.updated_at = Utc::now();
             task_store.update(&task)?;
@@ -622,6 +655,7 @@ pub mod pipeline {
             gate1_report: gate1,
             gate2_report: Some(gate2),
         };
+        emit_state_change(event_bus, &task, "reviewing", "awaiting_approval");
         task.status = TaskStatus::AwaitingApproval { summary };
         task.updated_at = Utc::now();
         task_store.update(&task)?;
@@ -654,23 +688,36 @@ pub mod pipeline {
         task_store: &TaskStore<'_>,
         gate_store: &GateStore<'_>,
         repos_config: &ReposConfig,
+        event_bus: &EventBus,
         mut task: Task,
     ) -> Result<()> {
         let repo_config = repos_config
             .get(&task.repo)
             .context(format!("no config for repo {}", task.repo))?;
 
+        emit_state_change(event_bus, &task, "approved", "integrating");
         task.status = TaskStatus::Integrating;
         task.updated_at = Utc::now();
         task_store.update(&task)?;
 
         // --- Gate 3: Integration pipeline ---
         tracing::info!("running Gate 3: Integration");
+        event_bus.emit(EventKind::GateStarted {
+            task_id: task.id.clone(),
+            level: GateLevel::Integration,
+        });
         let fixture = PathBuf::from("fixtures/pipeline_test.wat");
         let gate3 = run_integration_gate(repos_config, &fixture)?;
         gate_store.store(&task.id, &gate3)?;
+        event_bus.emit(EventKind::GateFinished {
+            task_id: task.id.clone(),
+            level: GateLevel::Integration,
+            passed: gate3.passed,
+            duration_secs: gate3.duration_secs,
+        });
 
         if !gate3.passed {
+            emit_state_change(event_bus, &task, "integrating", "gate3_failed");
             task.status = TaskStatus::Gate3Failed { report: gate3 };
             task.updated_at = Utc::now();
             task_store.update(&task)?;
@@ -683,6 +730,7 @@ pub mod pipeline {
         let git = GitRepo::open(&repo_config.path)?;
         let commit_sha = git.merge_to_main().context("failed to merge branch")?;
 
+        emit_state_change(event_bus, &task, "integrating", "merged");
         task.status = TaskStatus::Merged {
             commit_sha: commit_sha.clone(),
         };
@@ -705,6 +753,7 @@ pub mod pipeline {
         repos_config: &ReposConfig,
         agents_dir: &Path,
         registry: &BackendRegistry,
+        event_bus: &EventBus,
         mut task: Task,
     ) -> Result<()> {
         let feedback = match &task.status {
@@ -769,6 +818,7 @@ pub mod pipeline {
             agents_dir,
             registry,
             None,
+            event_bus,
             task,
         )
         .await

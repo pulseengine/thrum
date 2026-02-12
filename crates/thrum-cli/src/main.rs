@@ -351,6 +351,8 @@ async fn cmd_run_parallel(
         }
     };
 
+    let event_bus = thrum_runner::event_bus::EventBus::new();
+
     let ctx = Arc::new(PipelineContext {
         db: shared_db,
         repos_config: Arc::new(repos_config),
@@ -359,6 +361,7 @@ async fn cmd_run_parallel(
         session_budget_usd: None,
         roles: Some(Arc::new(roles_config)),
         sandbox_config: pipeline.sandbox,
+        event_bus,
     });
 
     let config = EngineConfig {
@@ -393,6 +396,7 @@ async fn cmd_run(
 ) -> Result<()> {
     let task_store = TaskStore::new(db);
     let gate_store = GateStore::new(db);
+    let event_bus = thrum_runner::event_bus::EventBus::new();
 
     let pipeline = PipelineConfig::load(pipeline_config)?;
     let registry = build_registry(&pipeline)?;
@@ -415,6 +419,7 @@ async fn cmd_run(
                 repos_config,
                 agents_dir,
                 &registry,
+                &event_bus,
                 task,
             )
             .await;
@@ -434,6 +439,7 @@ async fn cmd_run(
                 &task_store,
                 &gate_store,
                 repos_config,
+                &event_bus,
                 task,
             )
             .await;
@@ -487,6 +493,7 @@ async fn cmd_run(
             agents_dir,
             &registry,
             None,
+            &event_bus,
             task,
         )
         .await;
