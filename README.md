@@ -1,5 +1,7 @@
 # Thrum
 
+*Thrum* — the low, continuous hum of a machine working steadily. In weaving, the thrum is the row of warp threads left on a loom when the finished cloth is cut away — the foundation that holds everything together while new work is built on top. Thrum is the steady rhythm of autonomous agents building, verifying, and shipping code.
+
 A gate-based pipeline orchestrator for autonomous AI-driven development across one or more repositories.
 
 Thrum manages a task queue where coding agents (Claude Code, OpenCode, Aider, or any CLI/API agent) implement changes that must pass through configurable verification gates before merging. Failed gates trigger automatic retries with memory of previous failures. Human approval is required between the proof gate and integration.
