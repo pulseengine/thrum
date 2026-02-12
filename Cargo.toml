@@ -54,6 +54,10 @@ tracing-opentelemetry = "0.30"
 bollard = "0.18"
 futures-util = "0.3"
 
+# File watching
+notify = "8"
+notify-debouncer-mini = "0.7"
+
 # Git
 git2 = "0.19"
 

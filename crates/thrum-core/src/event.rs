@@ -89,8 +89,33 @@ pub enum EventKind {
         duration_secs: f64,
     },
 
+    /// A file changed in a watched repo working directory.
+    FileChanged {
+        agent_id: AgentId,
+        task_id: TaskId,
+        path: std::path::PathBuf,
+        kind: FileChangeKind,
+    },
+
+    /// Periodic diff statistics for an in-progress agent task.
+    DiffUpdate {
+        agent_id: AgentId,
+        task_id: TaskId,
+        files_changed: u32,
+        insertions: u32,
+        deletions: u32,
+    },
+
     /// Engine-level log message (info, warn, error).
     EngineLog { level: LogLevel, message: String },
+}
+
+/// What kind of file system change was detected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FileChangeKind {
+    Created,
+    Modified,
+    Deleted,
 }
 
 /// Which output stream a line came from.
@@ -186,6 +211,31 @@ impl std::fmt::Display for PipelineEvent {
                 )
             }
 
+            EventKind::FileChanged {
+                agent_id,
+                path,
+                kind,
+                ..
+            } => {
+                let tag = match kind {
+                    FileChangeKind::Created => "created",
+                    FileChangeKind::Modified => "modified",
+                    FileChangeKind::Deleted => "deleted",
+                };
+                write!(f, "[{ts}] {agent_id} file {tag}: {}", path.display())
+            }
+
+            EventKind::DiffUpdate {
+                agent_id,
+                files_changed,
+                insertions,
+                deletions,
+                ..
+            } => write!(
+                f,
+                "[{ts}] {agent_id} diff: {files_changed} files, +{insertions} -{deletions}"
+            ),
+
             EventKind::EngineLog { level, message } => {
                 let tag = match level {
                     LogLevel::Info => "INFO",
@@ -242,6 +292,50 @@ mod tests {
         });
         let s = event.to_string();
         assert!(s.contains("gate/cargo_test err: running 42 tests"));
+    }
+
+    #[test]
+    fn file_changed_display() {
+        let event = PipelineEvent::new(EventKind::FileChanged {
+            agent_id: AgentId("agent-1-loom-TASK-0001".into()),
+            task_id: TaskId(1),
+            path: std::path::PathBuf::from("src/main.rs"),
+            kind: FileChangeKind::Modified,
+        });
+        let s = event.to_string();
+        assert!(s.contains("file modified: src/main.rs"));
+    }
+
+    #[test]
+    fn diff_update_display() {
+        let event = PipelineEvent::new(EventKind::DiffUpdate {
+            agent_id: AgentId("agent-1-loom-TASK-0001".into()),
+            task_id: TaskId(1),
+            files_changed: 3,
+            insertions: 42,
+            deletions: 7,
+        });
+        let s = event.to_string();
+        assert!(s.contains("diff: 3 files, +42 -7"));
+    }
+
+    #[test]
+    fn file_changed_serialize_roundtrip() {
+        let event = PipelineEvent::new(EventKind::FileChanged {
+            agent_id: AgentId("agent-1-loom-TASK-0001".into()),
+            task_id: TaskId(1),
+            path: std::path::PathBuf::from("src/lib.rs"),
+            kind: FileChangeKind::Created,
+        });
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: PipelineEvent = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed.kind,
+            EventKind::FileChanged {
+                kind: FileChangeKind::Created,
+                ..
+            }
+        ));
     }
 
     #[test]
