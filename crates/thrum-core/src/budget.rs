@@ -51,6 +51,12 @@ impl BudgetTracker {
         self.entries.push(entry);
     }
 
+    /// Check if executing a role with the given per-invocation budget would
+    /// exceed the ceiling. Returns `true` if there is enough remaining budget.
+    pub fn can_afford(&self, role_budget_usd: f64) -> bool {
+        self.remaining() >= role_budget_usd
+    }
+
     /// Breakdown by session type.
     pub fn by_session_type(&self) -> Vec<(SessionType, f64)> {
         let mut planning = 0.0;
@@ -76,6 +82,43 @@ impl BudgetTracker {
     }
 }
 
+/// Estimate cost in USD from token counts and model name.
+///
+/// Uses approximate per-million-token pricing:
+/// - Opus models: $15/M input, $75/M output
+/// - Sonnet models: $3/M input, $15/M output
+/// - Haiku models: $0.25/M input, $1.25/M output
+/// - Other/unknown: $3/M input, $15/M output (Sonnet-equivalent)
+///
+/// If token counts are unavailable, falls back to `fallback_usd`.
+pub fn estimate_cost(
+    model: &str,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    fallback_usd: f64,
+) -> f64 {
+    let (input, output) = match (input_tokens, output_tokens) {
+        (Some(i), Some(o)) => (i, o),
+        _ => return fallback_usd,
+    };
+
+    let model_lower = model.to_lowercase();
+    let (input_rate, output_rate) = if model_lower.contains("opus") {
+        (15.0, 75.0) // per million tokens
+    } else if model_lower.contains("haiku") {
+        (0.25, 1.25)
+    } else {
+        // Sonnet-equivalent default
+        (3.0, 15.0)
+    };
+
+    let cost =
+        (input as f64 * input_rate / 1_000_000.0) + (output as f64 * output_rate / 1_000_000.0);
+
+    // Use at least a minimal floor to avoid zero-cost entries
+    cost.max(0.001)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,5 +141,50 @@ mod tests {
 
         assert_eq!(tracker.total_spent(), 15.0);
         assert_eq!(tracker.remaining(), 9_985.0);
+    }
+
+    #[test]
+    fn can_afford_check() {
+        let mut tracker = BudgetTracker::new(10.0);
+        assert!(tracker.can_afford(6.0));
+        assert!(tracker.can_afford(10.0));
+        assert!(!tracker.can_afford(10.01));
+
+        tracker.record(BudgetEntry {
+            task_id: 1,
+            session_type: SessionType::Implementation,
+            model: "opus-4".into(),
+            input_tokens: 0,
+            output_tokens: 0,
+            estimated_cost_usd: 7.0,
+            timestamp: Utc::now(),
+        });
+
+        assert!(tracker.can_afford(3.0));
+        assert!(!tracker.can_afford(3.01));
+    }
+
+    #[test]
+    fn estimate_cost_opus() {
+        // 100k input, 10k output on Opus
+        // = (100_000 * 15 / 1M) + (10_000 * 75 / 1M)
+        // = 1.5 + 0.75 = 2.25
+        let cost = estimate_cost("claude-opus-4-6", Some(100_000), Some(10_000), 5.0);
+        assert!((cost - 2.25).abs() < 0.001);
+    }
+
+    #[test]
+    fn estimate_cost_sonnet() {
+        // 100k input, 10k output on Sonnet
+        // = (100_000 * 3 / 1M) + (10_000 * 15 / 1M)
+        // = 0.3 + 0.15 = 0.45
+        let cost = estimate_cost("claude-sonnet-4-5", Some(100_000), Some(10_000), 5.0);
+        assert!((cost - 0.45).abs() < 0.001);
+    }
+
+    #[test]
+    fn estimate_cost_fallback_when_no_tokens() {
+        let cost = estimate_cost("opus-4", None, None, 6.0);
+        assert!((cost - 6.0).abs() < f64::EPSILON);
     }
 }

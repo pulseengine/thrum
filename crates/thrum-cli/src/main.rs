@@ -4,6 +4,7 @@ use clap::{Parser, Subcommand};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use thrum_core::budget::BudgetTracker;
 use thrum_core::consistency::check_consistency;
 use thrum_core::gate::{run_gate, run_integration_gate};
 use thrum_core::repo::ReposConfig;
@@ -11,6 +12,7 @@ use thrum_core::spec::Spec;
 use thrum_core::sphinx_needs::{NeedsJson, trace_record_to_needs};
 use thrum_core::task::{GateLevel, RepoName, Task, TaskId, TaskStatus};
 use thrum_core::telemetry::{TelemetryConfig, TraceFilter, TraceReader, init_telemetry};
+use thrum_db::budget_store::BudgetStore;
 use thrum_db::gate_store::GateStore;
 use thrum_db::task_store::TaskStore;
 use thrum_db::trace_store::TraceStore;
@@ -260,9 +262,7 @@ async fn main() -> Result<()> {
 /// Unified pipeline configuration loaded from pipeline.toml.
 ///
 /// All sections are optional — the engine falls back to sensible defaults
-/// when a section is absent. This struct deserializes the top-level keys
-/// we care about and ignores the rest (release, budget, etc. are
-/// loaded separately by their respective subsystems).
+/// when a section is absent.
 #[derive(serde::Deserialize, Default)]
 struct PipelineConfig {
     /// Registered AI backends (coding agents + chat APIs).
@@ -277,6 +277,29 @@ struct PipelineConfig {
     /// Gate configurations (integration steps, etc.).
     #[serde(default)]
     gates: GatesConfig,
+    /// Budget configuration for AI spending limits.
+    #[serde(default)]
+    budget: BudgetConfig,
+}
+
+/// Budget configuration from [budget] section in pipeline.toml.
+#[derive(serde::Deserialize)]
+struct BudgetConfig {
+    /// Overall spending ceiling in USD.
+    #[serde(default = "default_budget_ceiling")]
+    ceiling_usd: f64,
+}
+
+fn default_budget_ceiling() -> f64 {
+    1000.0
+}
+
+impl Default for BudgetConfig {
+    fn default() -> Self {
+        Self {
+            ceiling_usd: default_budget_ceiling(),
+        }
+    }
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -373,14 +396,35 @@ async fn cmd_run_parallel(
         }
     };
 
+    // Load or create the budget tracker from DB, using the configured ceiling
+    let budget_tracker = {
+        let budget_store = BudgetStore::new(&shared_db);
+        match budget_store.load()? {
+            Some(mut existing) => {
+                // Update ceiling in case config changed
+                existing.ceiling_usd = pipeline.budget.ceiling_usd;
+                existing
+            }
+            None => BudgetTracker::new(pipeline.budget.ceiling_usd),
+        }
+    };
+    tracing::info!(
+        ceiling_usd = budget_tracker.ceiling_usd,
+        spent_usd = budget_tracker.total_spent(),
+        remaining_usd = budget_tracker.remaining(),
+        "budget tracker loaded"
+    );
+    let budget = Arc::new(tokio::sync::Mutex::new(budget_tracker));
+
     let event_bus = thrum_runner::event_bus::EventBus::new();
 
     let ctx = Arc::new(PipelineContext {
-        db: shared_db,
+        db: shared_db.clone(),
         repos_config: Arc::new(repos_config),
         agents_dir: agents_dir.to_path_buf(),
         registry: Arc::new(registry),
         session_budget_usd: None,
+        budget: budget.clone(),
         roles: Some(Arc::new(roles_config)),
         sandbox_config: pipeline.sandbox,
         event_bus,
@@ -411,7 +455,24 @@ async fn cmd_run_parallel(
     });
 
     tracing::info!(agents = max_agents, "starting parallel execution engine");
-    thrum_runner::parallel::run_parallel(ctx, config, repo_filter, shutdown).await
+    let result = thrum_runner::parallel::run_parallel(ctx, config, repo_filter, shutdown).await;
+
+    // Persist budget tracker to DB after run completes
+    {
+        let tracker = budget.lock().await;
+        let budget_store = BudgetStore::new(&shared_db);
+        if let Err(e) = budget_store.save(&tracker) {
+            tracing::warn!(error = %e, "failed to persist budget tracker");
+        } else {
+            tracing::info!(
+                spent_usd = tracker.total_spent(),
+                remaining_usd = tracker.remaining(),
+                "budget tracker persisted"
+            );
+        }
+    }
+
+    result
 }
 
 async fn cmd_run(
@@ -435,6 +496,25 @@ async fn cmd_run(
         .map(|g| g.steps.clone())
         .unwrap_or_default();
 
+    // Load or create budget tracker
+    let budget_tracker = {
+        let budget_store = BudgetStore::new(db);
+        match budget_store.load()? {
+            Some(mut existing) => {
+                existing.ceiling_usd = pipeline.budget.ceiling_usd;
+                existing
+            }
+            None => BudgetTracker::new(pipeline.budget.ceiling_usd),
+        }
+    };
+    tracing::info!(
+        ceiling_usd = budget_tracker.ceiling_usd,
+        spent_usd = budget_tracker.total_spent(),
+        remaining_usd = budget_tracker.remaining(),
+        "budget tracker loaded"
+    );
+    let budget = Arc::new(tokio::sync::Mutex::new(budget_tracker));
+
     loop {
         // Phase A: Retry failed tasks (Gate1/Gate2 failures under retry limit)
         if let Some(task) = task_store
@@ -454,6 +534,7 @@ async fn cmd_run(
                 agents_dir,
                 &registry,
                 &event_bus,
+                &budget,
                 task,
             )
             .await;
@@ -529,6 +610,7 @@ async fn cmd_run(
             &registry,
             None,
             &event_bus,
+            &budget,
             task,
         )
         .await;
@@ -540,6 +622,15 @@ async fn cmd_run(
 
         if once {
             break;
+        }
+    }
+
+    // Persist budget tracker
+    {
+        let tracker = budget.lock().await;
+        let budget_store = BudgetStore::new(db);
+        if let Err(e) = budget_store.save(&tracker) {
+            tracing::warn!(error = %e, "failed to persist budget tracker");
         }
     }
 
