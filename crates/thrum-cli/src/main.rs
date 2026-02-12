@@ -248,6 +248,7 @@ async fn main() -> Result<()> {
             let state = std::sync::Arc::new(thrum_api::ApiState {
                 db_path: cli.db.clone(),
                 trace_dir: cli.trace_dir.clone(),
+                config_path: Some(cli.config.clone()),
             });
             thrum_api::serve(state, &bind).await
         }

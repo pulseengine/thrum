@@ -82,6 +82,49 @@ impl GitRepo {
         ))
     }
 
+    /// Get the full unified diff (patch) between the default branch and a named branch.
+    ///
+    /// Returns the diff as plain text in unified diff format, suitable for
+    /// display in code review tools. Does not require checking out the branch.
+    pub fn diff_patch_for_branch(&self, branch: &str) -> Result<String> {
+        let main = self.default_branch()?;
+        let main_ref = format!("refs/heads/{main}");
+        let branch_ref = format!("refs/heads/{branch}");
+
+        let main_commit = self
+            .repo
+            .revparse_single(&main_ref)?
+            .peel_to_commit()
+            .context(format!("failed to resolve default branch '{main}'"))?;
+        let branch_commit = self
+            .repo
+            .revparse_single(&branch_ref)?
+            .peel_to_commit()
+            .context(format!("failed to resolve branch '{branch}'"))?;
+
+        let main_tree = main_commit.tree()?;
+        let branch_tree = branch_commit.tree()?;
+
+        let diff = self
+            .repo
+            .diff_tree_to_tree(Some(&main_tree), Some(&branch_tree), None)?;
+
+        let mut patch = String::new();
+        diff.print(git2::DiffFormat::Patch, |_delta, _hunk, line| {
+            let origin = line.origin();
+            // Prefix context/add/remove lines with their origin character
+            if origin == '+' || origin == '-' || origin == ' ' {
+                patch.push(origin);
+            }
+            if let Ok(content) = std::str::from_utf8(line.content()) {
+                patch.push_str(content);
+            }
+            true
+        })?;
+
+        Ok(patch)
+    }
+
     /// Merge the current branch into the default branch.
     pub fn merge_to_main(&self) -> Result<String> {
         let current = self.current_branch()?;

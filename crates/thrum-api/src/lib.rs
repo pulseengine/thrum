@@ -7,15 +7,18 @@ use axum::{
     Json, Router,
     extract::{Path, Query, State},
     http::StatusCode,
+    response::IntoResponse,
     routing::{get, post},
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
+use thrum_core::repo::ReposConfig;
 use thrum_core::task::{RepoName, Task, TaskId, TaskStatus};
 use thrum_core::telemetry::{TraceFilter, TraceReader};
 use thrum_db::task_store::TaskStore;
+use thrum_runner::git::GitRepo;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
@@ -23,12 +26,23 @@ use tower_http::trace::TraceLayer;
 pub struct ApiState {
     pub db_path: PathBuf,
     pub trace_dir: PathBuf,
+    /// Path to repos.toml — needed for diff endpoint to locate repo working dirs.
+    pub config_path: Option<PathBuf>,
 }
 
 impl ApiState {
     /// Open the database (creates if needed).
     fn db(&self) -> Result<redb::Database, AppError> {
         thrum_db::open_db(&self.db_path).map_err(AppError::Internal)
+    }
+
+    /// Load repos configuration. Returns an error if config_path is not set.
+    fn repos_config(&self) -> Result<ReposConfig, AppError> {
+        let path = self
+            .config_path
+            .as_ref()
+            .ok_or_else(|| AppError::internal("repos config path not configured"))?;
+        ReposConfig::load(path).map_err(AppError::Internal)
     }
 }
 
@@ -39,6 +53,7 @@ pub fn api_router(state: Arc<ApiState>) -> Router {
         .route("/api/v1/status", get(status))
         .route("/api/v1/tasks", get(list_tasks).post(create_task))
         .route("/api/v1/tasks/{id}", get(get_task))
+        .route("/api/v1/tasks/{id}/diff", get(get_task_diff))
         .route("/api/v1/tasks/{id}/approve", post(approve_task))
         .route("/api/v1/tasks/{id}/reject", post(reject_task))
         .route("/api/v1/traces", get(list_traces))
@@ -58,29 +73,49 @@ pub async fn serve(state: Arc<ApiState>, bind_addr: &str) -> anyhow::Result<()> 
 
 // ─── Error type ──────────────────────────────────────────────────────────
 
-struct AppError(anyhow::Error);
+#[derive(Debug)]
+struct AppError {
+    status: StatusCode,
+    error: anyhow::Error,
+}
 
 impl AppError {
     fn internal(msg: impl Into<String>) -> Self {
-        Self(anyhow::anyhow!(msg.into()))
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            error: anyhow::anyhow!(msg.into()),
+        }
+    }
+
+    fn not_found(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            error: anyhow::anyhow!(msg.into()),
+        }
     }
 
     #[allow(non_snake_case)]
     fn Internal(e: anyhow::Error) -> Self {
-        Self(e)
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            error: e,
+        }
     }
 }
 
 impl axum::response::IntoResponse for AppError {
     fn into_response(self) -> axum::response::Response {
-        let body = serde_json::json!({ "error": self.0.to_string() });
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response()
+        let body = serde_json::json!({ "error": self.error.to_string() });
+        (self.status, Json(body)).into_response()
     }
 }
 
 impl<E: Into<anyhow::Error>> From<E> for AppError {
     fn from(e: E) -> Self {
-        Self(e.into())
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            error: e.into(),
+        }
     }
 }
 
@@ -273,6 +308,52 @@ async fn reject_task(
     Ok(Json(TaskResponse::from(task)))
 }
 
+// ─── Diff ────────────────────────────────────────────────────────────────
+
+/// GET /api/v1/tasks/{id}/diff
+///
+/// Returns the full unified diff for a task's branch vs. the default branch.
+/// Only available for tasks in `Reviewing` or `AwaitingApproval` state.
+/// Returns plain text (not JSON) so it can be displayed directly in chat.
+async fn get_task_diff(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<i64>,
+) -> Result<impl IntoResponse, AppError> {
+    let db = state.db()?;
+    let store = TaskStore::new(&db);
+
+    let task = store
+        .get(&TaskId(id))?
+        .ok_or_else(|| AppError::not_found(format!("task {id} not found")))?;
+
+    if !task.status.is_reviewable() {
+        return Err(AppError::not_found(format!(
+            "task {} is '{}', diff only available for reviewing or awaiting-approval tasks",
+            id,
+            task.status.label()
+        )));
+    }
+
+    let repos_config = state.repos_config()?;
+    let repo_config = repos_config
+        .get(&task.repo)
+        .ok_or_else(|| AppError::not_found(format!("repo '{}' not found in config", task.repo)))?;
+
+    let git_repo = GitRepo::open(&repo_config.path)
+        .map_err(|e| AppError::internal(format!("failed to open git repo: {e}")))?;
+
+    let branch = task.branch_name();
+    let diff = git_repo
+        .diff_patch_for_branch(&branch)
+        .map_err(|e| AppError::internal(format!("failed to generate diff: {e}")))?;
+
+    Ok((
+        StatusCode::OK,
+        [("content-type", "text/plain; charset=utf-8")],
+        diff,
+    ))
+}
+
 // ─── Traces ──────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -325,6 +406,7 @@ mod tests {
         let state = Arc::new(ApiState {
             db_path,
             trace_dir: dir.path().join("traces"),
+            config_path: None,
         });
         (state, dir) // Keep dir alive for the test duration
     }
@@ -372,5 +454,50 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn diff_endpoint_returns_404_for_missing_task() {
+        let (state, _dir) = test_state();
+        let app = api_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/tasks/999/diff")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn diff_endpoint_returns_404_for_pending_task() {
+        let (state, _dir) = test_state();
+
+        // Create a task (starts as Pending)
+        {
+            let db = state.db().unwrap();
+            let store = TaskStore::new(&db);
+            let task = Task::new(RepoName::new("test"), "Test".into(), "desc".into());
+            store.insert(task).unwrap();
+        }
+
+        let app = api_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/tasks/1/diff")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }
