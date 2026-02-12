@@ -183,6 +183,12 @@ enum TaskAction {
     },
     /// Show detailed info about a task.
     Show { id: i64 },
+    /// Force-set a task's status (for operational recovery).
+    SetStatus {
+        id: i64,
+        #[arg(long)]
+        status: String,
+    },
 }
 
 #[tokio::main]
@@ -254,7 +260,7 @@ async fn main() -> Result<()> {
 ///
 /// All sections are optional — the engine falls back to sensible defaults
 /// when a section is absent. This struct deserializes the top-level keys
-/// we care about and ignores the rest (gates, release, budget, etc. are
+/// we care about and ignores the rest (release, budget, etc. are
 /// loaded separately by their respective subsystems).
 #[derive(serde::Deserialize, Default)]
 struct PipelineConfig {
@@ -267,6 +273,21 @@ struct PipelineConfig {
     /// Sandbox configuration for agent isolation.
     #[serde(default)]
     sandbox: Option<thrum_runner::sandbox::SandboxConfig>,
+    /// Gate configurations (integration steps, etc.).
+    #[serde(default)]
+    gates: GatesConfig,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct GatesConfig {
+    #[serde(default)]
+    integration: Option<IntegrationGateToml>,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct IntegrationGateToml {
+    #[serde(default)]
+    steps: Vec<thrum_core::gate::IntegrationStep>,
 }
 
 impl PipelineConfig {
@@ -362,6 +383,12 @@ async fn cmd_run_parallel(
         roles: Some(Arc::new(roles_config)),
         sandbox_config: pipeline.sandbox,
         event_bus,
+        integration_steps: pipeline
+            .gates
+            .integration
+            .as_ref()
+            .map(|g| g.steps.clone())
+            .unwrap_or_default(),
     });
 
     let config = EngineConfig {
@@ -400,6 +427,12 @@ async fn cmd_run(
 
     let pipeline = PipelineConfig::load(pipeline_config)?;
     let registry = build_registry(&pipeline)?;
+    let integration_steps = pipeline
+        .gates
+        .integration
+        .as_ref()
+        .map(|g| g.steps.clone())
+        .unwrap_or_default();
 
     loop {
         // Phase A: Retry failed tasks (Gate1/Gate2 failures under retry limit)
@@ -440,6 +473,7 @@ async fn cmd_run(
                 &gate_store,
                 repos_config,
                 &event_bus,
+                &integration_steps,
                 task,
             )
             .await;
@@ -947,6 +981,30 @@ fn cmd_task(db: &redb::Database, action: TaskAction) -> Result<()> {
                 .get(&TaskId(id))?
                 .context(format!("task {id} not found"))?;
             println!("{}", serde_json::to_string_pretty(&task)?);
+        }
+        TaskAction::SetStatus { id, status } => {
+            let mut task = store
+                .get(&TaskId(id))?
+                .context(format!("task {id} not found"))?;
+
+            task.status = match status.as_str() {
+                "pending" => TaskStatus::Pending,
+                "merged" => TaskStatus::Merged {
+                    commit_sha: "manually-set".into(),
+                },
+                "approved" => TaskStatus::Approved,
+                other => {
+                    anyhow::bail!("unsupported status '{other}'. Use: pending, approved, merged")
+                }
+            };
+            task.updated_at = Utc::now();
+            store.update(&task)?;
+            println!(
+                "Set {} to '{}': {}",
+                task.id,
+                task.status.label(),
+                task.title
+            );
         }
     }
 

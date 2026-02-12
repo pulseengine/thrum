@@ -59,6 +59,8 @@ pub struct PipelineContext {
     pub sandbox_config: Option<crate::sandbox::SandboxConfig>,
     /// Event bus for real-time pipeline observability.
     pub event_bus: EventBus,
+    /// Integration gate steps (empty = Gate 3 passes vacuously).
+    pub integration_steps: Vec<thrum_core::gate::IntegrationStep>,
 }
 
 /// Result of a single agent run.
@@ -365,6 +367,7 @@ async fn run_agent_task(ctx: &PipelineContext, task: Task, category: ClaimCatego
                 &gate_store,
                 &ctx.repos_config,
                 &ctx.event_bus,
+                &ctx.integration_steps,
                 task,
             )
             .await
@@ -395,7 +398,7 @@ pub mod pipeline {
     use chrono::Utc;
     use std::path::{Path, PathBuf};
     use thrum_core::event::EventKind;
-    use thrum_core::gate::{run_gate, run_integration_gate};
+    use thrum_core::gate::{run_gate, run_integration_gate_configured};
     use thrum_core::repo::ReposConfig;
     use thrum_core::task::{CheckpointSummary, GateLevel, MAX_RETRIES, Task, TaskStatus};
     use thrum_db::gate_store::GateStore;
@@ -684,11 +687,15 @@ pub mod pipeline {
     }
 
     /// Post-approval: Approved → Integrating → Gate 3 → Merged.
+    ///
+    /// `integration_steps`: if non-empty, runs config-driven integration gate.
+    /// If empty, Gate 3 passes vacuously (single-repo or no integration configured).
     pub async fn post_approval_pipeline(
         task_store: &TaskStore<'_>,
         gate_store: &GateStore<'_>,
         repos_config: &ReposConfig,
         event_bus: &EventBus,
+        integration_steps: &[thrum_core::gate::IntegrationStep],
         mut task: Task,
     ) -> Result<()> {
         let repo_config = repos_config
@@ -706,8 +713,30 @@ pub mod pipeline {
             task_id: task.id.clone(),
             level: GateLevel::Integration,
         });
-        let fixture = PathBuf::from("fixtures/pipeline_test.wat");
-        let gate3 = run_integration_gate(repos_config, &fixture)?;
+
+        let gate3 = if integration_steps.is_empty() {
+            // No integration steps configured — pass vacuously
+            tracing::info!("no integration steps configured, Gate 3 passes vacuously");
+            thrum_core::task::GateReport {
+                level: GateLevel::Integration,
+                checks: vec![thrum_core::task::CheckResult {
+                    name: "no_integration_steps".into(),
+                    passed: true,
+                    stdout: "No integration steps configured for this pipeline".into(),
+                    stderr: String::new(),
+                    exit_code: 0,
+                }],
+                passed: true,
+                duration_secs: 0.0,
+            }
+        } else {
+            let config = thrum_core::gate::IntegrationGateConfig {
+                steps: integration_steps.to_vec(),
+            };
+            let fixture = PathBuf::from("fixtures/pipeline_test.wat");
+            run_integration_gate_configured(repos_config, &fixture, &config)?
+        };
+
         gate_store.store(&task.id, &gate3)?;
         event_bus.emit(EventKind::GateFinished {
             task_id: task.id.clone(),
