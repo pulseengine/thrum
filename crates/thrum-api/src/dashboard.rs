@@ -62,8 +62,8 @@ async fn stylesheet() -> Response {
 async fn status_partial(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Html<String>, DashboardError> {
-    let db = state.db_dashboard()?;
-    let store = TaskStore::new(&db);
+    let db = state.db();
+    let store = TaskStore::new(db);
     let counts = store.status_counts()?;
 
     let mut html = String::with_capacity(512);
@@ -104,8 +104,8 @@ fn write_card(buf: &mut String, class: &str, count: usize, label: &str) {
 
 /// Task queue table — full table body with action buttons.
 async fn tasks_partial(State(state): State<Arc<ApiState>>) -> Result<Html<String>, DashboardError> {
-    let db = state.db_dashboard()?;
-    let store = TaskStore::new(&db);
+    let db = state.db();
+    let store = TaskStore::new(db);
     let tasks = store.list(None, None)?;
 
     if tasks.is_empty() {
@@ -194,8 +194,8 @@ async fn approve_action(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<i64>,
 ) -> Result<Html<String>, DashboardError> {
-    let db = state.db_dashboard()?;
-    let store = TaskStore::new(&db);
+    let db = state.db();
+    let store = TaskStore::new(db);
 
     let mut task = store
         .get(&TaskId(id))?
@@ -230,8 +230,8 @@ async fn reject_action(
     Path(id): Path<i64>,
     Form(form): Form<RejectForm>,
 ) -> Result<Html<String>, DashboardError> {
-    let db = state.db_dashboard()?;
-    let store = TaskStore::new(&db);
+    let db = state.db();
+    let store = TaskStore::new(db);
 
     let mut task = store
         .get(&TaskId(id))?

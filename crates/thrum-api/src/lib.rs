@@ -26,17 +26,35 @@ use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
 /// Shared application state for API handlers.
+///
+/// Holds an `Arc<Database>` opened once at server start, shared across all
+/// request handlers. This avoids the overhead of reopening the database on
+/// every request and prevents per-request file lock churn.
 pub struct ApiState {
-    pub db_path: PathBuf,
+    pub db: Arc<redb::Database>,
     pub trace_dir: PathBuf,
     /// Path to repos.toml — needed for diff endpoint to locate repo working dirs.
     pub config_path: Option<PathBuf>,
 }
 
 impl ApiState {
-    /// Open the database (creates if needed).
-    fn db(&self) -> Result<redb::Database, AppError> {
-        thrum_db::open_db(&self.db_path).map_err(AppError::Internal)
+    /// Create ApiState with a shared database connection.
+    pub fn new(
+        db_path: &std::path::Path,
+        trace_dir: PathBuf,
+        config_path: Option<PathBuf>,
+    ) -> anyhow::Result<Self> {
+        let db = Arc::new(thrum_db::open_db(db_path)?);
+        Ok(Self {
+            db,
+            trace_dir,
+            config_path,
+        })
+    }
+
+    /// Get a reference to the shared database.
+    fn db(&self) -> &redb::Database {
+        &self.db
     }
 
     /// Load repos configuration. Returns an error if config_path is not set.
@@ -46,11 +64,6 @@ impl ApiState {
             .as_ref()
             .ok_or_else(|| AppError::internal("repos config path not configured"))?;
         ReposConfig::load(path).map_err(AppError::Internal)
-    }
-
-    /// Open the database for dashboard handlers.
-    fn db_dashboard(&self) -> Result<redb::Database, anyhow::Error> {
-        thrum_db::open_db(&self.db_path)
     }
 }
 
@@ -161,12 +174,12 @@ struct StatusResponse {
 }
 
 async fn status(State(state): State<Arc<ApiState>>) -> Result<Json<StatusResponse>, AppError> {
-    let db = state.db()?;
-    let store = TaskStore::new(&db);
+    let db = state.db();
+    let store = TaskStore::new(db);
     let counts = store.status_counts()?;
 
     // Load budget info from the budget store
-    let budget_store = thrum_db::budget_store::BudgetStore::new(&db);
+    let budget_store = thrum_db::budget_store::BudgetStore::new(db);
     let (budget_remaining, budget_ceiling, budget_spent) = match budget_store.load() {
         Ok(Some(tracker)) => (
             Some(tracker.remaining()),
@@ -179,7 +192,7 @@ async fn status(State(state): State<Arc<ApiState>>) -> Result<Json<StatusRespons
     Ok(Json(StatusResponse {
         healthy: true,
         task_counts: counts,
-        db_path: state.db_path.display().to_string(),
+        db_path: "(shared)".to_string(),
         trace_dir: state.trace_dir.display().to_string(),
         budget_remaining,
         budget_ceiling,
@@ -230,8 +243,8 @@ async fn list_tasks(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<TaskListQuery>,
 ) -> Result<Json<Vec<TaskResponse>>, AppError> {
-    let db = state.db()?;
-    let store = TaskStore::new(&db);
+    let db = state.db();
+    let store = TaskStore::new(db);
 
     let repo_filter = query
         .repo
@@ -249,8 +262,8 @@ async fn get_task(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<i64>,
 ) -> Result<Json<TaskResponse>, AppError> {
-    let db = state.db()?;
-    let store = TaskStore::new(&db);
+    let db = state.db();
+    let store = TaskStore::new(db);
 
     let task = store
         .get(&TaskId(id))?
@@ -277,8 +290,8 @@ async fn create_task(
 ) -> Result<(StatusCode, Json<TaskResponse>), AppError> {
     let repo_name = RepoName::new(&req.repo);
 
-    let db = state.db()?;
-    let store = TaskStore::new(&db);
+    let db = state.db();
+    let store = TaskStore::new(db);
 
     let mut task = Task::new(repo_name, req.title, req.description);
     task.requirement_id = req.requirement_id;
@@ -292,8 +305,8 @@ async fn approve_task(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<i64>,
 ) -> Result<Json<TaskResponse>, AppError> {
-    let db = state.db()?;
-    let store = TaskStore::new(&db);
+    let db = state.db();
+    let store = TaskStore::new(db);
 
     let mut task = store
         .get(&TaskId(id))?
@@ -324,8 +337,8 @@ async fn reject_task(
     Path(id): Path<i64>,
     Json(req): Json<RejectRequest>,
 ) -> Result<Json<TaskResponse>, AppError> {
-    let db = state.db()?;
-    let store = TaskStore::new(&db);
+    let db = state.db();
+    let store = TaskStore::new(db);
 
     let mut task = store
         .get(&TaskId(id))?
@@ -351,8 +364,8 @@ async fn get_task_diff(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<i64>,
 ) -> Result<impl IntoResponse, AppError> {
-    let db = state.db()?;
-    let store = TaskStore::new(&db);
+    let db = state.db();
+    let store = TaskStore::new(db);
 
     let task = store
         .get(&TaskId(id))?
@@ -434,12 +447,7 @@ mod tests {
     fn test_state() -> (Arc<ApiState>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.redb");
-        let _db = thrum_db::open_db(&db_path).unwrap();
-        let state = Arc::new(ApiState {
-            db_path,
-            trace_dir: dir.path().join("traces"),
-            config_path: None,
-        });
+        let state = Arc::new(ApiState::new(&db_path, dir.path().join("traces"), None).unwrap());
         (state, dir) // Keep dir alive for the test duration
     }
 
@@ -512,8 +520,7 @@ mod tests {
 
         // Create a task (starts as Pending)
         {
-            let db = state.db().unwrap();
-            let store = TaskStore::new(&db);
+            let store = TaskStore::new(state.db());
             let task = Task::new(RepoName::new("test"), "Test".into(), "desc".into());
             store.insert(task).unwrap();
         }
@@ -628,10 +635,9 @@ mod tests {
     async fn dashboard_tasks_partial_with_tasks() {
         let (state, _dir) = test_state();
 
-        // Insert a task directly
+        // Insert a task directly via the shared DB
         {
-            let db = thrum_db::open_db(&state.db_path).unwrap();
-            let store = TaskStore::new(&db);
+            let store = TaskStore::new(state.db());
             let task = Task::new(RepoName::new("loom"), "Test task".into(), "desc".into());
             store.insert(task).unwrap();
         }

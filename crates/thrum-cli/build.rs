@@ -45,6 +45,27 @@ fn main() {
     // Build timestamp
     let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
     println!("cargo:rustc-env=THRUM_BUILD_TIME={now}");
+
+    // Changelog since last tag (compact, one line per non-merge commit)
+    // Written to a file because cargo:rustc-env doesn't support multiline values.
+    let last_tag = cmd("git", &["describe", "--tags", "--abbrev=0"]);
+    let changelog = if last_tag != "unknown" && !last_tag.is_empty() {
+        cmd(
+            "git",
+            &[
+                "log",
+                "--oneline",
+                "--no-merges",
+                &format!("{last_tag}..HEAD"),
+            ],
+        )
+    } else {
+        // No tags — show last 20 commits
+        cmd("git", &["log", "--oneline", "--no-merges", "-20"])
+    };
+    let out_dir = std::env::var("OUT_DIR").unwrap();
+    std::fs::write(format!("{out_dir}/changelog.txt"), &changelog).unwrap();
+    println!("cargo:rustc-env=THRUM_LAST_TAG={last_tag}");
 }
 
 fn cmd(program: &str, args: &[&str]) -> String {

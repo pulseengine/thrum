@@ -131,6 +131,8 @@ enum Commands {
         #[arg(long, default_value = "127.0.0.1:3000")]
         bind: String,
     },
+    /// Show changelog since last release tag.
+    Changelog,
 }
 
 #[derive(Subcommand)]
@@ -282,12 +284,38 @@ async fn main() -> Result<()> {
             cmd_release(dry_run, tag, &repos_config, &db).await
         }
         Commands::Serve { bind } => {
-            let state = std::sync::Arc::new(thrum_api::ApiState {
-                db_path: cli.db.clone(),
-                trace_dir: cli.trace_dir.clone(),
-                config_path: Some(cli.config.clone()),
-            });
+            let state = std::sync::Arc::new(thrum_api::ApiState::new(
+                &cli.db,
+                cli.trace_dir.clone(),
+                Some(cli.config.clone()),
+            )?);
             thrum_api::serve(state, &bind).await
+        }
+        Commands::Changelog => {
+            cmd_changelog();
+            Ok(())
+        }
+    }
+}
+
+// ─── Changelog ──────────────────────────────────────────────────────────
+
+fn cmd_changelog() {
+    let last_tag: &str = env!("THRUM_LAST_TAG");
+    let changelog: &str = include_str!(concat!(env!("OUT_DIR"), "/changelog.txt"));
+    let commit: &str = env!("THRUM_GIT_COMMIT");
+
+    if last_tag.is_empty() || last_tag == "unknown" {
+        println!("No release tags found. Recent commits:");
+    } else {
+        println!("Changes since {last_tag} (current: {commit}):");
+    }
+    println!();
+    if changelog.is_empty() {
+        println!("  (no changes)");
+    } else {
+        for line in changelog.lines() {
+            println!("  {line}");
         }
     }
 }
@@ -412,10 +440,42 @@ fn build_registry(pipeline: &PipelineConfig) -> Result<BackendRegistry> {
 
 /// Check all managed repos for advancement beyond what Thrum last saw.
 ///
+/// Also checks if the Thrum binary itself has been upgraded since the last
+/// run (different build commit) and shows the embedded changelog.
+///
 /// Logs warnings for repos that moved forward (e.g. manual commits, external merges)
 /// and records the current HEAD so subsequent runs won't re-warn.
 fn check_repos_advanced(db: &redb::Database, repos_config: &ReposConfig) {
     let meta = MetaStore::new(db);
+
+    // Check if Thrum itself was upgraded
+    const BUILD_COMMIT: &str = env!("THRUM_GIT_COMMIT");
+    const CHANGELOG: &str = include_str!(concat!(env!("OUT_DIR"), "/changelog.txt"));
+    const LAST_TAG: &str = env!("THRUM_LAST_TAG");
+    match meta.check_repo_advanced("__thrum_build__", BUILD_COMMIT) {
+        Ok(Some((old_build, _new_build))) => {
+            tracing::info!(
+                old_build = &old_build[..8.min(old_build.len())],
+                new_build = BUILD_COMMIT,
+                "Thrum binary upgraded — what's new since {LAST_TAG}:"
+            );
+            for line in CHANGELOG.lines().take(10) {
+                tracing::info!("  {line}");
+            }
+            if let Err(e) = meta.record_commit("__thrum_build__", BUILD_COMMIT) {
+                tracing::debug!(error = %e, "failed to record thrum build version");
+            }
+        }
+        Ok(None) => {
+            // First run or same build — record silently
+            if let Err(e) = meta.record_commit("__thrum_build__", BUILD_COMMIT) {
+                tracing::debug!(error = %e, "failed to record thrum build version");
+            }
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, "failed to check thrum build version");
+        }
+    }
     for repo_cfg in &repos_config.repo {
         let head = std::process::Command::new("git")
             .args(["rev-parse", "HEAD"])
