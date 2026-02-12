@@ -1,6 +1,7 @@
 pub mod budget_store;
 pub mod gate_store;
 pub mod memory_store;
+pub mod meta_store;
 pub mod task_store;
 pub mod trace_store;
 
@@ -21,6 +22,7 @@ pub fn open_db(path: &Path) -> Result<Database> {
         let _trace_counter = write_txn.open_table(trace_store::TRACE_COUNTER_TABLE)?;
         let _memory = write_txn.open_table(memory_store::MEMORY_TABLE)?;
         let _budget = write_txn.open_table(budget_store::BUDGET_TABLE)?;
+        let _meta = write_txn.open_table(meta_store::META_TABLE)?;
     }
     write_txn.commit()?;
     Ok(db)

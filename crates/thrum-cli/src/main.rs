@@ -14,6 +14,7 @@ use thrum_core::task::{GateLevel, RepoName, Task, TaskId, TaskStatus};
 use thrum_core::telemetry::{TelemetryConfig, TraceFilter, TraceReader, init_telemetry};
 use thrum_db::budget_store::BudgetStore;
 use thrum_db::gate_store::GateStore;
+use thrum_db::meta_store::MetaStore;
 use thrum_db::task_store::TaskStore;
 use thrum_db::trace_store::TraceStore;
 use thrum_runner::backend::{AiRequest, BackendRegistry};
@@ -228,8 +229,10 @@ async fn main() -> Result<()> {
     };
     let _telemetry_guard = init_telemetry(&telemetry_config)?;
 
-    // Open database
-    let db = thrum_db::open_db(&cli.db)?;
+    // Open database lazily — only commands that need a persistent handle open it.
+    // This avoids holding the redb exclusive file lock during `serve` or `check`,
+    // which don't need it and would block other CLI commands.
+    let open_db = || thrum_db::open_db(&cli.db);
 
     match cli.command {
         Commands::Run { repo, once, agents } => {
@@ -246,6 +249,7 @@ async fn main() -> Result<()> {
                 )
                 .await
             } else {
+                let db = open_db()?;
                 cmd_run(
                     &db,
                     &repos_config,
@@ -257,13 +261,23 @@ async fn main() -> Result<()> {
                 .await
             }
         }
-        Commands::Task { action } => cmd_task(&db, action),
-        Commands::Trace { action } => cmd_trace(&db, action),
+        Commands::Task { action } => {
+            let db = open_db()?;
+            cmd_task(&db, action)
+        }
+        Commands::Trace { action } => {
+            let db = open_db()?;
+            cmd_trace(&db, action)
+        }
         Commands::Traces { action } => cmd_traces(&cli.trace_dir, action),
         Commands::Safety => cmd_safety(),
-        Commands::Status => cmd_status(&db, &cli.config),
+        Commands::Status => {
+            let db = open_db()?;
+            cmd_status(&db, &cli.config)
+        }
         Commands::Check => cmd_check(&cli.config),
         Commands::Release { dry_run, tag } => {
+            let db = open_db()?;
             let repos_config = ReposConfig::load(&cli.config)?;
             cmd_release(dry_run, tag, &repos_config, &db).await
         }
@@ -396,6 +410,74 @@ fn build_registry(pipeline: &PipelineConfig) -> Result<BackendRegistry> {
     Ok(registry)
 }
 
+/// Check all managed repos for advancement beyond what Thrum last saw.
+///
+/// Logs warnings for repos that moved forward (e.g. manual commits, external merges)
+/// and records the current HEAD so subsequent runs won't re-warn.
+fn check_repos_advanced(db: &redb::Database, repos_config: &ReposConfig) {
+    let meta = MetaStore::new(db);
+    for repo_cfg in &repos_config.repo {
+        let head = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&repo_cfg.path)
+            .output()
+            .ok()
+            .and_then(|o| {
+                if o.status.success() {
+                    Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
+                } else {
+                    None
+                }
+            });
+
+        let Some(current_sha) = head else {
+            tracing::debug!(repo = %repo_cfg.name, "could not determine HEAD, skipping advancement check");
+            continue;
+        };
+
+        match meta.check_repo_advanced(&repo_cfg.name.to_string(), &current_sha) {
+            Ok(Some((old, new))) => {
+                // Show how many commits happened since last seen
+                let count = std::process::Command::new("git")
+                    .args(["rev-list", "--count", &format!("{old}..{new}")])
+                    .current_dir(&repo_cfg.path)
+                    .output()
+                    .ok()
+                    .and_then(|o| {
+                        String::from_utf8_lossy(&o.stdout)
+                            .trim()
+                            .parse::<u32>()
+                            .ok()
+                    })
+                    .unwrap_or(0);
+
+                tracing::warn!(
+                    repo = %repo_cfg.name,
+                    old_commit = &old[..8.min(old.len())],
+                    new_commit = &new[..8.min(new.len())],
+                    commits_ahead = count,
+                    "repo has advanced since last Thrum run — review changes with: git log {}..{}",
+                    &old[..8.min(old.len())],
+                    &new[..8.min(new.len())],
+                );
+                // Record the new commit so we don't re-warn next run
+                if let Err(e) = meta.record_commit(&repo_cfg.name.to_string(), &current_sha) {
+                    tracing::debug!(error = %e, "failed to record commit after advancement");
+                }
+            }
+            Ok(None) => {
+                // First run or same commit — record it silently
+                if let Err(e) = meta.record_commit(&repo_cfg.name.to_string(), &current_sha) {
+                    tracing::debug!(error = %e, "failed to record commit");
+                }
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, repo = %repo_cfg.name, "failed to check repo advancement");
+            }
+        }
+    }
+}
+
 /// Parallel execution path: dispatches multiple agents via the parallel engine.
 ///
 /// Re-opens the DB as Arc<Database> because the parallel engine needs owned
@@ -411,6 +493,9 @@ async fn cmd_run_parallel(
     let pipeline = PipelineConfig::load(pipeline_config)?;
     let registry = build_registry(&pipeline)?;
     let shared_db = Arc::new(thrum_db::open_db(db_path)?);
+
+    // Check if any repos have advanced since last Thrum run
+    check_repos_advanced(&shared_db, &repos_config);
 
     let roles_config = if pipeline.roles.is_empty() {
         thrum_core::role::RolesConfig::default()
@@ -511,6 +596,9 @@ async fn cmd_run(
     let task_store = TaskStore::new(db);
     let gate_store = GateStore::new(db);
     let event_bus = thrum_runner::event_bus::EventBus::new();
+
+    // Check if any repos have advanced since last Thrum run
+    check_repos_advanced(db, repos_config);
 
     let pipeline = PipelineConfig::load(pipeline_config)?;
     let registry = build_registry(&pipeline)?;
