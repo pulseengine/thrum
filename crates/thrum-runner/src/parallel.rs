@@ -65,6 +65,8 @@ pub struct PipelineContext {
     pub event_bus: EventBus,
     /// Integration gate steps (empty = Gate 3 passes vacuously).
     pub integration_steps: Vec<thrum_core::gate::IntegrationStep>,
+    /// Test subsampling configuration (None = no subsampling).
+    pub subsample: Option<thrum_core::subsample::SubsampleConfig>,
 }
 
 /// Result of a single agent run.
@@ -362,6 +364,7 @@ async fn run_agent_task(ctx: &PipelineContext, task: Task, category: ClaimCatego
                 &ctx.registry,
                 &ctx.event_bus,
                 &ctx.budget,
+                ctx.subsample.as_ref(),
                 task,
             )
             .await
@@ -387,6 +390,7 @@ async fn run_agent_task(ctx: &PipelineContext, task: Task, category: ClaimCatego
                 roles_ref,
                 &ctx.event_bus,
                 &ctx.budget,
+                ctx.subsample.as_ref(),
                 task,
             )
             .await
@@ -408,6 +412,7 @@ pub mod pipeline {
     use thrum_core::event::EventKind;
     use thrum_core::gate::{run_gate, run_integration_gate_configured};
     use thrum_core::repo::ReposConfig;
+    use thrum_core::subsample::SubsampleConfig;
     use thrum_core::task::{CheckpointSummary, GateLevel, MAX_RETRIES, Task, TaskStatus};
     use thrum_db::gate_store::GateStore;
     use thrum_db::task_store::TaskStore;
@@ -467,6 +472,9 @@ pub mod pipeline {
     /// When `roles` is provided, backend selection uses role→backend resolution
     /// (enabling any coding agent to be swapped in via config). When `None`,
     /// falls back to capability-based selection (first Agent, first Chat).
+    ///
+    /// When `subsample` is `Some` and enabled, test commands at each gate are
+    /// wrapped through `subsample_test_cmd()` using the configured ratios.
     #[allow(clippy::too_many_arguments)]
     pub async fn run_task_pipeline(
         task_store: &TaskStore<'_>,
@@ -477,6 +485,7 @@ pub mod pipeline {
         roles: Option<&thrum_core::role::RolesConfig>,
         event_bus: &EventBus,
         budget: &Arc<Mutex<BudgetTracker>>,
+        subsample: Option<&SubsampleConfig>,
         mut task: Task,
     ) -> Result<()> {
         let repo_config = repos_config
@@ -588,7 +597,7 @@ pub mod pipeline {
             task_id: task.id.clone(),
             level: GateLevel::Quality,
         });
-        let gate1 = run_gate(&GateLevel::Quality, repo_config)?;
+        let gate1 = run_gate(&GateLevel::Quality, repo_config, subsample, Some(task.id.0))?;
         gate_store.store(&task.id, &gate1)?;
         event_bus.emit(EventKind::GateFinished {
             task_id: task.id.clone(),
@@ -694,7 +703,7 @@ pub mod pipeline {
             task_id: task.id.clone(),
             level: GateLevel::Proof,
         });
-        let gate2 = run_gate(&GateLevel::Proof, repo_config)?;
+        let gate2 = run_gate(&GateLevel::Proof, repo_config, subsample, Some(task.id.0))?;
         gate_store.store(&task.id, &gate2)?;
         event_bus.emit(EventKind::GateFinished {
             task_id: task.id.clone(),
@@ -876,6 +885,7 @@ pub mod pipeline {
         registry: &BackendRegistry,
         event_bus: &EventBus,
         budget: &Arc<Mutex<BudgetTracker>>,
+        subsample: Option<&SubsampleConfig>,
         mut task: Task,
     ) -> Result<()> {
         let feedback = match &task.status {
@@ -942,6 +952,7 @@ pub mod pipeline {
             None,
             event_bus,
             budget,
+            subsample,
             task,
         )
         .await
