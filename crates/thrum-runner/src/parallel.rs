@@ -14,11 +14,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use thrum_core::agent::{AgentId, AgentSession};
+use thrum_core::budget::BudgetTracker;
 use thrum_core::event::EventKind;
 use thrum_core::repo::ReposConfig;
 use thrum_core::task::{RepoName, Task};
 use thrum_db::task_store::{ClaimCategory, TaskStore};
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex, Semaphore};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
@@ -55,6 +56,9 @@ pub struct PipelineContext {
     pub agents_dir: PathBuf,
     pub registry: Arc<BackendRegistry>,
     pub session_budget_usd: Option<f64>,
+    /// Shared budget tracker for global spending enforcement.
+    /// Protected by a mutex for thread-safe concurrent access.
+    pub budget: Arc<Mutex<BudgetTracker>>,
     pub roles: Option<Arc<thrum_core::role::RolesConfig>>,
     pub sandbox_config: Option<crate::sandbox::SandboxConfig>,
     /// Event bus for real-time pipeline observability.
@@ -357,6 +361,7 @@ async fn run_agent_task(ctx: &PipelineContext, task: Task, category: ClaimCatego
                 &ctx.agents_dir,
                 &ctx.registry,
                 &ctx.event_bus,
+                &ctx.budget,
                 task,
             )
             .await
@@ -381,6 +386,7 @@ async fn run_agent_task(ctx: &PipelineContext, task: Task, category: ClaimCatego
                 &ctx.registry,
                 roles_ref,
                 &ctx.event_bus,
+                &ctx.budget,
                 task,
             )
             .await
@@ -390,19 +396,22 @@ async fn run_agent_task(ctx: &PipelineContext, task: Task, category: ClaimCatego
 
 /// Pipeline functions extracted for sharing between sequential and parallel paths.
 pub mod pipeline {
-    use crate::backend::{AiBackend, AiRequest, BackendRegistry};
+    use crate::backend::{AiBackend, AiRequest, AiResponse, BackendRegistry};
     use crate::claude::load_agent_prompt;
     use crate::event_bus::EventBus;
     use crate::git::GitRepo;
     use anyhow::{Context, Result};
     use chrono::Utc;
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use thrum_core::budget::{self, BudgetEntry, BudgetTracker, SessionType};
     use thrum_core::event::EventKind;
     use thrum_core::gate::{run_gate, run_integration_gate_configured};
     use thrum_core::repo::ReposConfig;
     use thrum_core::task::{CheckpointSummary, GateLevel, MAX_RETRIES, Task, TaskStatus};
     use thrum_db::gate_store::GateStore;
     use thrum_db::task_store::TaskStore;
+    use tokio::sync::Mutex;
 
     /// Emit a task state change event.
     fn emit_state_change(event_bus: &EventBus, task: &Task, from: &str, to: &str) {
@@ -412,6 +421,45 @@ pub mod pipeline {
             from: from.to_string(),
             to: to.to_string(),
         });
+    }
+
+    /// Record the cost of an AI invocation into the shared budget tracker.
+    ///
+    /// Estimates cost from token counts in the response, falling back to
+    /// the role's per-invocation budget if tokens are unavailable.
+    async fn record_invocation_cost(
+        budget: &Arc<Mutex<BudgetTracker>>,
+        task_id: i64,
+        session_type: SessionType,
+        response: &AiResponse,
+        role_budget_usd: f64,
+    ) {
+        let estimated_cost = budget::estimate_cost(
+            &response.model,
+            response.input_tokens,
+            response.output_tokens,
+            role_budget_usd,
+        );
+
+        let entry = BudgetEntry {
+            task_id,
+            session_type,
+            model: response.model.clone(),
+            input_tokens: response.input_tokens.unwrap_or(0),
+            output_tokens: response.output_tokens.unwrap_or(0),
+            estimated_cost_usd: estimated_cost,
+            timestamp: Utc::now(),
+        };
+
+        let mut tracker = budget.lock().await;
+        tracker.record(entry);
+
+        tracing::info!(
+            estimated_cost_usd = estimated_cost,
+            remaining_usd = tracker.remaining(),
+            ceiling_usd = tracker.ceiling_usd,
+            "recorded invocation cost"
+        );
     }
 
     /// Full pipeline: Pending/Claimed → Implement → Gate1 → Review → Gate2 → AwaitingApproval.
@@ -428,6 +476,7 @@ pub mod pipeline {
         registry: &BackendRegistry,
         roles: Option<&thrum_core::role::RolesConfig>,
         event_bus: &EventBus,
+        budget: &Arc<Mutex<BudgetTracker>>,
         mut task: Task,
     ) -> Result<()> {
         let repo_config = repos_config
@@ -435,15 +484,16 @@ pub mod pipeline {
             .context(format!("no config for repo {}", task.repo))?;
 
         // Role-aware backend selection: resolve implementer role → backend
-        let (agent, impl_role_name) = if let Some(roles) = roles {
+        let (agent, impl_role_name, impl_budget_usd) = if let Some(roles) = roles {
             let impl_role = roles.implementer();
             let backend = registry
                 .resolve_role(&impl_role)
                 .context("no backend available for implementer role")?;
-            (backend, impl_role.backend.clone())
+            let budget_usd = impl_role.budget_usd.unwrap_or(6.0);
+            (backend, impl_role.backend.clone(), budget_usd)
         } else {
             let backend = registry.agent().context("no agent backend available")?;
-            (backend, "default-agent".to_string())
+            (backend, "default-agent".to_string(), 6.0)
         };
 
         tracing::info!(
@@ -453,6 +503,21 @@ pub mod pipeline {
             role_backend = %impl_role_name,
             "selected backend for implementation"
         );
+
+        // --- Budget check: ensure enough remaining before starting ---
+        {
+            let tracker = budget.lock().await;
+            if !tracker.can_afford(impl_budget_usd) {
+                tracing::warn!(
+                    task_id = %task.id,
+                    remaining_usd = tracker.remaining(),
+                    required_usd = impl_budget_usd,
+                    ceiling_usd = tracker.ceiling_usd,
+                    "budget exhausted, skipping task"
+                );
+                return Ok(());
+            }
+        }
 
         // --- Implement ---
         let branch = task.branch_name();
@@ -498,6 +563,16 @@ pub mod pipeline {
             .with_cwd(repo_config.path.clone());
 
         let result = agent.invoke(&request).await?;
+
+        // Record implementation cost
+        record_invocation_cost(
+            budget,
+            task.id.0,
+            SessionType::Implementation,
+            &result,
+            impl_budget_usd,
+        )
+        .await;
 
         if result.timed_out || result.exit_code.is_some_and(|c| c != 0) {
             tracing::warn!(
@@ -559,18 +634,21 @@ pub mod pipeline {
         }
 
         // --- Review (role-aware backend selection) ---
-        let reviewer: &dyn AiBackend = if let Some(roles) = roles {
+        let (reviewer, review_budget_usd): (&dyn AiBackend, f64) = if let Some(roles) = roles {
             let rev_role = roles.reviewer();
-            registry
+            let budget_usd = rev_role.budget_usd.unwrap_or(1.0);
+            let backend = registry
                 .resolve_role(&rev_role)
                 .or_else(|| registry.chat())
                 .or_else(|| registry.agent())
-                .context("no backend available for reviewer role")?
+                .context("no backend available for reviewer role")?;
+            (backend, budget_usd)
         } else {
-            registry
+            let backend = registry
                 .chat()
                 .or_else(|| registry.agent())
-                .context("no backend available for review")?
+                .context("no backend available for review")?;
+            (backend, 1.0)
         };
 
         tracing::info!(
@@ -592,6 +670,16 @@ pub mod pipeline {
         .with_system(reviewer_system);
 
         let review_result = reviewer.invoke(&review_request).await?;
+
+        // Record review cost
+        record_invocation_cost(
+            budget,
+            task.id.0,
+            SessionType::Review,
+            &review_result,
+            review_budget_usd,
+        )
+        .await;
 
         emit_state_change(event_bus, &task, "implementing", "reviewing");
         task.status = TaskStatus::Reviewing {
@@ -779,6 +867,7 @@ pub mod pipeline {
     }
 
     /// Retry a failed task: bump retry count, re-invoke with gate failure feedback.
+    #[allow(clippy::too_many_arguments)]
     pub async fn retry_task_pipeline(
         task_store: &TaskStore<'_>,
         gate_store: &GateStore<'_>,
@@ -786,6 +875,7 @@ pub mod pipeline {
         agents_dir: &Path,
         registry: &BackendRegistry,
         event_bus: &EventBus,
+        budget: &Arc<Mutex<BudgetTracker>>,
         mut task: Task,
     ) -> Result<()> {
         let feedback = match &task.status {
@@ -851,6 +941,7 @@ pub mod pipeline {
             registry,
             None,
             event_bus,
+            budget,
             task,
         )
         .await

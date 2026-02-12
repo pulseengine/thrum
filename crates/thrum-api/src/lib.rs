@@ -152,6 +152,12 @@ struct StatusResponse {
     task_counts: std::collections::HashMap<String, usize>,
     db_path: String,
     trace_dir: String,
+    /// Remaining budget in USD, if a budget tracker has been persisted.
+    budget_remaining: Option<f64>,
+    /// Total budget ceiling in USD, if a budget tracker has been persisted.
+    budget_ceiling: Option<f64>,
+    /// Total spent so far in USD, if a budget tracker has been persisted.
+    budget_spent: Option<f64>,
 }
 
 async fn status(State(state): State<Arc<ApiState>>) -> Result<Json<StatusResponse>, AppError> {
@@ -159,11 +165,25 @@ async fn status(State(state): State<Arc<ApiState>>) -> Result<Json<StatusRespons
     let store = TaskStore::new(&db);
     let counts = store.status_counts()?;
 
+    // Load budget info from the budget store
+    let budget_store = thrum_db::budget_store::BudgetStore::new(&db);
+    let (budget_remaining, budget_ceiling, budget_spent) = match budget_store.load() {
+        Ok(Some(tracker)) => (
+            Some(tracker.remaining()),
+            Some(tracker.ceiling_usd),
+            Some(tracker.total_spent()),
+        ),
+        _ => (None, None, None),
+    };
+
     Ok(Json(StatusResponse {
         healthy: true,
         task_counts: counts,
         db_path: state.db_path.display().to_string(),
         trace_dir: state.trace_dir.display().to_string(),
+        budget_remaining,
+        budget_ceiling,
+        budget_spent,
     }))
 }
 

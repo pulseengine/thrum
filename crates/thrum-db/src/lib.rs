@@ -1,3 +1,4 @@
+pub mod budget_store;
 pub mod gate_store;
 pub mod memory_store;
 pub mod task_store;
@@ -19,6 +20,7 @@ pub fn open_db(path: &Path) -> Result<Database> {
         let _traces = write_txn.open_table(trace_store::TRACES_TABLE)?;
         let _trace_counter = write_txn.open_table(trace_store::TRACE_COUNTER_TABLE)?;
         let _memory = write_txn.open_table(memory_store::MEMORY_TABLE)?;
+        let _budget = write_txn.open_table(budget_store::BUDGET_TABLE)?;
     }
     write_txn.commit()?;
     Ok(db)
