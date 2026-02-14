@@ -3,6 +3,7 @@ pub mod agent;
 pub mod budget;
 pub mod checkpoint;
 pub mod consistency;
+pub mod coordination;
 pub mod event;
 pub mod gate;
 pub mod memory;

@@ -276,6 +276,47 @@ impl WatchApp {
                     "[SESSION] {task_id} continuing session {session_id}"
                 ));
             }
+
+            // -- Agent-to-agent coordination events --
+            EventKind::FileConflictDetected {
+                conflict, policy, ..
+            } => {
+                let policy_tag = match policy {
+                    thrum_core::coordination::ConflictPolicy::WarnAndContinue => "warn",
+                    thrum_core::coordination::ConflictPolicy::Serialize => "serialize",
+                };
+                self.engine_log.push(format!(
+                    "[CONFLICT/{policy_tag}] {} between {} and {} on {}",
+                    conflict.path.display(),
+                    conflict.first_agent,
+                    conflict.second_agent,
+                    conflict.repo,
+                ));
+                // Also notify both agent panels
+                for aid in [&conflict.first_agent, &conflict.second_agent] {
+                    if let Some(panel) = self.agents.get_mut(&aid.0) {
+                        panel
+                            .log_lines
+                            .push(format!("⚠ file conflict: {}", conflict.path.display()));
+                    }
+                }
+            }
+
+            EventKind::CrossAgentNotification {
+                source, message, ..
+            } => {
+                self.engine_log
+                    .push(format!("[NOTIFY] {source}: {message}"));
+            }
+
+            EventKind::SharedMemoryWrite {
+                agent_id,
+                key,
+                value,
+            } => {
+                self.engine_log
+                    .push(format!("[SHARED] {agent_id} set {key}={value}"));
+            }
         }
     }
 
