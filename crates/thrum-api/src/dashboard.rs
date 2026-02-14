@@ -19,7 +19,6 @@ use std::sync::Arc;
 use thrum_core::task::{TaskId, TaskStatus};
 use thrum_core::telemetry::{TraceFilter, TraceReader};
 use thrum_db::budget_store::BudgetStore;
-use thrum_db::convergence_store::ConvergenceStore;
 use thrum_db::gate_store::GateStore;
 use thrum_db::memory_store::MemoryStore;
 use thrum_db::task_store::TaskStore;
@@ -213,8 +212,6 @@ async fn task_detail_partial(
     let db = state.db();
     let task_store = TaskStore::new(db);
     let gate_store = GateStore::new(db);
-    let convergence_store = ConvergenceStore::new(db);
-
     let task = task_store
         .get(&TaskId(id))?
         .ok_or_else(|| DashboardError(format!("task {id} not found")))?;
@@ -302,33 +299,7 @@ async fn task_detail_partial(
         html.push_str("</div>");
     }
 
-    // ── Convergence / Retry History ──
-    let convergence_records = convergence_store.get_for_task(&TaskId(id))?;
-    if !convergence_records.is_empty() {
-        html.push_str("<div class=\"detail-section\"><h4>Convergence Analysis</h4>");
-        html.push_str("<div class=\"convergence-records\">");
-        for record in &convergence_records {
-            let sig = escape_html(&format!("{}", record.signature));
-            let _ = write!(
-                html,
-                "<div class=\"convergence-entry\">\
-                 <span class=\"conv-signature\">{sig}</span>\
-                 <span class=\"conv-count\">x{}</span>\
-                 <span class=\"conv-strategy badge badge-{}\">{}</span>\
-                 </div>",
-                record.occurrence_count,
-                thrum_core::convergence::RetryStrategy::from_occurrence_count(
-                    record.occurrence_count
-                )
-                .label(),
-                thrum_core::convergence::RetryStrategy::from_occurrence_count(
-                    record.occurrence_count
-                )
-                .label(),
-            );
-        }
-        html.push_str("</div></div>");
-    }
+    // TODO: Add convergence / retry history once convergence_store exists
 
     // ── Diff (for reviewable tasks) ──
     if task.status.is_reviewable() {

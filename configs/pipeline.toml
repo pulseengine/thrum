@@ -4,6 +4,14 @@
 # For a working multi-repo example, see examples/pulseengine/pipeline.toml.
 # For a minimal single-repo setup, see examples/minimal/pipeline.toml.
 
+# ── Engine Concurrency ──────────────────────────────────────────────
+# When > 1, each agent gets an isolated git worktree so that multiple
+# agents can work concurrently on the same repo without index conflicts.
+
+[engine]
+per_repo_limit = 3
+worktrees_dir = "worktrees"
+
 # ── Gate 1: Code Quality ──────────────────────────────────────────────
 # Runs fmt, clippy, and test checks against each repo.
 
