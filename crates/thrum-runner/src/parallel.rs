@@ -170,6 +170,29 @@ pub async fn run_parallel(
         }
     }
 
+    // Lifecycle: decay and prune stale memory entries at engine shutdown.
+    // Uses 72-hour half-life (memories lose half their relevance every 3 days)
+    // and prunes entries that have decayed below 0.05 (effectively forgotten).
+    {
+        let memory_store = thrum_db::memory_store::MemoryStore::new(&ctx.db);
+        match memory_store.decay_all(72.0) {
+            Ok(n) => {
+                if n > 0 {
+                    tracing::info!(entries = n, "decayed memory relevance scores");
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "failed to decay memory entries"),
+        }
+        match memory_store.prune_below(0.05) {
+            Ok(n) => {
+                if n > 0 {
+                    tracing::info!(pruned = n, "pruned low-relevance memory entries");
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "failed to prune memory entries"),
+        }
+    }
+
     tracing::info!("parallel engine stopped");
     ctx.event_bus.emit(EventKind::EngineLog {
         level: thrum_core::event::LogLevel::Info,

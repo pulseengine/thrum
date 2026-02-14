@@ -3,6 +3,7 @@ mod watch;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use clap::{Parser, Subcommand};
+use redb::ReadableTable;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -141,6 +142,11 @@ enum Commands {
     },
     /// Show changelog since last release tag.
     Changelog,
+    /// Inspect and manage agent memory entries.
+    Memory {
+        #[command(subcommand)]
+        action: MemoryAction,
+    },
     /// Live TUI dashboard showing agent activity.
     Watch,
 }
@@ -184,6 +190,36 @@ enum TraceAction {
     },
     /// Show traceability gaps (requirements without tests/proofs).
     Gaps,
+}
+
+#[derive(Subcommand)]
+enum MemoryAction {
+    /// List memory entries, optionally filtered by repo or category.
+    List {
+        #[arg(long)]
+        repo: Option<String>,
+        /// Filter by category: error, pattern, decision, context.
+        #[arg(long)]
+        category: Option<String>,
+        #[arg(long, default_value = "20")]
+        limit: usize,
+    },
+    /// Show a single memory entry by ID.
+    Show { id: String },
+    /// Manually trigger decay and pruning of stale entries.
+    Decay {
+        /// Half-life in hours (default: 72).
+        #[arg(long, default_value = "72.0")]
+        half_life: f64,
+        /// Minimum relevance score; entries below this are pruned.
+        #[arg(long, default_value = "0.05")]
+        prune_threshold: f64,
+    },
+    /// Clear all memory entries for a repo (or all repos).
+    Clear {
+        #[arg(long)]
+        repo: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -288,6 +324,10 @@ async fn main() -> Result<()> {
         Commands::Task { action } => {
             let db = open_db()?;
             cmd_task(&db, action)
+        }
+        Commands::Memory { action } => {
+            let db = open_db()?;
+            cmd_memory(&db, action)
         }
         Commands::Trace { action } => {
             let db = open_db()?;
@@ -948,6 +988,13 @@ async fn cmd_run(
         }
     }
 
+    // Lifecycle: decay and prune stale memory entries after run completes
+    {
+        let memory_store = thrum_db::memory_store::MemoryStore::new(db);
+        let _ = memory_store.decay_all(72.0);
+        let _ = memory_store.prune_below(0.05);
+    }
+
     // Persist budget tracker
     {
         let tracker = budget.lock().await;
@@ -1421,6 +1468,140 @@ fn cmd_task(db: &redb::Database, action: TaskAction) -> Result<()> {
                 task.status.label(),
                 task.title
             );
+        }
+    }
+
+    Ok(())
+}
+
+fn cmd_memory(db: &redb::Database, action: MemoryAction) -> Result<()> {
+    use thrum_db::memory_store::MemoryStore;
+
+    let store = MemoryStore::new(db);
+
+    match action {
+        MemoryAction::List {
+            repo,
+            category,
+            limit,
+        } => {
+            let entries = if let Some(ref repo_name) = repo {
+                let rn = RepoName::new(repo_name);
+                if category.as_deref() == Some("error") {
+                    store.query_errors_for_repo(&rn, limit)?
+                } else {
+                    let mut all = store.query_for_task(&rn, limit)?;
+                    if let Some(ref cat) = category {
+                        all.retain(|e| e.category.label() == cat.as_str());
+                    }
+                    all
+                }
+            } else {
+                // No repo filter: query all entries (use a high limit, then filter)
+                // MemoryStore doesn't have a "list all" — iterate manually
+                let read_txn = db.begin_read()?;
+                let table = read_txn.open_table(thrum_db::memory_store::MEMORY_TABLE)?;
+                let mut entries = Vec::new();
+                for item in table.iter()? {
+                    let (_, value) = item?;
+                    let entry: thrum_core::memory::MemoryEntry =
+                        serde_json::from_str(value.value())?;
+                    if let Some(ref cat) = category
+                        && entry.category.label() != cat.as_str()
+                    {
+                        continue;
+                    }
+                    entries.push(entry);
+                }
+                entries.sort_by(|a, b| {
+                    b.relevance_score
+                        .partial_cmp(&a.relevance_score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                entries.truncate(limit);
+                entries
+            };
+
+            if entries.is_empty() {
+                println!("No memory entries found.");
+            } else {
+                println!(
+                    "{:<18} {:<10} {:<10} {:<8} {:<6} CONTENT",
+                    "ID", "REPO", "CATEGORY", "SCORE", "HITS"
+                );
+                println!("{}", "-".repeat(80));
+                for e in &entries {
+                    println!(
+                        "{:<18} {:<10} {:<10} {:<8.3} {:<6} {}",
+                        &e.id.0[..16.min(e.id.0.len())],
+                        e.repo,
+                        e.category.label(),
+                        e.relevance_score,
+                        e.access_count,
+                        e.content.chars().take(50).collect::<String>(),
+                    );
+                }
+                println!("\n({} entries)", entries.len());
+            }
+        }
+        MemoryAction::Show { id } => {
+            let memory_id = thrum_core::memory::MemoryId(id);
+            match store.get(&memory_id)? {
+                Some(entry) => {
+                    println!("{}", serde_json::to_string_pretty(&entry)?);
+                }
+                None => {
+                    println!("Memory entry not found: {}", memory_id);
+                }
+            }
+        }
+        MemoryAction::Decay {
+            half_life,
+            prune_threshold,
+        } => {
+            let decayed = store.decay_all(half_life)?;
+            let pruned = store.prune_below(prune_threshold)?;
+            println!(
+                "Decayed {decayed} entries (half-life: {half_life}h), pruned {pruned} below {prune_threshold}"
+            );
+        }
+        MemoryAction::Clear { repo } => {
+            if let Some(ref repo_name) = repo {
+                let rn = RepoName::new(repo_name);
+                // Get all entries for this repo, then remove them
+                let entries = store.query_for_task(&rn, usize::MAX)?;
+                let write_txn = db.begin_write()?;
+                {
+                    let mut table = write_txn.open_table(thrum_db::memory_store::MEMORY_TABLE)?;
+                    for entry in &entries {
+                        table.remove(entry.id.0.as_str())?;
+                    }
+                }
+                write_txn.commit()?;
+                println!(
+                    "Cleared {} memory entries for repo '{repo_name}'",
+                    entries.len()
+                );
+            } else {
+                // Clear all entries
+                let write_txn = db.begin_write()?;
+                {
+                    let mut table = write_txn.open_table(thrum_db::memory_store::MEMORY_TABLE)?;
+                    let keys: Vec<String> = table
+                        .iter()?
+                        .map(|item| {
+                            let (key, _) = item.unwrap();
+                            key.value().to_string()
+                        })
+                        .collect();
+                    let count = keys.len();
+                    for key in &keys {
+                        table.remove(key.as_str())?;
+                    }
+                    println!("Cleared {count} memory entries");
+                }
+                write_txn.commit()?;
+            }
         }
     }
 
