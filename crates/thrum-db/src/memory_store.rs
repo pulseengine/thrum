@@ -40,6 +40,37 @@ impl<'a> MemoryStore<'a> {
         }
     }
 
+    /// List all memory entries, optionally filtered by repo, sorted by relevance descending.
+    pub fn list_all(
+        &self,
+        repo_filter: Option<&RepoName>,
+        limit: usize,
+    ) -> Result<Vec<MemoryEntry>> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(MEMORY_TABLE)?;
+        let mut entries = Vec::new();
+
+        let iter = table.iter()?;
+        for item in iter {
+            let (_, value) = item?;
+            let entry: MemoryEntry = serde_json::from_str(value.value())?;
+            if let Some(repo) = repo_filter
+                && &entry.repo != repo
+            {
+                continue;
+            }
+            entries.push(entry);
+        }
+
+        entries.sort_by(|a, b| {
+            b.relevance_score
+                .partial_cmp(&a.relevance_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        entries.truncate(limit);
+        Ok(entries)
+    }
+
     /// Query memories for a repo, sorted by relevance_score descending.
     pub fn query_for_task(&self, repo: &RepoName, limit: usize) -> Result<Vec<MemoryEntry>> {
         let read_txn = self.db.begin_read()?;
