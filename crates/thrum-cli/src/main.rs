@@ -103,6 +103,11 @@ enum Commands {
         /// Bind address for the API server (requires --serve).
         #[arg(long, default_value = "127.0.0.1:3000")]
         bind: String,
+        /// Resume tasks from their last checkpoint instead of starting over.
+        /// When set, the engine detects existing checkpoints and skips
+        /// already-completed gates for in-progress tasks.
+        #[arg(long)]
+        resume: bool,
     },
     /// Manage tasks in the queue.
     Task {
@@ -261,6 +266,10 @@ enum TaskAction {
         #[arg(long)]
         status: String,
     },
+    /// Show checkpoint info for a task (if any).
+    Checkpoint { id: i64 },
+    /// Show stored session ID for a task (used for session continuation on retries).
+    Session { id: i64 },
 }
 
 #[tokio::main]
@@ -289,6 +298,7 @@ async fn main() -> Result<()> {
             agents,
             serve,
             bind,
+            resume,
         } => {
             let repo_filter = repo.map(RepoName::new);
             let repos_config = ReposConfig::load(&cli.config)?;
@@ -317,6 +327,7 @@ async fn main() -> Result<()> {
                     &cli.pipeline,
                     repo_filter,
                     once,
+                    resume,
                 )
                 .await
             }
@@ -836,6 +847,7 @@ async fn cmd_run(
     pipeline_config: &Path,
     repo_filter: Option<RepoName>,
     once: bool,
+    resume: bool,
 ) -> Result<()> {
     let task_store = TaskStore::new(db);
     let gate_store = GateStore::new(db);
@@ -928,6 +940,72 @@ async fn cmd_run(
                 break;
             }
             continue;
+        }
+
+        // Phase B½: Resume tasks with checkpoints (if --resume flag is set)
+        if resume {
+            let checkpoint_store = thrum_db::checkpoint_store::CheckpointStore::new(db);
+            let checkpoints = checkpoint_store.list().unwrap_or_default();
+            for checkpoint in checkpoints {
+                // Only resume tasks matching the repo filter
+                if let Some(ref filter) = repo_filter
+                    && &checkpoint.repo != filter
+                {
+                    continue;
+                }
+
+                if let Some(task) = task_store.get(&checkpoint.task_id)? {
+                    // Only resume tasks that are in a resumable state
+                    // (implementing or claimed — not already in a gate-failed/merged state)
+                    let resumable = matches!(
+                        task.status,
+                        TaskStatus::Implementing { .. }
+                            | TaskStatus::Claimed { .. }
+                            | TaskStatus::Pending
+                    );
+                    if !resumable {
+                        continue;
+                    }
+
+                    tracing::info!(
+                        task_id = %task.id,
+                        phase = %checkpoint.completed_phase,
+                        "resuming task from checkpoint"
+                    );
+
+                    let result = thrum_runner::parallel::pipeline::resume_task_pipeline(
+                        &task_store,
+                        &gate_store,
+                        repos_config,
+                        agents_dir,
+                        &registry,
+                        None,
+                        &event_bus,
+                        &budget,
+                        subsample.as_ref(),
+                        task,
+                        None,
+                    )
+                    .await;
+
+                    match result {
+                        Ok(true) => {
+                            tracing::info!("resumed task pipeline completed");
+                        }
+                        Ok(false) => {
+                            tracing::debug!("no checkpoint found for resume");
+                        }
+                        Err(e) => {
+                            tracing::error!("resume pipeline failed: {e:#}");
+                        }
+                    }
+
+                    if once {
+                        break;
+                    }
+                    continue;
+                }
+            }
         }
 
         // Phase C: Pick next pending task
@@ -1468,6 +1546,31 @@ fn cmd_task(db: &redb::Database, action: TaskAction) -> Result<()> {
                 task.status.label(),
                 task.title
             );
+        }
+        TaskAction::Checkpoint { id } => {
+            let task_id = TaskId(id);
+            let checkpoint_store = thrum_db::checkpoint_store::CheckpointStore::new(db);
+            match checkpoint_store.get(&task_id)? {
+                Some(cp) => {
+                    println!("{}", serde_json::to_string_pretty(&cp)?);
+                }
+                None => {
+                    println!("No checkpoint found for TASK-{id:04}");
+                }
+            }
+        }
+
+        TaskAction::Session { id } => {
+            let task_id = TaskId(id);
+            let session_store = thrum_db::session_store::SessionStore::new(db);
+            match session_store.get(&task_id)? {
+                Some(sid) => {
+                    println!("TASK-{id:04} session ID: {sid}");
+                }
+                None => {
+                    println!("No stored session for TASK-{id:04}");
+                }
+            }
         }
     }
 

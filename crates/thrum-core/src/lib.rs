@@ -1,6 +1,7 @@
 pub mod a2a;
 pub mod agent;
 pub mod budget;
+pub mod checkpoint;
 pub mod consistency;
 pub mod event;
 pub mod gate;

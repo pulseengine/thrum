@@ -261,6 +261,21 @@ impl WatchApp {
                     self.engine_log.drain(..50);
                 }
             }
+
+            EventKind::CheckpointSaved { task_id, phase, .. } => {
+                self.engine_log
+                    .push(format!("[CKPT] {task_id} checkpoint saved at {phase}"));
+            }
+
+            EventKind::SessionContinued {
+                task_id,
+                session_id,
+                ..
+            } => {
+                self.engine_log.push(format!(
+                    "[SESSION] {task_id} continuing session {session_id}"
+                ));
+            }
         }
     }
 

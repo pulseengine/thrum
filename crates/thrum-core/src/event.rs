@@ -7,6 +7,7 @@
 //! broadcast bus lives in `thrum-runner`.
 
 use crate::agent::AgentId;
+use crate::checkpoint::CompletedPhase;
 use crate::task::{GateLevel, RepoName, TaskId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -108,6 +109,20 @@ pub enum EventKind {
 
     /// Engine-level log message (info, warn, error).
     EngineLog { level: LogLevel, message: String },
+
+    /// Agent session checkpoint saved for resumable runs.
+    CheckpointSaved {
+        task_id: TaskId,
+        repo: RepoName,
+        phase: CompletedPhase,
+    },
+
+    /// Agent session continued from a previous invocation (timeout/failure recovery).
+    SessionContinued {
+        task_id: TaskId,
+        repo: RepoName,
+        session_id: String,
+    },
 }
 
 /// What kind of file system change was detected.
@@ -244,6 +259,21 @@ impl std::fmt::Display for PipelineEvent {
                 };
                 write!(f, "[{ts}] [{tag}] {message}")
             }
+
+            EventKind::CheckpointSaved {
+                task_id,
+                repo,
+                phase,
+            } => write!(f, "[{ts}] {task_id} ({repo}): checkpoint saved at {phase}"),
+
+            EventKind::SessionContinued {
+                task_id,
+                repo,
+                session_id,
+            } => write!(
+                f,
+                "[{ts}] {task_id} ({repo}): session continued ({session_id})"
+            ),
         }
     }
 }
