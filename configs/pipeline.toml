@@ -144,7 +144,7 @@ enabled = true
 backend = "opus"
 prompt_template = "agents/implementer.md"
 budget_usd = 6.0
-timeout_secs = 600
+timeout_secs = 1200
 
 [roles.reviewer]
 backend = "sonnet"
