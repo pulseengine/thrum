@@ -144,6 +144,28 @@ pub async fn serve(state: Arc<ApiState>, bind_addr: &str) -> anyhow::Result<()> 
     Ok(())
 }
 
+/// Start the API server with a graceful shutdown signal.
+///
+/// When the token is cancelled, the server stops accepting new connections
+/// and finishes in-flight requests. Used by `thrum run --serve` so the API server
+/// shuts down together with the engine, releasing the shared DB lock.
+pub async fn serve_with_shutdown(
+    state: Arc<ApiState>,
+    bind_addr: &str,
+    shutdown: tokio_util::sync::CancellationToken,
+) -> anyhow::Result<()> {
+    let app = api_router(state);
+    let listener = tokio::net::TcpListener::bind(bind_addr).await?;
+    tracing::info!(%bind_addr, "starting API server (with graceful shutdown)");
+    tracing::info!("dashboard available at http://{bind_addr}/dashboard");
+    tracing::info!("live dashboard at http://{bind_addr}/dashboard/live");
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown.cancelled_owned())
+        .await?;
+    tracing::info!("API server shut down gracefully");
+    Ok(())
+}
+
 // ─── Error type ──────────────────────────────────────────────────────────
 
 #[derive(Debug)]

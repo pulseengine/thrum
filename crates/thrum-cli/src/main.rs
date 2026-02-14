@@ -699,8 +699,22 @@ async fn cmd_run_parallel(
 
     let event_bus = thrum_runner::event_bus::EventBus::new();
 
+    // Create the cancellation token early so the API server can share it.
+    let shutdown = CancellationToken::new();
+    let shutdown_signal = shutdown.clone();
+
+    // Signal handler for graceful shutdown
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            tracing::info!("received Ctrl+C, initiating graceful shutdown");
+            shutdown_signal.cancel();
+        }
+    });
+
     // Spawn A2A/HTTP API server if --serve was passed.
     // Uses the same Arc<Database> to avoid redb exclusive lock conflict.
+    // The API server receives the CancellationToken so it shuts down
+    // when the engine stops, releasing the shared DB lock.
     if serve {
         let api_state = Arc::new(thrum_api::ApiState::with_shared_db(
             shared_db.clone(),
@@ -709,8 +723,11 @@ async fn cmd_run_parallel(
             event_bus.clone(),
         ));
         let bind_addr = bind.to_string();
+        let api_shutdown = shutdown.clone();
         tokio::spawn(async move {
-            if let Err(e) = thrum_api::serve(api_state, &bind_addr).await {
+            if let Err(e) =
+                thrum_api::serve_with_shutdown(api_state, &bind_addr, api_shutdown).await
+            {
                 tracing::error!(error = %e, "API server failed");
             }
         });
@@ -745,19 +762,14 @@ async fn cmd_run_parallel(
         poll_interval: std::time::Duration::from_secs(5),
     };
 
-    let shutdown = CancellationToken::new();
-    let shutdown_clone = shutdown.clone();
-
-    // Signal handler for graceful shutdown
-    tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            tracing::info!("received Ctrl+C, initiating graceful shutdown");
-            shutdown_clone.cancel();
-        }
-    });
+    // Keep a clone to signal the API server after the engine finishes.
+    let final_shutdown = shutdown.clone();
 
     tracing::info!(agents = max_agents, "starting parallel execution engine");
     let result = thrum_runner::parallel::run_parallel(ctx, config, repo_filter, shutdown).await;
+
+    // Signal the API server to shut down (no-op if already cancelled via Ctrl+C).
+    final_shutdown.cancel();
 
     // Persist budget tracker to DB after run completes
     {

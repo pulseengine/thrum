@@ -2967,6 +2967,7 @@ dependencies = [
  "thrum-runner",
  "tokio",
  "tokio-stream",
+ "tokio-util",
  "toml",
  "tower 0.5.3",
  "tower-http",
