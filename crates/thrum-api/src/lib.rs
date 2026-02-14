@@ -141,7 +141,6 @@ pub async fn serve(state: Arc<ApiState>, bind_addr: &str) -> anyhow::Result<()> 
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     tracing::info!(%bind_addr, "starting API server");
     tracing::info!("dashboard available at http://{bind_addr}/dashboard");
-    tracing::info!("live dashboard at http://{bind_addr}/dashboard/live");
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -160,7 +159,6 @@ pub async fn serve_with_shutdown(
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     tracing::info!(%bind_addr, "starting API server (with graceful shutdown)");
     tracing::info!("dashboard available at http://{bind_addr}/dashboard");
-    tracing::info!("live dashboard at http://{bind_addr}/dashboard/live");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown.cancelled_owned())
         .await?;
@@ -634,6 +632,10 @@ mod tests {
         let html = String::from_utf8(body.to_vec()).unwrap();
         assert!(html.contains("Thrum Dashboard"));
         assert!(html.contains("htmx.org"));
+        // Unified dashboard has budget, memory, and agent sections
+        assert!(html.contains("budget-bar"));
+        assert!(html.contains("memory-section"));
+        assert!(html.contains("agent-grid"));
     }
 
     #[tokio::test]
@@ -734,6 +736,9 @@ mod tests {
         assert!(html.contains("loom"));
         assert!(html.contains("Test task"));
         assert!(html.contains("pending"));
+        // Unified dashboard includes timeline and expandable rows
+        assert!(html.contains("timeline"));
+        assert!(html.contains("task-row"));
     }
 
     #[tokio::test]
@@ -788,14 +793,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_dashboard_serves_html() {
+    async fn unified_dashboard_includes_sse() {
         let (state, _dir) = test_state();
         let app = api_router(state);
 
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/dashboard/live")
+                    .uri("/dashboard")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -807,20 +812,24 @@ mod tests {
             .await
             .unwrap();
         let html = String::from_utf8(body.to_vec()).unwrap();
-        assert!(html.contains("Thrum Live Dashboard"));
+        // Unified dashboard includes SSE wiring from the old live page
         assert!(html.contains("EventSource"));
         assert!(html.contains("/api/v1/events/stream"));
+        assert!(html.contains("agent-grid"));
+        // Also still has HTMX polling partials
+        assert!(html.contains("partials/budget"));
+        assert!(html.contains("partials/memory"));
     }
 
     #[tokio::test]
-    async fn live_css_served() {
+    async fn dashboard_budget_partial() {
         let (state, _dir) = test_state();
         let app = api_router(state);
 
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/dashboard/assets/live.css")
+                    .uri("/dashboard/partials/budget")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -828,8 +837,72 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
-        let ct = response.headers().get("content-type").unwrap();
-        assert_eq!(ct, "text/css; charset=utf-8");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("budget-widget"));
+    }
+
+    #[tokio::test]
+    async fn dashboard_memory_partial() {
+        let (state, _dir) = test_state();
+        let app = api_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/dashboard/partials/memory")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("memory-filter"));
+    }
+
+    #[tokio::test]
+    async fn dashboard_task_detail_partial() {
+        let (state, _dir) = test_state();
+
+        // Insert a task so we can fetch its detail
+        {
+            let store = TaskStore::new(state.db());
+            let mut task = Task::new(
+                RepoName::new("loom"),
+                "Detail test".into(),
+                "A description".into(),
+            );
+            task.acceptance_criteria = vec!["criterion 1".into()];
+            store.insert(task).unwrap();
+        }
+
+        let app = api_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/dashboard/partials/task-detail/1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("task-detail"));
+        assert!(html.contains("A description"));
+        assert!(html.contains("criterion 1"));
+        assert!(html.contains("branch-name"));
     }
 
     #[tokio::test]
