@@ -12,7 +12,7 @@ use axum::{
     Json, Router,
     extract::{Path, Query, State},
     http::StatusCode,
-    response::IntoResponse,
+    response::{IntoResponse, Redirect},
     routing::{get, post},
 };
 use chrono::Utc;
@@ -110,6 +110,8 @@ impl ApiState {
 /// Build the axum router with all API routes and the embedded dashboard.
 pub fn api_router(state: Arc<ApiState>) -> Router {
     Router::new()
+        // Root redirects to the dashboard
+        .route("/", get(|| async { Redirect::permanent("/dashboard") }))
         // JSON API
         .route("/api/v1/health", get(health_check))
         .route("/api/v1/status", get(status))

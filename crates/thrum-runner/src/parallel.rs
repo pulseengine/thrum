@@ -513,12 +513,15 @@ pub mod pipeline {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use thrum_core::budget::{self, BudgetEntry, BudgetTracker, SessionType};
+    use thrum_core::checkpoint::Checkpoint;
     use thrum_core::event::EventKind;
     use thrum_core::gate::{run_gate, run_integration_gate_configured};
     use thrum_core::repo::ReposConfig;
     use thrum_core::subsample::SubsampleConfig;
     use thrum_core::task::{CheckpointSummary, GateLevel, MAX_RETRIES, Task, TaskStatus};
+    use thrum_db::checkpoint_store::CheckpointStore;
     use thrum_db::gate_store::GateStore;
+    use thrum_db::session_store::SessionStore;
     use thrum_db::task_store::TaskStore;
     use tokio::sync::Mutex;
 
@@ -530,6 +533,45 @@ pub mod pipeline {
             from: from.to_string(),
             to: to.to_string(),
         });
+    }
+
+    /// Save a checkpoint and emit a CheckpointSaved event.
+    fn save_checkpoint(
+        checkpoint_store: &CheckpointStore<'_>,
+        event_bus: &EventBus,
+        checkpoint: &Checkpoint,
+    ) {
+        if let Err(e) = checkpoint_store.save(checkpoint) {
+            tracing::warn!(
+                task_id = %checkpoint.task_id,
+                phase = %checkpoint.completed_phase,
+                error = %e,
+                "failed to save checkpoint"
+            );
+        } else {
+            tracing::info!(
+                task_id = %checkpoint.task_id,
+                phase = %checkpoint.completed_phase,
+                "checkpoint saved"
+            );
+            event_bus.emit(EventKind::CheckpointSaved {
+                task_id: checkpoint.task_id.clone(),
+                repo: checkpoint.repo.clone(),
+                phase: checkpoint.completed_phase.clone(),
+            });
+        }
+    }
+
+    /// Remove a checkpoint after a task reaches a terminal state (merged)
+    /// or moves to AwaitingApproval (checkpoint data is now in the task status).
+    fn remove_checkpoint(checkpoint_store: &CheckpointStore<'_>, task: &Task) {
+        if let Err(e) = checkpoint_store.remove(&task.id) {
+            tracing::debug!(
+                task_id = %task.id,
+                error = %e,
+                "failed to remove checkpoint (non-fatal)"
+            );
+        }
     }
 
     /// Record the cost of an AI invocation into the shared budget tracker.
@@ -688,11 +730,41 @@ pub mod pipeline {
             build_implementation_prompt(&task, &branch)
         );
 
-        let request = AiRequest::new(&prompt)
+        // Look up a previous session ID for session continuation on retries.
+        // If this task was retried, the session store may contain the session
+        // ID from the prior (timed-out or failed) invocation.
+        let session_store = SessionStore::new(task_store.db());
+        let resume_session_id = session_store.get(&task.id).unwrap_or(None);
+        if let Some(ref sid) = resume_session_id {
+            tracing::info!(
+                task_id = %task.id,
+                session_id = sid,
+                "found previous session ID for continuation"
+            );
+            event_bus.emit(EventKind::SessionContinued {
+                task_id: task.id.clone(),
+                repo: task.repo.clone(),
+                session_id: sid.clone(),
+            });
+        }
+
+        let mut request = AiRequest::new(&prompt)
             .with_system(system_prompt)
             .with_cwd(repo_config.path.clone());
+        if let Some(sid) = resume_session_id {
+            request = request.with_resume_session(sid);
+        }
 
         let result = agent.invoke(&request).await?;
+
+        // Store the session ID for potential future retries (timeout/failure recovery).
+        // This persists even if the invocation timed out — especially important then,
+        // since the agent's partial work is preserved in the session.
+        if let Some(ref sid) = result.session_id
+            && let Err(e) = session_store.save(&task.id, sid)
+        {
+            tracing::warn!(error = %e, "failed to store session ID");
+        }
 
         // Record implementation cost
         record_invocation_cost(
@@ -713,6 +785,7 @@ pub mod pipeline {
         }
 
         // --- Gate 1: Quality ---
+        let checkpoint_store = CheckpointStore::new(task_store.db());
         tracing::info!("running Gate 1: Quality");
         event_bus.emit(EventKind::GateStarted {
             task_id: task.id.clone(),
@@ -767,6 +840,17 @@ pub mod pipeline {
             }
 
             return Ok(());
+        }
+
+        // --- Checkpoint: Gate 1 passed ---
+        {
+            let mut cp = Checkpoint::after_implementation(
+                task.id.clone(),
+                task.repo.clone(),
+                branch.clone(),
+            );
+            cp.advance_to_gate1(gate1.clone());
+            save_checkpoint(&checkpoint_store, event_bus, &cp);
         }
 
         // --- Review (role-aware backend selection) ---
@@ -824,6 +908,28 @@ pub mod pipeline {
         task.updated_at = Utc::now();
         task_store.update(&task)?;
 
+        // --- Checkpoint: Review completed ---
+        {
+            let cp_store = CheckpointStore::new(task_store.db());
+            match cp_store.get(&task.id) {
+                Ok(Some(mut cp)) => {
+                    cp.advance_to_review(review_result.content.clone());
+                    save_checkpoint(&cp_store, event_bus, &cp);
+                }
+                _ => {
+                    // No existing checkpoint — create a fresh one with review state
+                    let mut cp = Checkpoint::after_implementation(
+                        task.id.clone(),
+                        task.repo.clone(),
+                        branch.clone(),
+                    );
+                    cp.advance_to_gate1(gate1.clone());
+                    cp.advance_to_review(review_result.content.clone());
+                    save_checkpoint(&cp_store, event_bus, &cp);
+                }
+            }
+        }
+
         // --- Gate 2: Proofs ---
         tracing::info!("running Gate 2: Proof");
         event_bus.emit(EventKind::GateStarted {
@@ -879,7 +985,29 @@ pub mod pipeline {
             return Ok(());
         }
 
-        // --- Checkpoint: Await Human Approval ---
+        // --- Checkpoint: Gate 2 passed ---
+        {
+            let cp_store = CheckpointStore::new(task_store.db());
+            match cp_store.get(&task.id) {
+                Ok(Some(mut cp)) => {
+                    cp.advance_to_gate2(gate2.clone());
+                    save_checkpoint(&cp_store, event_bus, &cp);
+                }
+                _ => {
+                    let mut cp = Checkpoint::after_implementation(
+                        task.id.clone(),
+                        task.repo.clone(),
+                        branch.clone(),
+                    );
+                    cp.advance_to_gate1(gate1.clone());
+                    cp.advance_to_review(review_result.content.clone());
+                    cp.advance_to_gate2(gate2.clone());
+                    save_checkpoint(&cp_store, event_bus, &cp);
+                }
+            }
+        }
+
+        // --- Await Human Approval ---
         let summary = CheckpointSummary {
             diff_summary: diff,
             reviewer_output: review_result.content,
@@ -890,6 +1018,10 @@ pub mod pipeline {
         task.status = TaskStatus::AwaitingApproval { summary };
         task.updated_at = Utc::now();
         task_store.update(&task)?;
+
+        // Clean up checkpoint and session — task state now captures all needed data
+        remove_checkpoint(&checkpoint_store, &task);
+        let _ = session_store.remove(&task.id);
 
         tracing::info!(
             task_id = %task.id,
@@ -1016,6 +1148,11 @@ pub mod pipeline {
         task.updated_at = Utc::now();
         task_store.update(&task)?;
 
+        // Clean up any stale checkpoint and session for this task
+        let checkpoint_store = CheckpointStore::new(task_store.db());
+        remove_checkpoint(&checkpoint_store, &task);
+        let _ = SessionStore::new(task_store.db()).remove(&task.id);
+
         tracing::info!(
             task_id = %task.id,
             commit = %commit_sha,
@@ -1135,6 +1272,271 @@ pub mod pipeline {
             work_dir,
         )
         .await
+    }
+
+    /// Resume a task from its last checkpoint, skipping already-completed gates.
+    ///
+    /// Detects the existing branch and checkpoint, then picks up the pipeline
+    /// from the phase after the last checkpoint. This avoids re-running
+    /// expensive AI invocations and gate checks that already passed.
+    ///
+    /// Returns `Ok(true)` if resumption was performed, `Ok(false)` if no
+    /// checkpoint was found (caller should run the full pipeline instead).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn resume_task_pipeline(
+        task_store: &TaskStore<'_>,
+        gate_store: &GateStore<'_>,
+        repos_config: &ReposConfig,
+        agents_dir: &Path,
+        registry: &BackendRegistry,
+        roles: Option<&thrum_core::role::RolesConfig>,
+        event_bus: &EventBus,
+        budget: &Arc<Mutex<BudgetTracker>>,
+        subsample: Option<&SubsampleConfig>,
+        mut task: Task,
+        work_dir: Option<&Path>,
+    ) -> Result<bool> {
+        let checkpoint_store = CheckpointStore::new(task_store.db());
+        let checkpoint = match checkpoint_store.get(&task.id)? {
+            Some(cp) => cp,
+            None => return Ok(false), // No checkpoint — cannot resume
+        };
+
+        let base_repo_config = repos_config
+            .get(&task.repo)
+            .context(format!("no config for repo {}", task.repo))?;
+
+        let repo_config = match work_dir {
+            Some(dir) => base_repo_config.with_work_dir(dir.to_path_buf()),
+            None => base_repo_config.clone(),
+        };
+        let repo_config = &repo_config;
+
+        let branch = checkpoint.branch.clone();
+
+        tracing::info!(
+            task_id = %task.id,
+            phase = %checkpoint.completed_phase,
+            branch = %branch,
+            "resuming task from checkpoint"
+        );
+
+        // Ensure the task is in Implementing state for resumption
+        let prev_status = task.status.label().to_string();
+        task.status = TaskStatus::Implementing {
+            branch: branch.clone(),
+            started_at: Utc::now(),
+        };
+        task.updated_at = Utc::now();
+        task_store.update(&task)?;
+        emit_state_change(event_bus, &task, &prev_status, "implementing (resumed)");
+
+        // Verify the branch still exists
+        let git = GitRepo::open(&repo_config.path)?;
+        if let Err(e) = git.create_branch(&branch) {
+            tracing::debug!(
+                error = %e,
+                "branch already exists (expected for resume)"
+            );
+        }
+
+        // Determine what we can skip based on checkpoint phase
+        let gate1_report = if checkpoint.gate1_passed() {
+            tracing::info!(
+                task_id = %task.id,
+                "skipping Gate 1 (already passed in checkpoint)"
+            );
+            checkpoint
+                .gate1_report
+                .clone()
+                .context("checkpoint says gate1 passed but no report found")?
+        } else {
+            // Gate 1 not yet passed — run it
+            tracing::info!("running Gate 1: Quality (resume)");
+            event_bus.emit(EventKind::GateStarted {
+                task_id: task.id.clone(),
+                level: GateLevel::Quality,
+            });
+            let gate1 = run_gate(&GateLevel::Quality, repo_config, subsample, Some(task.id.0))?;
+            gate_store.store(&task.id, &gate1)?;
+            event_bus.emit(EventKind::GateFinished {
+                task_id: task.id.clone(),
+                level: GateLevel::Quality,
+                passed: gate1.passed,
+                duration_secs: gate1.duration_secs,
+            });
+
+            if !gate1.passed {
+                emit_state_change(event_bus, &task, "implementing", "gate1_failed");
+                task.status = TaskStatus::Gate1Failed { report: gate1 };
+                task.updated_at = Utc::now();
+                task_store.update(&task)?;
+                // Remove stale checkpoint on failure
+                remove_checkpoint(&checkpoint_store, &task);
+                return Ok(true);
+            }
+
+            // Save checkpoint after gate1
+            let mut cp = checkpoint.clone();
+            cp.advance_to_gate1(gate1.clone());
+            save_checkpoint(&checkpoint_store, event_bus, &cp);
+
+            gate1
+        };
+
+        let reviewer_output = if checkpoint.review_completed() {
+            tracing::info!(
+                task_id = %task.id,
+                "skipping review (already completed in checkpoint)"
+            );
+            checkpoint.reviewer_output.clone().unwrap_or_default()
+        } else {
+            // Run review
+            let (reviewer, review_budget_usd): (&dyn AiBackend, f64) = if let Some(roles) = roles {
+                let rev_role = roles.reviewer();
+                let budget_usd = rev_role.budget_usd.unwrap_or(1.0);
+                let backend = registry
+                    .resolve_role(&rev_role)
+                    .or_else(|| registry.chat())
+                    .or_else(|| registry.agent())
+                    .context("no backend available for reviewer role")?;
+                (backend, budget_usd)
+            } else {
+                let backend = registry
+                    .chat()
+                    .or_else(|| registry.agent())
+                    .context("no backend available for review")?;
+                (backend, 1.0)
+            };
+
+            let reviewer_prompt_file = agents_dir.join("reviewer.md");
+            let reviewer_system = load_agent_prompt(&reviewer_prompt_file, None)
+                .await
+                .unwrap_or_default();
+
+            let diff = git.diff_summary().unwrap_or_default();
+            let review_request = AiRequest::new(format!(
+                "Review this change for correctness, proof obligations, and style:\n\n{diff}"
+            ))
+            .with_system(reviewer_system);
+
+            let review_result = reviewer.invoke(&review_request).await?;
+            record_invocation_cost(
+                budget,
+                task.id.0,
+                SessionType::Review,
+                &review_result,
+                review_budget_usd,
+            )
+            .await;
+
+            emit_state_change(event_bus, &task, "implementing", "reviewing");
+            task.status = TaskStatus::Reviewing {
+                reviewer_output: review_result.content.clone(),
+            };
+            task.updated_at = Utc::now();
+            task_store.update(&task)?;
+
+            // Save checkpoint after review
+            {
+                let cp_store = CheckpointStore::new(task_store.db());
+                if let Ok(Some(mut cp)) = cp_store.get(&task.id) {
+                    cp.advance_to_review(review_result.content.clone());
+                    save_checkpoint(&cp_store, event_bus, &cp);
+                }
+            }
+
+            review_result.content
+        };
+
+        let gate2_report = if checkpoint.gate2_passed() {
+            tracing::info!(
+                task_id = %task.id,
+                "skipping Gate 2 (already passed in checkpoint)"
+            );
+            checkpoint.gate2_report.clone()
+        } else {
+            // Run Gate 2
+            tracing::info!("running Gate 2: Proof (resume)");
+            event_bus.emit(EventKind::GateStarted {
+                task_id: task.id.clone(),
+                level: GateLevel::Proof,
+            });
+            let gate2 = run_gate(&GateLevel::Proof, repo_config, subsample, Some(task.id.0))?;
+            gate_store.store(&task.id, &gate2)?;
+            event_bus.emit(EventKind::GateFinished {
+                task_id: task.id.clone(),
+                level: GateLevel::Proof,
+                passed: gate2.passed,
+                duration_secs: gate2.duration_secs,
+            });
+
+            if !gate2.passed {
+                emit_state_change(event_bus, &task, "reviewing", "gate2_failed");
+                task.status = TaskStatus::Gate2Failed { report: gate2 };
+                task.updated_at = Utc::now();
+                task_store.update(&task)?;
+                remove_checkpoint(&checkpoint_store, &task);
+                return Ok(true);
+            }
+
+            // Save checkpoint after gate2
+            {
+                let cp_store = CheckpointStore::new(task_store.db());
+                if let Ok(Some(mut cp)) = cp_store.get(&task.id) {
+                    cp.advance_to_gate2(gate2.clone());
+                    save_checkpoint(&cp_store, event_bus, &cp);
+                }
+            }
+
+            Some(gate2)
+        };
+
+        // --- AwaitingApproval ---
+        let diff = git.diff_summary().unwrap_or_default();
+        let summary = CheckpointSummary {
+            diff_summary: diff,
+            reviewer_output,
+            gate1_report,
+            gate2_report,
+        };
+        emit_state_change(event_bus, &task, "reviewing", "awaiting_approval");
+        task.status = TaskStatus::AwaitingApproval { summary };
+        task.updated_at = Utc::now();
+        task_store.update(&task)?;
+
+        // Clean up checkpoint — task state now captures all needed data
+        remove_checkpoint(&checkpoint_store, &task);
+
+        tracing::info!(
+            task_id = %task.id,
+            "resumed task now awaiting approval — use `thrum task approve {}`",
+            task.id.0
+        );
+
+        // Store successful approach as pattern memory
+        {
+            let criteria_summary = if task.acceptance_criteria.is_empty() {
+                String::new()
+            } else {
+                format!(" (criteria: {})", task.acceptance_criteria.join(", "))
+            };
+            let mem = thrum_core::memory::MemoryEntry::new(
+                task.id.clone(),
+                task.repo.clone(),
+                thrum_core::memory::MemoryCategory::Pattern {
+                    pattern_name: "successful_implementation".into(),
+                },
+                format!(
+                    "Task '{}' passed gates and reached approval (resumed){criteria_summary}",
+                    task.title
+                ),
+            );
+            let memory_store = thrum_db::memory_store::MemoryStore::new(task_store.db());
+            let _ = memory_store.store(&mem);
+        }
+
+        Ok(true)
     }
 
     pub fn build_implementation_prompt(task: &Task, branch: &str) -> String {
