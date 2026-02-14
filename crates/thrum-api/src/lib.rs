@@ -1175,4 +1175,183 @@ mod tests {
         assert_eq!(rpc_resp["result"]["id"], format!("thrum-{task_id}"));
         assert_eq!(rpc_resp["result"]["metadata"]["repo"], "cross-check");
     }
+
+    #[tokio::test]
+    async fn review_page_returns_404_for_missing_task() {
+        let (state, _dir) = test_state();
+        let app = api_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/dashboard/tasks/999/review")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn review_page_rejects_non_awaiting_task() {
+        let (state, _dir) = test_state();
+
+        // Create a task (starts as Pending — not awaiting approval)
+        {
+            let store = TaskStore::new(state.db());
+            let task = Task::new(RepoName::new("test"), "Test".into(), "desc".into());
+            store.insert(task).unwrap();
+        }
+
+        let app = api_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/dashboard/tasks/1/review")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("review page only available"));
+    }
+
+    #[tokio::test]
+    async fn review_page_renders_for_awaiting_approval_task() {
+        let (state, _dir) = test_state();
+
+        // Create a task and set it to AwaitingApproval with a CheckpointSummary
+        {
+            use thrum_core::task::{CheckResult, CheckpointSummary, GateLevel, GateReport};
+
+            let store = TaskStore::new(state.db());
+            let mut task = Task::new(
+                RepoName::new("loom"),
+                "Add widget feature".into(),
+                "Implement the widget".into(),
+            );
+            task.acceptance_criteria = vec!["Widget renders correctly".into()];
+            let mut task = store.insert(task).unwrap();
+
+            task.status = TaskStatus::AwaitingApproval {
+                summary: CheckpointSummary {
+                    diff_summary: "3 files changed, 42 insertions(+), 7 deletions(-)".into(),
+                    reviewer_output: "Code looks good, tests pass.".into(),
+                    gate1_report: GateReport {
+                        level: GateLevel::Quality,
+                        checks: vec![
+                            CheckResult {
+                                name: "cargo_fmt".into(),
+                                passed: true,
+                                stdout: String::new(),
+                                stderr: String::new(),
+                                exit_code: 0,
+                            },
+                            CheckResult {
+                                name: "cargo_test".into(),
+                                passed: true,
+                                stdout: "test result: ok".into(),
+                                stderr: String::new(),
+                                exit_code: 0,
+                            },
+                        ],
+                        passed: true,
+                        duration_secs: 12.5,
+                    },
+                    gate2_report: None,
+                },
+            };
+            store.update(&task).unwrap();
+        }
+
+        let app = api_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/dashboard/tasks/1/review")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+
+        // Verify key sections are present
+        assert!(html.contains("Review Task"), "should have page title");
+        assert!(html.contains("TASK-0001"), "should show task ID");
+        assert!(
+            html.contains("Add widget feature"),
+            "should show task title"
+        );
+        assert!(
+            html.contains("Implement the widget"),
+            "should show description"
+        );
+        assert!(
+            html.contains("Widget renders correctly"),
+            "should show acceptance criteria"
+        );
+        assert!(
+            html.contains("Code looks good"),
+            "should show reviewer output"
+        );
+        assert!(
+            html.contains("Gate Reports"),
+            "should have gate reports section"
+        );
+        assert!(
+            html.contains("cargo_fmt"),
+            "should show individual gate checks"
+        );
+        assert!(html.contains("cargo_test"), "should show test check");
+        assert!(
+            html.contains("Memory Context"),
+            "should have memory section"
+        );
+        // Convergence section only shows for retried tasks
+        assert!(html.contains("Approve"), "should have approve button");
+        assert!(html.contains("Reject"), "should have reject button");
+        assert!(
+            html.contains("/dashboard/tasks/1/review/diff"),
+            "should have HTMX diff loader"
+        );
+        // Delta summary
+        assert!(html.contains("+42"), "should show insertions count");
+        assert!(html.contains("-7"), "should show deletions count");
+    }
+
+    #[tokio::test]
+    async fn review_css_served() {
+        let (state, _dir) = test_state();
+        let app = api_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/dashboard/assets/review.css")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let ct = response.headers().get("content-type").unwrap();
+        assert_eq!(ct, "text/css; charset=utf-8");
+    }
 }

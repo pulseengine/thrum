@@ -838,42 +838,47 @@ pub mod pipeline {
 
         if !gate1.passed {
             emit_state_change(event_bus, &task, "implementing", "gate1_failed");
-            task.status = TaskStatus::Gate1Failed { report: gate1 };
+            task.status = TaskStatus::Gate1Failed {
+                report: gate1.clone(),
+            };
             task.updated_at = Utc::now();
             task_store.update(&task)?;
 
             // Store failure as memory for future context.
             // Include the task title so the agent can correlate errors with
             // specific features when working on similar tasks later.
-            if let TaskStatus::Gate1Failed { ref report } = task.status {
-                let failed_checks: String = report
-                    .checks
-                    .iter()
-                    .filter(|c| !c.passed)
-                    .map(|c| {
-                        format!(
-                            "{}: {}",
-                            c.name,
-                            c.stderr.chars().take(200).collect::<String>()
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("; ");
-                let error_summary = format!(
-                    "Task '{}' failed Gate 1 (Quality): {failed_checks}",
-                    task.title
-                );
-                let mem = thrum_core::memory::MemoryEntry::new(
-                    task.id.clone(),
-                    task.repo.clone(),
-                    thrum_core::memory::MemoryCategory::Error {
-                        error_type: "gate1_failure".into(),
-                    },
-                    error_summary,
-                );
-                let memory_store = thrum_db::memory_store::MemoryStore::new(task_store.db());
-                let _ = memory_store.store(&mem);
-            }
+            let failed_checks: String = gate1
+                .checks
+                .iter()
+                .filter(|c| !c.passed)
+                .map(|c| {
+                    format!(
+                        "{}: {}",
+                        c.name,
+                        c.stderr.chars().take(200).collect::<String>()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            let error_summary = format!(
+                "Task '{}' failed Gate 1 (Quality): {failed_checks}",
+                task.title
+            );
+            let mem = thrum_core::memory::MemoryEntry::new(
+                task.id.clone(),
+                task.repo.clone(),
+                thrum_core::memory::MemoryCategory::Error {
+                    error_type: "gate1_failure".into(),
+                },
+                error_summary,
+            );
+            let memory_store = thrum_db::memory_store::MemoryStore::new(task_store.db());
+            let _ = memory_store.store(&mem);
+
+            // Record failure signatures for convergence detection.
+            // On retry, the convergence store is read to determine if the
+            // agent is stuck repeating the same failure.
+            record_convergence_failures(task_store.db(), &task.id, &gate1);
 
             return Ok(());
         }
@@ -983,40 +988,43 @@ pub mod pipeline {
 
         if !gate2.passed {
             emit_state_change(event_bus, &task, "reviewing", "gate2_failed");
-            task.status = TaskStatus::Gate2Failed { report: gate2 };
+            task.status = TaskStatus::Gate2Failed {
+                report: gate2.clone(),
+            };
             task.updated_at = Utc::now();
             task_store.update(&task)?;
 
             // Store failure as memory for future context
-            if let TaskStatus::Gate2Failed { ref report } = task.status {
-                let failed_checks: String = report
-                    .checks
-                    .iter()
-                    .filter(|c| !c.passed)
-                    .map(|c| {
-                        format!(
-                            "{}: {}",
-                            c.name,
-                            c.stderr.chars().take(200).collect::<String>()
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("; ");
-                let error_summary = format!(
-                    "Task '{}' failed Gate 2 (Proof): {failed_checks}",
-                    task.title
-                );
-                let mem = thrum_core::memory::MemoryEntry::new(
-                    task.id.clone(),
-                    task.repo.clone(),
-                    thrum_core::memory::MemoryCategory::Error {
-                        error_type: "gate2_failure".into(),
-                    },
-                    error_summary,
-                );
-                let memory_store = thrum_db::memory_store::MemoryStore::new(task_store.db());
-                let _ = memory_store.store(&mem);
-            }
+            let failed_checks: String = gate2
+                .checks
+                .iter()
+                .filter(|c| !c.passed)
+                .map(|c| {
+                    format!(
+                        "{}: {}",
+                        c.name,
+                        c.stderr.chars().take(200).collect::<String>()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            let error_summary = format!(
+                "Task '{}' failed Gate 2 (Proof): {failed_checks}",
+                task.title
+            );
+            let mem = thrum_core::memory::MemoryEntry::new(
+                task.id.clone(),
+                task.repo.clone(),
+                thrum_core::memory::MemoryCategory::Error {
+                    error_type: "gate2_failure".into(),
+                },
+                error_summary,
+            );
+            let memory_store = thrum_db::memory_store::MemoryStore::new(task_store.db());
+            let _ = memory_store.store(&mem);
+
+            // Record failure signatures for convergence detection.
+            record_convergence_failures(task_store.db(), &task.id, &gate2);
 
             return Ok(());
         }
@@ -1198,11 +1206,17 @@ pub mod pipeline {
         Ok(())
     }
 
-    /// Retry a failed task: bump retry count, re-invoke with gate failure feedback.
+    /// Retry a failed task with convergence-aware strategy rotation.
     ///
-    /// Queries failure-specific memories from the memory store and injects them
-    /// alongside the gate failure report, giving the agent context about previous
-    /// errors to avoid repeating the same mistakes.
+    /// Instead of blind retries, analyzes failure history to detect convergence
+    /// (the agent repeating the same failure). When convergence is detected,
+    /// the strategy escalates:
+    /// 1. Normal: standard retry with failure feedback
+    /// 2. ExpandedContext: more detail, explicit "read the full error" directive
+    /// 3. DifferentApproach: "your approach is NOT working, try something else"
+    /// 4. HumanReview: stops automatic retry, flags for human intervention
+    ///
+    /// Also queries failure-specific memories from the memory store for context.
     #[allow(clippy::too_many_arguments)]
     pub async fn retry_task_pipeline(
         task_store: &TaskStore<'_>,
@@ -1216,7 +1230,9 @@ pub mod pipeline {
         mut task: Task,
         work_dir: Option<&Path>,
     ) -> Result<()> {
-        let feedback = match &task.status {
+        use thrum_core::convergence::RetryStrategy;
+
+        let (feedback, convergence_augmentation) = match &task.status {
             TaskStatus::Gate1Failed { report } => {
                 let failed_checks: Vec<_> = report
                     .checks
@@ -1230,10 +1246,15 @@ pub mod pipeline {
                         )
                     })
                     .collect();
-                format!(
+                let feedback = format!(
                     "Gate 1 (Quality) failed. Fix these issues:\n{}",
                     failed_checks.join("\n")
-                )
+                );
+
+                // Convergence analysis: compare new failure against history
+                let augmentation =
+                    analyze_convergence(task_store.db(), &task.id, report, event_bus);
+                (feedback, augmentation)
             }
             TaskStatus::Gate2Failed { report } => {
                 let failed_checks: Vec<_> = report
@@ -1248,17 +1269,46 @@ pub mod pipeline {
                         )
                     })
                     .collect();
-                format!(
+                let feedback = format!(
                     "Gate 2 (Proof) failed. Fix these issues:\n{}",
                     failed_checks.join("\n")
-                )
+                );
+
+                let augmentation =
+                    analyze_convergence(task_store.db(), &task.id, report, event_bus);
+                (feedback, augmentation)
             }
             TaskStatus::Claimed { .. } => {
                 // Was claimed from a retryable state — check original retry count
-                "Previous gate failure (details in prior attempts).".to_string()
+                let feedback = "Previous gate failure (details in prior attempts).".to_string();
+                (feedback, ConvergenceAugmentation::normal())
             }
             _ => return Ok(()),
         };
+
+        // If convergence analysis says human review is needed, don't retry.
+        // The task stays in its failed state and will not be automatically claimed.
+        if convergence_augmentation.strategy == RetryStrategy::HumanReview {
+            tracing::warn!(
+                task_id = %task.id,
+                strategy = "human-review",
+                "convergence detected: flagging task for human review instead of retrying"
+            );
+            event_bus.emit(EventKind::TaskConvergenceDetected {
+                task_id: task.id.clone(),
+                strategy: "human-review".into(),
+                repeated_count: convergence_augmentation.max_occurrence,
+            });
+            // Don't increment retry_count or reset status — leave in failed state
+            return Ok(());
+        }
+
+        tracing::info!(
+            task_id = %task.id,
+            strategy = convergence_augmentation.strategy.label(),
+            repeated_failures = convergence_augmentation.repeated_count,
+            "retrying with convergence-aware strategy"
+        );
 
         // Query failure-specific memories for context-aware retries.
         // These are error-category memories from the same repo, surfacing
@@ -1289,9 +1339,12 @@ pub mod pipeline {
 
         let original_desc = task.description.clone();
         task.description = format!(
-            "{original_desc}\n\n---\n**RETRY {}/{}** — Previous attempt failed:\n\
-             {feedback}{failure_memories}",
-            task.retry_count, MAX_RETRIES
+            "{original_desc}\n\n---\n**RETRY {}/{} [strategy: {}]** — Previous attempt failed:\n\
+             {feedback}{failure_memories}{convergence_prompt}",
+            task.retry_count,
+            MAX_RETRIES,
+            convergence_augmentation.strategy.label(),
+            convergence_prompt = convergence_augmentation.prompt,
         );
 
         run_task_pipeline(
@@ -1597,6 +1650,145 @@ pub mod pipeline {
                     .collect::<Vec<_>>()
                     .join("\n"),
             )
+        }
+    }
+
+    /// Result of convergence analysis, carrying the strategy and prompt augmentation.
+    struct ConvergenceAugmentation {
+        strategy: thrum_core::convergence::RetryStrategy,
+        prompt: String,
+        repeated_count: u32,
+        max_occurrence: u32,
+    }
+
+    impl ConvergenceAugmentation {
+        fn normal() -> Self {
+            Self {
+                strategy: thrum_core::convergence::RetryStrategy::Normal,
+                prompt: String::new(),
+                repeated_count: 0,
+                max_occurrence: 0,
+            }
+        }
+    }
+
+    /// Record failure signatures from a gate report into the convergence store.
+    ///
+    /// Called when a gate fails. Updates existing records (incrementing occurrence
+    /// count) or creates new ones. This data is read during retry to detect
+    /// convergence.
+    fn record_convergence_failures(
+        db: &redb::Database,
+        task_id: &thrum_core::task::TaskId,
+        report: &thrum_core::task::GateReport,
+    ) {
+        use thrum_core::convergence::{FailureRecord, FailureSignature};
+        use thrum_db::convergence_store::ConvergenceStore;
+
+        let store = ConvergenceStore::new(db);
+        let signatures = FailureSignature::from_gate_report(report);
+
+        for sig in signatures {
+            // Find the stderr for this check
+            let stderr = report
+                .checks
+                .iter()
+                .find(|c| c.name == sig.check_name && !c.passed)
+                .map(|c| c.stderr.chars().take(1000).collect::<String>())
+                .unwrap_or_default();
+
+            match store.get(task_id, &sig.error_hash) {
+                Ok(Some(mut existing)) => {
+                    existing.record_occurrence(stderr);
+                    if let Err(e) = store.store(&existing) {
+                        tracing::warn!(
+                            task_id = %task_id,
+                            error = %e,
+                            "failed to update convergence record"
+                        );
+                    }
+                }
+                Ok(None) => {
+                    let record = FailureRecord::new(task_id.clone(), sig, stderr);
+                    if let Err(e) = store.store(&record) {
+                        tracing::warn!(
+                            task_id = %task_id,
+                            error = %e,
+                            "failed to store convergence record"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        task_id = %task_id,
+                        error = %e,
+                        "failed to query convergence store"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Analyze convergence for a task and produce a strategy-specific prompt augmentation.
+    ///
+    /// Reads historical failure records from the convergence store, compares them
+    /// against the new gate report, and determines the retry strategy. Also emits
+    /// a convergence event when repeated failures are detected.
+    fn analyze_convergence(
+        db: &redb::Database,
+        task_id: &thrum_core::task::TaskId,
+        report: &thrum_core::task::GateReport,
+        event_bus: &EventBus,
+    ) -> ConvergenceAugmentation {
+        use thrum_core::convergence::ConvergenceAnalysis;
+        use thrum_db::convergence_store::ConvergenceStore;
+
+        let store = ConvergenceStore::new(db);
+        let existing_records = match store.get_for_task(task_id) {
+            Ok(records) => records,
+            Err(e) => {
+                tracing::warn!(
+                    task_id = %task_id,
+                    error = %e,
+                    "failed to read convergence history, falling back to normal retry"
+                );
+                return ConvergenceAugmentation::normal();
+            }
+        };
+
+        let analysis = ConvergenceAnalysis::analyze(&existing_records, report);
+        let max_occurrence = analysis
+            .occurrence_counts
+            .values()
+            .copied()
+            .max()
+            .unwrap_or(1);
+
+        if !analysis.repeated_signatures.is_empty() {
+            tracing::info!(
+                task_id = %task_id,
+                strategy = analysis.strategy.label(),
+                repeated_count = analysis.repeated_signatures.len(),
+                max_occurrence,
+                "convergence analysis complete"
+            );
+
+            event_bus.emit(EventKind::TaskConvergenceDetected {
+                task_id: task_id.clone(),
+                strategy: analysis.strategy.label().to_string(),
+                repeated_count: max_occurrence,
+            });
+        }
+
+        let prompt = analysis
+            .strategy
+            .prompt_augmentation(&analysis.repeated_signatures);
+
+        ConvergenceAugmentation {
+            strategy: analysis.strategy,
+            prompt,
+            repeated_count: analysis.repeated_signatures.len() as u32,
+            max_occurrence,
         }
     }
 }

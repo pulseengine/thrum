@@ -317,6 +317,24 @@ impl WatchApp {
                 self.engine_log
                     .push(format!("[SHARED] {agent_id} set {key}={value}"));
             }
+
+            EventKind::TaskConvergenceDetected {
+                task_id,
+                strategy,
+                repeated_count,
+            } => {
+                self.engine_log.push(format!(
+                    "[CONVERGENCE] {task_id}: strategy={strategy}, repeats={repeated_count}"
+                ));
+                // Also notify the agent panel working on this task
+                for panel in self.agents.values_mut() {
+                    if panel.task_id == *task_id {
+                        panel.log_lines.push(format!(
+                            "convergence detected: {strategy} (repeats={repeated_count})"
+                        ));
+                    }
+                }
+            }
         }
     }
 

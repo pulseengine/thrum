@@ -1,25 +1,22 @@
-//! Unified web dashboard served via HTMX + SSE.
+//! Embedded web dashboard served via HTMX.
 //!
 //! All HTML templates are compiled into the binary via `include_str!`.
-//! The dashboard uses HTMX polling for DB-backed partials and native
-//! EventSource for real-time agent activity and event streaming.
-//! Zero JS build step — all interactivity is server-driven or inline.
+//! The dashboard polls partial endpoints that return HTML fragments,
+//! keeping interactivity server-driven with zero JS build step.
 
 use axum::{
     Form, Router,
-    extract::{Path, Query, State},
+    extract::{Path, State},
     http::{StatusCode, header},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
 use chrono::Utc;
-use serde::Deserialize;
 use std::fmt::Write as FmtWrite;
 use std::sync::Arc;
-use thrum_core::task::{TaskId, TaskStatus};
+use thrum_core::task::{CheckResult, GateReport, TaskId, TaskStatus};
 use thrum_core::telemetry::{TraceFilter, TraceReader};
 use thrum_db::budget_store::BudgetStore;
-use thrum_db::gate_store::GateStore;
 use thrum_db::memory_store::MemoryStore;
 use thrum_db::task_store::TaskStore;
 
@@ -29,38 +26,49 @@ use crate::ApiState;
 
 const DASHBOARD_HTML: &str = include_str!("../assets/dashboard.html");
 const STYLE_CSS: &str = include_str!("../assets/style.css");
+const LIVE_HTML: &str = include_str!("../assets/live.html");
+const LIVE_CSS: &str = include_str!("../assets/live.css");
+const REVIEW_HTML: &str = include_str!("../assets/review.html");
+const REVIEW_CSS: &str = include_str!("../assets/review.css");
 
 // ─── Router ─────────────────────────────────────────────────────────────
 
 /// Build the dashboard sub-router.
 ///
 /// Mount this on the main router alongside the JSON API.
-/// The unified dashboard merges the previous polling-based `/dashboard`
-/// and SSE-based `/dashboard/live` into a single observability page.
 pub fn dashboard_router() -> Router<Arc<ApiState>> {
     Router::new()
         .route("/dashboard", get(index))
+        .route("/dashboard/live", get(live_index))
         .route("/dashboard/assets/style.css", get(stylesheet))
-        // HTMX partials — polled every 5s for DB-backed data
+        .route("/dashboard/assets/live.css", get(live_stylesheet))
+        .route("/dashboard/assets/review.css", get(review_stylesheet))
         .route("/dashboard/partials/status", get(status_partial))
         .route("/dashboard/partials/tasks", get(tasks_partial))
         .route("/dashboard/partials/activity", get(activity_partial))
         .route("/dashboard/partials/budget", get(budget_partial))
         .route("/dashboard/partials/memory", get(memory_partial))
-        // Task detail — loaded on-demand when a row is expanded
         .route(
             "/dashboard/partials/task-detail/{id}",
             get(task_detail_partial),
         )
-        // Actions
         .route("/dashboard/tasks/{id}/approve", post(approve_action))
         .route("/dashboard/tasks/{id}/reject", post(reject_action))
+        .route("/dashboard/tasks/{id}/review", get(review_page))
+        .route(
+            "/dashboard/tasks/{id}/review/diff",
+            get(review_diff_partial),
+        )
 }
 
 // ─── Page & Assets ──────────────────────────────────────────────────────
 
 async fn index() -> Html<&'static str> {
     Html(DASHBOARD_HTML)
+}
+
+async fn live_index() -> Html<&'static str> {
+    Html(LIVE_HTML)
 }
 
 async fn stylesheet() -> Response {
@@ -70,6 +78,473 @@ async fn stylesheet() -> Response {
         STYLE_CSS,
     )
         .into_response()
+}
+
+async fn live_stylesheet() -> Response {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+        LIVE_CSS,
+    )
+        .into_response()
+}
+
+async fn review_stylesheet() -> Response {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+        REVIEW_CSS,
+    )
+        .into_response()
+}
+
+// ─── Review Page ────────────────────────────────────────────────────────
+
+/// GET /dashboard/tasks/{id}/review — full-page review for approval decisions.
+async fn review_page(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<i64>,
+) -> Result<Html<String>, DashboardError> {
+    let db = state.db();
+    let store = TaskStore::new(db);
+
+    let task = store
+        .get(&TaskId(id))?
+        .ok_or_else(|| DashboardError(format!("task {id} not found")))?;
+
+    // Extract the checkpoint summary from AwaitingApproval status
+    let summary = match &task.status {
+        TaskStatus::AwaitingApproval { summary } => summary.clone(),
+        _ => {
+            return Err(DashboardError(format!(
+                "task {} is '{}', review page only available for awaiting-approval tasks",
+                id,
+                task.status.label()
+            )));
+        }
+    };
+
+    // TODO: Load convergence records once convergence_store is implemented
+    let _failure_records: Vec<()> = Vec::new();
+
+    // Load memory entries for this task's repo
+    let memory_store = MemoryStore::new(db);
+    let memories = memory_store
+        .query_for_task(&task.repo, 20)
+        .unwrap_or_default();
+
+    // Build the review content HTML
+    let mut content = String::with_capacity(8192);
+
+    // ── Review Header
+    let title_esc = escape_html(&task.title);
+    let repo_esc = escape_html(&task.repo.to_string());
+    let created = task.created_at.format("%Y-%m-%d %H:%M UTC").to_string();
+    let _ = write!(
+        content,
+        "<div class=\"review-header\">\
+         <div class=\"task-title\">TASK-{id:04}: {title_esc}</div>\
+         <div class=\"task-meta\">\
+         <span><span class=\"badge badge-awaiting-approval\">awaiting-approval</span></span>\
+         <span>Repo: <strong>{repo_esc}</strong></span>\
+         <span>Retries: <strong>{retries}</strong></span>\
+         <span>Created: {created}</span>\
+         </div></div>",
+        retries = task.retry_count,
+    );
+
+    // ── Delta Summary (parsed from diff_summary or show placeholder)
+    render_delta_summary(&mut content, &summary.diff_summary);
+
+    // ── Task Description & Acceptance Criteria
+    render_description_section(&mut content, &task);
+
+    // ── Agent Reviewer Output
+    render_reviewer_section(&mut content, &summary.reviewer_output);
+
+    // ── Diff View (loaded via HTMX from the diff partial endpoint)
+    let _ = write!(
+        content,
+        "<div class=\"review-section\">\
+         <div class=\"section-header\" onclick=\"toggleSection('diff-body')\">\
+         <h3>Diff</h3>\
+         <button class=\"toggle-btn\">&#x25BC;</button>\
+         </div>\
+         <div class=\"section-body\" id=\"diff-body\">\
+         <div class=\"diff-view\" \
+              hx-get=\"/dashboard/tasks/{id}/review/diff\" \
+              hx-trigger=\"load\" \
+              hx-indicator=\"#action-indicator\">\
+         <div class=\"diff-empty\">Loading diff...</div>\
+         </div></div></div>",
+    );
+
+    // ── Gate Reports
+    render_gate_reports_section(&mut content, &summary.gate1_report, &summary.gate2_report);
+
+    // ── Memory Context
+    render_memory_section(&mut content, &memories);
+
+    // ── Convergence Status (stub until convergence_store exists)
+    if task.retry_count > 0 {
+        let _ = write!(
+            content,
+            "<div class=\"review-section\">\
+             <div class=\"section-header\">Convergence</div>\
+             <div class=\"convergence-info\">Retry count: {}</div>\
+             </div>",
+            task.retry_count,
+        );
+    }
+
+    // ── Approve / Reject Actions
+    let _ = write!(
+        content,
+        "<div class=\"review-actions\">\
+         <h3>Decision</h3>\
+         <div id=\"action-result\"></div>\
+         <form id=\"reject-form\" \
+               hx-post=\"/dashboard/tasks/{id}/reject\" \
+               hx-target=\"#action-result\" \
+               hx-swap=\"innerHTML\">\
+         <textarea name=\"feedback\" \
+                   placeholder=\"Feedback for the agent (required for rejection, optional for approval)...\"></textarea>\
+         <div class=\"action-buttons\">\
+         <button type=\"button\" class=\"btn btn-approve btn-lg\" id=\"approve-btn\" \
+                 hx-post=\"/dashboard/tasks/{id}/approve\" \
+                 hx-target=\"#action-result\" \
+                 hx-swap=\"innerHTML\" \
+                 hx-indicator=\"#action-indicator\">Approve</button>\
+         <button type=\"submit\" class=\"btn btn-reject btn-lg\" \
+                 hx-indicator=\"#action-indicator\">Reject</button>\
+         </div></form></div>",
+    );
+
+    // Embed the content into the review template
+    let page = REVIEW_HTML.replace("{{REVIEW_CONTENT}}", &content);
+    Ok(Html(page))
+}
+
+/// GET /dashboard/tasks/{id}/review/diff — HTMX partial returning syntax-colored diff.
+async fn review_diff_partial(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<i64>,
+) -> Result<Html<String>, DashboardError> {
+    let db = state.db();
+    let store = TaskStore::new(db);
+
+    let task = store
+        .get(&TaskId(id))?
+        .ok_or_else(|| DashboardError(format!("task {id} not found")))?;
+
+    if !task.status.is_reviewable() {
+        return Ok(Html(
+            "<div class=\"diff-empty\">Diff not available for this task status</div>".into(),
+        ));
+    }
+
+    // Try to fetch the live diff from the git repo
+    let diff_text = state
+        .config_path
+        .as_ref()
+        .and_then(|path| thrum_core::repo::ReposConfig::load(path).ok())
+        .and_then(|repos_config| repos_config.get(&task.repo).cloned())
+        .and_then(|repo_config| thrum_runner::git::GitRepo::open(&repo_config.path).ok())
+        .and_then(|git_repo| {
+            let branch = task.branch_name();
+            git_repo.diff_patch_for_branch(&branch).ok()
+        })
+        .unwrap_or_default();
+
+    if diff_text.is_empty() {
+        return Ok(Html(
+            "<div class=\"diff-empty\">No diff available (branch may not exist or repo config not set)</div>".into(),
+        ));
+    }
+
+    // Render diff with +/- coloring
+    let mut html = String::with_capacity(diff_text.len() * 2);
+    html.push_str("<pre>");
+    for line in diff_text.lines() {
+        let escaped = escape_html(line);
+        if line.starts_with("diff --git")
+            || line.starts_with("index ")
+            || line.starts_with("+++")
+            || line.starts_with("---")
+        {
+            let _ = write!(
+                html,
+                "<span class=\"diff-line diff-line-file\">{escaped}</span>"
+            );
+        } else if line.starts_with("@@") {
+            let _ = write!(
+                html,
+                "<span class=\"diff-line diff-line-hunk\">{escaped}</span>"
+            );
+        } else if line.starts_with('+') {
+            let _ = write!(
+                html,
+                "<span class=\"diff-line diff-line-add\">{escaped}</span>"
+            );
+        } else if line.starts_with('-') {
+            let _ = write!(
+                html,
+                "<span class=\"diff-line diff-line-del\">{escaped}</span>"
+            );
+        } else {
+            let _ = write!(html, "<span class=\"diff-line\">{escaped}</span>");
+        }
+    }
+    html.push_str("</pre>");
+    Ok(Html(html))
+}
+
+// ─── Review Page Render Helpers ─────────────────────────────────────────
+
+/// Render delta summary statistics (files changed, insertions, deletions).
+fn render_delta_summary(buf: &mut String, diff_summary: &str) {
+    // Parse counts from diff_summary if available, otherwise show defaults
+    let (files, insertions, deletions) = parse_diff_stats(diff_summary);
+
+    let _ = write!(
+        buf,
+        "<div class=\"delta-summary\">\
+         <div class=\"delta-stat files\">\
+         <div class=\"stat-value\">{files}</div>\
+         <div class=\"stat-label\">Files Changed</div>\
+         </div>\
+         <div class=\"delta-stat insertions\">\
+         <div class=\"stat-value\">+{insertions}</div>\
+         <div class=\"stat-label\">Insertions</div>\
+         </div>\
+         <div class=\"delta-stat deletions\">\
+         <div class=\"stat-value\">-{deletions}</div>\
+         <div class=\"stat-label\">Deletions</div>\
+         </div></div>",
+    );
+}
+
+/// Parse "X files changed, Y insertions(+), Z deletions(-)" from a diff summary.
+fn parse_diff_stats(summary: &str) -> (usize, usize, usize) {
+    if summary.is_empty() {
+        return (0, 0, 0);
+    }
+
+    let mut files = 0usize;
+    let mut insertions = 0usize;
+    let mut deletions = 0usize;
+
+    for word_pair in summary.split(',') {
+        let trimmed = word_pair.trim();
+        let parts: Vec<&str> = trimmed.split_whitespace().collect();
+        if parts.len() >= 2
+            && let Ok(n) = parts[0].parse::<usize>()
+        {
+            if trimmed.contains("file") {
+                files = n;
+            } else if trimmed.contains("insertion") {
+                insertions = n;
+            } else if trimmed.contains("deletion") {
+                deletions = n;
+            }
+        }
+    }
+
+    (files, insertions, deletions)
+}
+
+/// Render the task description and acceptance criteria section.
+fn render_description_section(buf: &mut String, task: &thrum_core::task::Task) {
+    let desc_esc = escape_html(&task.description);
+    buf.push_str(
+        "<div class=\"review-section\">\
+         <div class=\"section-header\" onclick=\"toggleSection('desc-body')\">\
+         <h3>Task Description &amp; Acceptance Criteria</h3>\
+         <button class=\"toggle-btn\">&#x25BC;</button>\
+         </div><div class=\"section-body\" id=\"desc-body\"><div class=\"review-text\">",
+    );
+
+    // Description
+    let _ = write!(buf, "<p>{desc_esc}</p>");
+
+    // Acceptance criteria
+    if !task.acceptance_criteria.is_empty() {
+        buf.push_str(
+            "<h4 style=\"margin-top:12px;font-size:12px;color:var(--text-muted);\
+                       text-transform:uppercase;letter-spacing:1px;\">Acceptance Criteria</h4>\
+                       <ul class=\"criteria-list\">",
+        );
+        for criterion in &task.acceptance_criteria {
+            let c_esc = escape_html(criterion);
+            let _ = write!(buf, "<li>{c_esc}</li>");
+        }
+        buf.push_str("</ul>");
+    }
+
+    buf.push_str("</div></div></div>");
+}
+
+/// Render the agent reviewer output section.
+fn render_reviewer_section(buf: &mut String, reviewer_output: &str) {
+    buf.push_str(
+        "<div class=\"review-section\">\
+         <div class=\"section-header\" onclick=\"toggleSection('reviewer-body')\">\
+         <h3>Agent Reviewer Insights</h3>\
+         <button class=\"toggle-btn\">&#x25BC;</button>\
+         </div><div class=\"section-body\" id=\"reviewer-body\">",
+    );
+
+    if reviewer_output.is_empty() {
+        buf.push_str("<div class=\"diff-empty\">No reviewer output available</div>");
+    } else {
+        let output_esc = escape_html(reviewer_output);
+        let _ = write!(buf, "<div class=\"reviewer-output\">{output_esc}</div>");
+    }
+
+    buf.push_str("</div></div>");
+}
+
+/// Render gate reports section with expandable check details.
+fn render_gate_reports_section(
+    buf: &mut String,
+    gate1_report: &GateReport,
+    gate2_report: &Option<GateReport>,
+) {
+    buf.push_str(
+        "<div class=\"review-section\">\
+         <div class=\"section-header\" onclick=\"toggleSection('gates-body')\">\
+         <h3>Gate Reports</h3>\
+         <button class=\"toggle-btn\">&#x25BC;</button>\
+         </div><div class=\"section-body\" id=\"gates-body\">",
+    );
+
+    render_single_gate_report(buf, gate1_report, "g1");
+
+    if let Some(g2) = gate2_report {
+        render_single_gate_report(buf, g2, "g2");
+    }
+
+    buf.push_str("</div></div>");
+}
+
+/// Render a single gate report with its checks.
+fn render_single_gate_report(buf: &mut String, report: &GateReport, prefix: &str) {
+    let status_class = if report.passed {
+        "gate-passed"
+    } else {
+        "gate-failed"
+    };
+    let status_icon = if report.passed { "PASSED" } else { "FAILED" };
+
+    let _ = write!(
+        buf,
+        "<div class=\"gate-report\">\
+         <div class=\"gate-header\">\
+         <span class=\"gate-label {status_class}\">{level} — {status_icon}</span>\
+         <span class=\"gate-duration\">{duration:.1}s</span>\
+         </div><ul class=\"check-list\">",
+        level = report.level,
+        duration = report.duration_secs,
+    );
+
+    for (i, check) in report.checks.iter().enumerate() {
+        render_check_item(buf, check, prefix, i);
+    }
+
+    buf.push_str("</ul></div>");
+}
+
+/// Render a single check result item with expandable stdout/stderr.
+fn render_check_item(buf: &mut String, check: &CheckResult, prefix: &str, index: usize) {
+    let status_class = if check.passed {
+        "check-pass"
+    } else {
+        "check-fail"
+    };
+    let icon = if check.passed { "&#x2714;" } else { "&#x2718;" };
+    let name_esc = escape_html(&check.name);
+    let output_id = format!("{prefix}-check-{index}");
+
+    let _ = write!(
+        buf,
+        "<li class=\"check-item\">\
+         <span class=\"check-icon {status_class}\">{icon}</span>\
+         <span class=\"check-name {status_class}\">{name_esc}</span>\
+         <span style=\"margin-left:8px;font-size:11px;color:var(--text-muted);\">\
+         (exit code: {exit_code})</span>",
+        exit_code = check.exit_code,
+    );
+
+    // Show expandable output if there's stdout or stderr
+    let has_stdout = !check.stdout.is_empty();
+    let has_stderr = !check.stderr.is_empty();
+    if has_stdout || has_stderr {
+        let _ = write!(
+            buf,
+            "<div class=\"check-output\">\
+             <button class=\"check-output-toggle\" \
+             onclick=\"document.getElementById('{output_id}').classList.toggle('expanded')\">\
+             Show output</button>\
+             <div class=\"check-output-content\" id=\"{output_id}\">"
+        );
+        if has_stdout {
+            let stdout_esc = escape_html(&check.stdout);
+            let _ = write!(buf, "<strong>stdout:</strong>\n{stdout_esc}");
+        }
+        if has_stdout && has_stderr {
+            buf.push_str("\n\n");
+        }
+        if has_stderr {
+            let stderr_esc = escape_html(&check.stderr);
+            let _ = write!(buf, "<strong>stderr:</strong>\n{stderr_esc}");
+        }
+        buf.push_str("</div></div>");
+    }
+
+    buf.push_str("</li>");
+}
+
+/// Render the memory context section.
+fn render_memory_section(buf: &mut String, memories: &[thrum_core::memory::MemoryEntry]) {
+    buf.push_str(
+        "<div class=\"review-section\">\
+         <div class=\"section-header\" onclick=\"toggleSection('memory-body')\">\
+         <h3>Memory Context</h3>\
+         <button class=\"toggle-btn\">&#x25BC;</button>\
+         </div><div class=\"section-body\" id=\"memory-body\">",
+    );
+
+    if memories.is_empty() {
+        buf.push_str("<div class=\"memory-empty\">No memories recorded for this repo</div>");
+    } else {
+        buf.push_str("<div class=\"memory-list\">");
+        for entry in memories {
+            let category_label = entry.category.label();
+            let content_esc = escape_html(&entry.content);
+            let cat_detail = match &entry.category {
+                thrum_core::memory::MemoryCategory::Error { error_type } => escape_html(error_type),
+                thrum_core::memory::MemoryCategory::Pattern { pattern_name } => {
+                    escape_html(pattern_name)
+                }
+                thrum_core::memory::MemoryCategory::Decision { alternatives } => {
+                    let alts: Vec<String> = alternatives.iter().map(|a| escape_html(a)).collect();
+                    alts.join(", ")
+                }
+                thrum_core::memory::MemoryCategory::Context { scope } => escape_html(scope),
+            };
+            let _ = write!(
+                buf,
+                "<div class=\"memory-entry\">\
+                 <div class=\"memory-category {category_label}\">\
+                 {category_label}: {cat_detail}</div>\
+                 <div class=\"memory-content\">{content_esc}</div>\
+                 </div>",
+            );
+        }
+        buf.push_str("</div>");
+    }
+
+    buf.push_str("</div></div>");
 }
 
 // ─── Partials ───────────────────────────────────────────────────────────
@@ -85,6 +560,7 @@ async fn status_partial(
     let mut html = String::with_capacity(512);
     html.push_str("<div class=\"status-grid\">");
 
+    // Group counts into meaningful categories
     let pending = counts.get("pending").copied().unwrap_or(0);
     let active = counts.get("claimed").copied().unwrap_or(0)
         + counts.get("implementing").copied().unwrap_or(0)
@@ -117,66 +593,7 @@ fn write_card(buf: &mut String, class: &str, count: usize, label: &str) {
     );
 }
 
-/// Budget usage bar — shows spent / remaining / ceiling.
-async fn budget_partial(
-    State(state): State<Arc<ApiState>>,
-) -> Result<Html<String>, DashboardError> {
-    let db = state.db();
-    let budget_store = BudgetStore::new(db);
-
-    let mut html = String::with_capacity(512);
-
-    match budget_store.load() {
-        Ok(Some(tracker)) => {
-            let spent = tracker.total_spent();
-            let ceiling = tracker.ceiling_usd;
-            let remaining = tracker.remaining();
-            let pct = if ceiling > 0.0 {
-                (spent / ceiling * 100.0).min(100.0)
-            } else {
-                0.0
-            };
-
-            let bar_class = if pct > 90.0 {
-                "budget-bar-fill danger"
-            } else if pct > 70.0 {
-                "budget-bar-fill warning"
-            } else {
-                "budget-bar-fill"
-            };
-
-            let _ = write!(
-                html,
-                "<div class=\"budget-widget\">\
-                 <div class=\"budget-header\">\
-                 <span class=\"budget-label\">Budget</span>\
-                 <span class=\"budget-numbers\">\
-                 ${spent:.2} / ${ceiling:.2} \
-                 <span class=\"budget-remaining\">(${remaining:.2} remaining)</span>\
-                 </span>\
-                 </div>\
-                 <div class=\"budget-bar\">\
-                 <div class=\"{bar_class}\" style=\"width:{pct:.1}%\"></div>\
-                 </div>\
-                 </div>",
-            );
-        }
-        _ => {
-            html.push_str(
-                "<div class=\"budget-widget\">\
-                 <div class=\"budget-header\">\
-                 <span class=\"budget-label\">Budget</span>\
-                 <span class=\"budget-numbers\">Not configured</span>\
-                 </div>\
-                 </div>",
-            );
-        }
-    }
-
-    Ok(Html(html))
-}
-
-/// Task queue table — clickable rows that expand to show detail.
+/// Task queue table — full table body with action buttons.
 async fn tasks_partial(State(state): State<Arc<ApiState>>) -> Result<Html<String>, DashboardError> {
     let db = state.db();
     let store = TaskStore::new(db);
@@ -186,12 +603,11 @@ async fn tasks_partial(State(state): State<Arc<ApiState>>) -> Result<Html<String
         return Ok(Html("<div class=\"empty\">No tasks in queue</div>".into()));
     }
 
-    let mut html = String::with_capacity(4096);
+    let mut html = String::with_capacity(2048);
     html.push_str("<table class=\"task-table\">");
     html.push_str(
         "<thead><tr>\
-         <th></th><th>ID</th><th>Repo</th><th>Title</th>\
-         <th>Status</th><th>Retries</th><th>Timeline</th><th>Actions</th>\
+         <th>ID</th><th>Repo</th><th>Title</th><th>Status</th><th>Timeline</th><th>Retries</th><th>Actions</th>\
          </tr></thead><tbody>",
     );
 
@@ -200,215 +616,6 @@ async fn tasks_partial(State(state): State<Arc<ApiState>>) -> Result<Html<String
     }
 
     html.push_str("</tbody></table>");
-    Ok(Html(html))
-}
-
-/// Per-task detail view — loaded via HTMX when a task row is expanded.
-/// Shows description, acceptance criteria, branch, gate reports, convergence, and diff.
-async fn task_detail_partial(
-    State(state): State<Arc<ApiState>>,
-    Path(id): Path<i64>,
-) -> Result<Html<String>, DashboardError> {
-    let db = state.db();
-    let task_store = TaskStore::new(db);
-    let gate_store = GateStore::new(db);
-    let task = task_store
-        .get(&TaskId(id))?
-        .ok_or_else(|| DashboardError(format!("task {id} not found")))?;
-
-    let mut html = String::with_capacity(4096);
-    html.push_str("<div class=\"task-detail\">");
-
-    // ── Description & Acceptance Criteria ──
-    html.push_str("<div class=\"detail-section\">");
-    html.push_str("<h4>Description</h4>");
-    let desc_esc = escape_html(&task.description);
-    let _ = write!(html, "<pre class=\"detail-pre\">{desc_esc}</pre>");
-
-    if !task.acceptance_criteria.is_empty() {
-        html.push_str("<h4>Acceptance Criteria</h4><ul class=\"criteria-list\">");
-        for criterion in &task.acceptance_criteria {
-            let c_esc = escape_html(criterion);
-            let _ = write!(html, "<li>{c_esc}</li>");
-        }
-        html.push_str("</ul>");
-    }
-    html.push_str("</div>");
-
-    // ── Branch ──
-    let branch = task.branch_name();
-    let branch_esc = escape_html(&branch);
-    let _ = write!(
-        html,
-        "<div class=\"detail-section\">\
-         <h4>Branch</h4>\
-         <code class=\"branch-name\">{branch_esc}</code>\
-         </div>"
-    );
-
-    // ── State Timeline ──
-    html.push_str("<div class=\"detail-section\">");
-    html.push_str("<h4>State Timeline</h4>");
-    render_state_timeline(&mut html, &task);
-    html.push_str("</div>");
-
-    // ── Gate Reports ──
-    let gate_reports = gate_store.get_all_for_task(&TaskId(id))?;
-    if !gate_reports.is_empty() {
-        html.push_str("<div class=\"detail-section\"><h4>Gate Reports</h4>");
-        for report in &gate_reports {
-            let gate_label = escape_html(&format!("{}", report.level));
-            let status_class = if report.passed { "pass" } else { "fail" };
-            let status_text = if report.passed { "PASS" } else { "FAIL" };
-            let _ = write!(
-                html,
-                "<div class=\"gate-report\">\
-                 <div class=\"gate-header\">\
-                 <span class=\"gate-name\">{gate_label}</span>\
-                 <span class=\"gate-status {status_class}\">{status_text}</span>\
-                 <span class=\"gate-duration\">{:.1}s</span>\
-                 </div>",
-                report.duration_secs,
-            );
-
-            for check in &report.checks {
-                let check_class = if check.passed { "pass" } else { "fail" };
-                let check_icon = if check.passed { "+" } else { "x" };
-                let check_name = escape_html(&check.name);
-                let _ = write!(
-                    html,
-                    "<div class=\"gate-check {check_class}\">\
-                     <span class=\"check-icon\">{check_icon}</span>\
-                     <span class=\"check-name\">{check_name}</span>\
-                     </div>",
-                );
-
-                // Show stderr for failed checks (truncated)
-                if !check.passed && !check.stderr.is_empty() {
-                    let stderr_trunc = if check.stderr.len() > 500 {
-                        format!("{}...(truncated)", &check.stderr[..500])
-                    } else {
-                        check.stderr.clone()
-                    };
-                    let stderr_esc = escape_html(&stderr_trunc);
-                    let _ = write!(html, "<pre class=\"check-output\">{stderr_esc}</pre>",);
-                }
-            }
-            html.push_str("</div>");
-        }
-        html.push_str("</div>");
-    }
-
-    // TODO: Add convergence / retry history once convergence_store exists
-
-    // ── Diff (for reviewable tasks) ──
-    if task.status.is_reviewable() {
-        let _ = write!(
-            html,
-            "<div class=\"detail-section\">\
-             <h4>Diff</h4>\
-             <div class=\"diff-container\" \
-             hx-get=\"/api/v1/tasks/{id}/diff\" \
-             hx-trigger=\"load\" \
-             hx-swap=\"innerHTML\">\
-             <div class=\"empty\">Loading diff&hellip;</div>\
-             </div>\
-             </div>",
-        );
-    }
-
-    html.push_str("</div>");
-    Ok(Html(html))
-}
-
-/// Memory entries viewer — filterable by repo.
-#[derive(Deserialize)]
-struct MemoryQuery {
-    repo: Option<String>,
-}
-
-async fn memory_partial(
-    State(state): State<Arc<ApiState>>,
-    Query(query): Query<MemoryQuery>,
-) -> Result<Html<String>, DashboardError> {
-    let db = state.db();
-    let memory_store = MemoryStore::new(db);
-    let task_store = TaskStore::new(db);
-
-    // Collect unique repos for the filter dropdown
-    let tasks = task_store.list(None, None)?;
-    let mut repos: Vec<String> = tasks.iter().map(|t| t.repo.to_string()).collect();
-    repos.sort();
-    repos.dedup();
-
-    let repo_filter = query
-        .repo
-        .as_deref()
-        .filter(|r| !r.is_empty())
-        .map(thrum_core::task::RepoName::new);
-
-    let entries = memory_store.list_all(repo_filter.as_ref(), 50)?;
-
-    let mut html = String::with_capacity(2048);
-
-    // Repo filter form
-    let selected_repo = query.repo.as_deref().unwrap_or("");
-    html.push_str(
-        "<div class=\"memory-filter\">\
-         <select name=\"repo\" \
-         hx-get=\"/dashboard/partials/memory\" \
-         hx-target=\"#memory-section\" \
-         hx-swap=\"innerHTML\" \
-         hx-include=\"this\">",
-    );
-    let all_selected = if selected_repo.is_empty() {
-        " selected"
-    } else {
-        ""
-    };
-    let _ = write!(html, "<option value=\"\"{all_selected}>All repos</option>");
-    for repo in &repos {
-        let repo_esc = escape_html(repo);
-        let sel = if repo.as_str() == selected_repo {
-            " selected"
-        } else {
-            ""
-        };
-        let _ = write!(
-            html,
-            "<option value=\"{repo_esc}\"{sel}>{repo_esc}</option>"
-        );
-    }
-    html.push_str("</select></div>");
-
-    if entries.is_empty() {
-        html.push_str("<div class=\"empty\">No memory entries</div>");
-    } else {
-        html.push_str("<div class=\"memory-list\">");
-        for entry in &entries {
-            let cat_label = entry.category.label();
-            let cat_class = cat_label;
-            let repo_esc = escape_html(&entry.repo.to_string());
-            let content_esc = escape_html(&entry.content);
-            let score = entry.relevance_score;
-            let access = entry.access_count;
-
-            let _ = write!(
-                html,
-                "<div class=\"memory-entry\">\
-                 <div class=\"memory-header\">\
-                 <span class=\"memory-category badge badge-{cat_class}\">{cat_label}</span>\
-                 <span class=\"memory-repo\">{repo_esc}</span>\
-                 <span class=\"memory-score\" title=\"Relevance score\">{score:.2}</span>\
-                 <span class=\"memory-access\" title=\"Access count\">x{access}</span>\
-                 </div>\
-                 <div class=\"memory-content\">{content_esc}</div>\
-                 </div>",
-            );
-        }
-        html.push_str("</div>");
-    }
-
     Ok(Html(html))
 }
 
@@ -444,6 +651,7 @@ async fn activity_partial(
         let message = event.message.as_deref().unwrap_or("");
         let target = event.target.as_deref().unwrap_or("");
 
+        // Show only HH:MM:SS portion for readability
         let short_time = if timestamp.len() >= 19 {
             &timestamp[11..19]
         } else {
@@ -470,9 +678,112 @@ async fn activity_partial(
     Ok(Html(html))
 }
 
+// ─── Budget, Memory, Task Detail Partials ───────────────────────────────
+
+/// Budget usage widget — shows spent/remaining/ceiling.
+async fn budget_partial(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Html<String>, DashboardError> {
+    let db = state.db();
+    let budget_store = BudgetStore::new(db);
+    let tracker = budget_store
+        .load()?
+        .unwrap_or_else(|| thrum_core::budget::BudgetTracker::new(1000.0));
+
+    let spent = tracker.total_spent();
+    let ceiling = tracker.ceiling_usd;
+    let remaining = ceiling - spent;
+    let pct = if ceiling > 0.0 {
+        (spent / ceiling * 100.0).min(100.0)
+    } else {
+        0.0
+    };
+
+    Ok(Html(format!(
+        "<div class=\"budget-widget\">\
+         <div class=\"budget-bar\" style=\"width:{pct:.0}%\"></div>\
+         <span class=\"budget-label\">${spent:.2} / ${ceiling:.2} (${remaining:.2} remaining)</span>\
+         </div>"
+    )))
+}
+
+/// Memory entries viewer — shows stored memory entries filtered by repo.
+async fn memory_partial(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Html<String>, DashboardError> {
+    let db = state.db();
+    let store = MemoryStore::new(db);
+    let entries = store.list_all(None, 50)?;
+
+    let mut html = String::with_capacity(1024);
+    html.push_str("<div class=\"memory-filter\">");
+    if entries.is_empty() {
+        html.push_str("<div class=\"empty\">No memory entries</div>");
+    } else {
+        for entry in &entries {
+            let _ = write!(
+                html,
+                "<div class=\"memory-entry\">\
+                 <span class=\"memory-repo\">{}</span>\
+                 <span class=\"memory-content\">{}</span>\
+                 <span class=\"memory-relevance\">{:.2}</span>\
+                 </div>",
+                escape_html(&entry.repo.to_string()),
+                escape_html(&entry.content[..entry.content.len().min(80)]),
+                entry.relevance_score,
+            );
+        }
+    }
+    html.push_str("</div>");
+    Ok(Html(html))
+}
+
+/// Task detail partial — shows expanded info for a single task.
+async fn task_detail_partial(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<i64>,
+) -> Result<Html<String>, DashboardError> {
+    let db = state.db();
+    let store = TaskStore::new(db);
+
+    let task = store
+        .get(&TaskId(id))?
+        .ok_or_else(|| DashboardError(format!("task {id} not found")))?;
+
+    let branch = format!(
+        "auto/TASK-{:04}/{}/{}",
+        task.id.0,
+        task.repo,
+        task.title.to_lowercase().replace(' ', "-")
+    );
+
+    let mut html = String::with_capacity(1024);
+    let _ = write!(
+        html,
+        "<div class=\"task-detail\">\
+         <h4>TASK-{:04}: {}</h4>\
+         <p>{}</p>\
+         <div class=\"branch-name\">{branch}</div>",
+        task.id.0,
+        escape_html(&task.title),
+        escape_html(&task.description),
+    );
+
+    if !task.acceptance_criteria.is_empty() {
+        html.push_str("<ul class=\"criteria\">");
+        for ac in &task.acceptance_criteria {
+            let _ = write!(html, "<li>{}</li>", escape_html(ac));
+        }
+        html.push_str("</ul>");
+    }
+
+    html.push_str("</div>");
+    Ok(Html(html))
+}
+
 // ─── Actions ────────────────────────────────────────────────────────────
 
-/// Approve a task and return the updated table row as HTML.
+/// Approve a task and return a success message (or updated row for dashboard).
 async fn approve_action(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<i64>,
@@ -496,9 +807,11 @@ async fn approve_action(
     task.updated_at = Utc::now();
     store.update(&task)?;
 
-    let mut html = String::new();
-    render_task_row_into(&mut html, &task);
-    Ok(Html(html))
+    // Return a success message (works for both dashboard row swap and review page)
+    Ok(Html(format!(
+        "<div class=\"action-result success\">\
+         TASK-{id:04} approved — moving to integration</div>"
+    )))
 }
 
 #[derive(serde::Deserialize)]
@@ -506,7 +819,7 @@ struct RejectForm {
     feedback: String,
 }
 
-/// Reject a task and return the updated table row as HTML.
+/// Reject a task and return a feedback message.
 async fn reject_action(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<i64>,
@@ -525,168 +838,45 @@ async fn reject_action(
     task.updated_at = Utc::now();
     store.update(&task)?;
 
-    let mut html = String::new();
-    render_task_row_into(&mut html, &task);
-    Ok(Html(html))
+    Ok(Html(format!(
+        "<div class=\"action-result error\">\
+         TASK-{id:04} rejected — returning to implementation with feedback</div>"
+    )))
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────
 
 /// Write a single `<tr>` for a task into the buffer.
-/// Rows are clickable — expanding to reveal a detail panel loaded via HTMX.
 fn render_task_row_into(buf: &mut String, task: &thrum_core::task::Task) {
     let id = task.id.0;
     let label = task.status.label();
     let repo = escape_html(&task.repo.to_string());
     let title = escape_html(&task.title);
     let retries = task.retry_count;
-    let detail_id = format!("task-detail-{id}");
 
-    // Main row — clickable to toggle detail
     let _ = write!(
         buf,
-        "<tr id=\"task-row-{id}\" class=\"task-row\" \
-         hx-get=\"/dashboard/partials/task-detail/{id}\" \
-         hx-target=\"#{detail_id}\" \
-         hx-swap=\"innerHTML\" \
-         hx-trigger=\"click\" \
-         hx-select=\".task-detail\" \
-         role=\"button\" tabindex=\"0\">\
-         <td class=\"expand-icon\">&#9654;</td>\
+        "<tr id=\"task-row-{id}\" class=\"task-row\">\
          <td class=\"task-id\">TASK-{id:04}</td>\
          <td>{repo}</td>\
-         <td class=\"task-title-cell\">{title}</td>\
+         <td>{title}</td>\
          <td><span class=\"badge badge-{label}\">{label}</span></td>\
+         <td class=\"timeline\"><span class=\"timeline-bar timeline-{label}\"></span></td>\
          <td>{retries}</td>\
          <td>",
     );
 
-    // Inline timeline bar
-    render_inline_timeline(buf, task);
-
-    buf.push_str("</td><td>");
-
-    // Approve/reject buttons
+    // Show review link for AwaitingApproval tasks
     if task.status.needs_human() {
         let _ = write!(
             buf,
-            "<div class=\"actions\" onclick=\"event.stopPropagation()\">\
-             <button class=\"btn btn-approve\" \
-             hx-post=\"/dashboard/tasks/{id}/approve\" \
-             hx-target=\"#task-row-{id}\" \
-             hx-swap=\"outerHTML\">Approve</button>\
-             <button class=\"btn btn-reject\" \
-             onclick=\"openRejectModal({id})\">Reject</button>\
+            "<div class=\"actions\">\
+             <a href=\"/dashboard/tasks/{id}/review\" class=\"btn btn-approve\">Review</a>\
              </div>",
         );
     }
 
-    // Close main row, then add the hidden detail row
-    let _ = write!(
-        buf,
-        "</td></tr>\
-         <tr class=\"detail-row\">\
-         <td colspan=\"8\" id=\"{detail_id}\" class=\"detail-cell\"></td>\
-         </tr>",
-    );
-}
-
-/// Render a compact inline timeline showing state progression.
-fn render_inline_timeline(buf: &mut String, task: &thrum_core::task::Task) {
-    // Define the pipeline stages in order
-    let stages: &[(&str, &str)] = &[
-        ("pending", "P"),
-        ("implementing", "I"),
-        ("gate1", "G1"),
-        ("reviewing", "R"),
-        ("gate2", "G2"),
-        ("approval", "A"),
-        ("integrating", "Int"),
-        ("gate3", "G3"),
-        ("merged", "M"),
-    ];
-
-    let current = task.status.label();
-    let current_idx = match current {
-        "pending" => 0,
-        "claimed" | "implementing" => 1,
-        "gate1-failed" => 2,
-        "reviewing" => 3,
-        "gate2-failed" => 4,
-        "awaiting-approval" => 5,
-        "approved" | "integrating" => 6,
-        "gate3-failed" => 7,
-        "merged" => 8,
-        "rejected" => 5, // rejected from approval
-        _ => 0,
-    };
-
-    let is_failed = current.contains("failed") || current == "rejected";
-
-    buf.push_str("<div class=\"timeline\">");
-    for (i, (_, abbr)) in stages.iter().enumerate() {
-        let class = if i < current_idx {
-            "timeline-step done"
-        } else if i == current_idx {
-            if is_failed {
-                "timeline-step failed"
-            } else {
-                "timeline-step active"
-            }
-        } else {
-            "timeline-step"
-        };
-        let _ = write!(buf, "<span class=\"{class}\">{abbr}</span>");
-    }
-    buf.push_str("</div>");
-}
-
-/// Render a detailed state timeline for the task detail view.
-fn render_state_timeline(buf: &mut String, task: &thrum_core::task::Task) {
-    let label = task.status.label();
-    let created = task.created_at.format("%Y-%m-%d %H:%M:%S UTC");
-    let updated = task.updated_at.format("%Y-%m-%d %H:%M:%S UTC");
-
-    let _ = write!(
-        buf,
-        "<div class=\"state-timeline\">\
-         <div class=\"timeline-entry\">\
-         <span class=\"timeline-dot done\"></span>\
-         <span class=\"timeline-label\">Created</span>\
-         <span class=\"timeline-time\">{created}</span>\
-         </div>"
-    );
-
-    // Show current state
-    let dot_class = if label.contains("failed") || label == "rejected" {
-        "timeline-dot failed"
-    } else if label == "merged" {
-        "timeline-dot done"
-    } else {
-        "timeline-dot active"
-    };
-    let label_esc = escape_html(label);
-    let _ = write!(
-        buf,
-        "<div class=\"timeline-entry\">\
-         <span class=\"{dot_class}\"></span>\
-         <span class=\"timeline-label\">{label_esc}</span>\
-         <span class=\"timeline-time\">{updated}</span>\
-         </div>"
-    );
-
-    if task.retry_count > 0 {
-        let _ = write!(
-            buf,
-            "<div class=\"timeline-entry\">\
-             <span class=\"timeline-dot\"></span>\
-             <span class=\"timeline-label\">Retries: {}</span>\
-             </div>",
-            task.retry_count,
-        );
-    }
-
-    buf.push_str("</div>");
+    buf.push_str("</td></tr>");
 }
 
 /// Minimal HTML escaping for dynamic content.

@@ -270,6 +270,20 @@ enum TaskAction {
     Checkpoint { id: i64 },
     /// Show stored session ID for a task (used for session continuation on retries).
     Session { id: i64 },
+    /// Export the full agent conversation transcript for a task.
+    ///
+    /// Calls the agent CLI's export command (e.g., `claude export`) using the
+    /// stored session ID. Output is saved in the traces/ directory alongside
+    /// OTEL trace files.
+    Export {
+        id: i64,
+        /// Output format: "markdown" (default) or "html".
+        #[arg(long, default_value = "markdown")]
+        format: String,
+        /// Override the output path (default: traces/export-TASK-XXXX-{timestamp}.{ext}).
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
 }
 
 #[tokio::main]
@@ -334,7 +348,7 @@ async fn main() -> Result<()> {
         }
         Commands::Task { action } => {
             let db = open_db()?;
-            cmd_task(&db, action)
+            cmd_task(&db, action, &cli.trace_dir)
         }
         Commands::Memory { action } => {
             let db = open_db()?;
@@ -1452,7 +1466,7 @@ fn cmd_traces(trace_dir: &Path, action: TracesAction) -> Result<()> {
 
 // ─── Task management ────────────────────────────────────────────────────
 
-fn cmd_task(db: &redb::Database, action: TaskAction) -> Result<()> {
+fn cmd_task(db: &redb::Database, action: TaskAction, trace_dir: &Path) -> Result<()> {
     let store = TaskStore::new(db);
 
     match action {
@@ -1582,6 +1596,72 @@ fn cmd_task(db: &redb::Database, action: TaskAction) -> Result<()> {
                 }
                 None => {
                     println!("No stored session for TASK-{id:04}");
+                }
+            }
+        }
+
+        TaskAction::Export { id, format, output } => {
+            use thrum_core::session_export::ExportFormat;
+
+            let task_id = TaskId(id);
+            let format: ExportFormat = format.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+
+            // Look up the stored session ID
+            let session_store = thrum_db::session_store::SessionStore::new(db);
+            let session_id = session_store.get(&task_id)?.context(format!(
+                "no stored session for TASK-{id:04}. \
+                     The task may not have been run yet, or the session was cleaned up after merge."
+            ))?;
+
+            println!("Exporting session {session_id} for TASK-{id:04} as {format}...");
+
+            // Run the export (async)
+            let rt = tokio::runtime::Handle::current();
+            let export_dir = output
+                .as_deref()
+                .map(|p| p.parent().unwrap_or(trace_dir))
+                .unwrap_or(trace_dir);
+
+            let result = rt.block_on(thrum_runner::session_export::export_session(
+                &session_id,
+                id,
+                format,
+                export_dir,
+                None, // auto-detect backend
+            ))?;
+
+            // If a custom output path was specified, rename the file
+            if let Some(ref custom_path) = output {
+                std::fs::rename(&result.path, custom_path).context(format!(
+                    "failed to move export to {}",
+                    custom_path.display()
+                ))?;
+                println!(
+                    "Exported TASK-{id:04} session to {} ({} bytes)",
+                    custom_path.display(),
+                    result.size_bytes
+                );
+            } else {
+                println!(
+                    "Exported TASK-{id:04} session to {} ({} bytes)",
+                    result.path.display(),
+                    result.size_bytes
+                );
+            }
+
+            // Also list any previous exports for this task
+            let existing = thrum_runner::session_export::list_exports(trace_dir, id)?;
+            if existing.len() > 1 {
+                println!(
+                    "\n{} total export(s) for TASK-{id:04} in {}:",
+                    existing.len(),
+                    trace_dir.display()
+                );
+                for path in &existing {
+                    println!(
+                        "  {}",
+                        path.file_name().unwrap_or_default().to_string_lossy()
+                    );
                 }
             }
         }

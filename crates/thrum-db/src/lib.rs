@@ -1,5 +1,6 @@
 pub mod budget_store;
 pub mod checkpoint_store;
+pub mod convergence_store;
 pub mod gate_store;
 pub mod memory_store;
 pub mod meta_store;
@@ -27,6 +28,7 @@ pub fn open_db(path: &Path) -> Result<Database> {
         let _meta = write_txn.open_table(meta_store::META_TABLE)?;
         let _checkpoints = write_txn.open_table(checkpoint_store::CHECKPOINT_TABLE)?;
         let _sessions = write_txn.open_table(session_store::SESSION_TABLE)?;
+        let _convergence = write_txn.open_table(convergence_store::CONVERGENCE_TABLE)?;
     }
     write_txn.commit()?;
     Ok(db)
