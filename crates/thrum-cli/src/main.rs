@@ -96,6 +96,12 @@ enum Commands {
         /// Number of parallel agents (default: 1 = sequential).
         #[arg(long, default_value = "1")]
         agents: usize,
+        /// Also start the A2A/HTTP API server alongside the engine.
+        #[arg(long)]
+        serve: bool,
+        /// Bind address for the API server (requires --serve).
+        #[arg(long, default_value = "127.0.0.1:3000")]
+        bind: String,
     },
     /// Manage tasks in the queue.
     Task {
@@ -241,17 +247,29 @@ async fn main() -> Result<()> {
     let open_db = || thrum_db::open_db(&cli.db);
 
     match cli.command {
-        Commands::Run { repo, once, agents } => {
+        Commands::Run {
+            repo,
+            once,
+            agents,
+            serve,
+            bind,
+        } => {
             let repo_filter = repo.map(RepoName::new);
             let repos_config = ReposConfig::load(&cli.config)?;
-            if agents > 1 && !once {
+            // Use parallel path when multiple agents OR when --serve is requested
+            // (serve needs Arc<Database> + shared EventBus which only the parallel path provides)
+            if (agents > 1 && !once) || serve {
                 cmd_run_parallel(
                     &cli.db,
                     repos_config,
                     &cli.agents_dir,
                     &cli.pipeline,
                     repo_filter,
-                    agents,
+                    agents.max(1),
+                    serve,
+                    &bind,
+                    &cli.trace_dir,
+                    cli.config.clone(),
                 )
                 .await
             } else {
@@ -345,6 +363,7 @@ async fn main() -> Result<()> {
                     .map(|g| g.steps.clone())
                     .unwrap_or_default(),
                 subsample: pipeline.subsample,
+                worktrees_dir: pipeline.engine.worktrees_dir,
             });
 
             watch::run_watch_tui(ctx).await
@@ -400,6 +419,40 @@ struct PipelineConfig {
     /// Test subsampling: run a fraction of tests at Gate 1 for speed.
     #[serde(default)]
     subsample: Option<thrum_core::subsample::SubsampleConfig>,
+    /// Engine concurrency settings.
+    #[serde(default)]
+    engine: EngineToml,
+}
+
+/// Engine concurrency settings from `[engine]` section in pipeline.toml.
+#[derive(serde::Deserialize)]
+struct EngineToml {
+    /// Maximum concurrent agents working on the same repo.
+    ///
+    /// When > 1, each agent gets an isolated git worktree so that multiple
+    /// agents can work concurrently without index conflicts.
+    #[serde(default = "default_per_repo_limit")]
+    per_repo_limit: usize,
+    /// Base directory for git worktrees.
+    #[serde(default = "default_worktrees_dir")]
+    worktrees_dir: PathBuf,
+}
+
+fn default_per_repo_limit() -> usize {
+    1
+}
+
+fn default_worktrees_dir() -> PathBuf {
+    PathBuf::from("worktrees")
+}
+
+impl Default for EngineToml {
+    fn default() -> Self {
+        Self {
+            per_repo_limit: default_per_repo_limit(),
+            worktrees_dir: default_worktrees_dir(),
+        }
+    }
 }
 
 /// Budget configuration from [budget] section in pipeline.toml.
@@ -596,6 +649,7 @@ fn check_repos_advanced(db: &redb::Database, repos_config: &ReposConfig) {
 ///
 /// Re-opens the DB as Arc<Database> because the parallel engine needs owned
 /// shared access across spawned tasks (redb serializes writers internally).
+#[allow(clippy::too_many_arguments)]
 async fn cmd_run_parallel(
     db_path: &Path,
     repos_config: ReposConfig,
@@ -603,6 +657,10 @@ async fn cmd_run_parallel(
     pipeline_config: &Path,
     repo_filter: Option<RepoName>,
     max_agents: usize,
+    serve: bool,
+    bind: &str,
+    trace_dir: &Path,
+    config_path: PathBuf,
 ) -> Result<()> {
     let pipeline = PipelineConfig::load(pipeline_config)?;
     let registry = build_registry(&pipeline)?;
@@ -641,6 +699,25 @@ async fn cmd_run_parallel(
 
     let event_bus = thrum_runner::event_bus::EventBus::new();
 
+    // Spawn A2A/HTTP API server if --serve was passed.
+    // Uses the same Arc<Database> to avoid redb exclusive lock conflict.
+    if serve {
+        let api_state = Arc::new(thrum_api::ApiState::with_shared_db(
+            shared_db.clone(),
+            trace_dir.to_path_buf(),
+            Some(config_path),
+            event_bus.clone(),
+        ));
+        let bind_addr = bind.to_string();
+        tokio::spawn(async move {
+            if let Err(e) = thrum_api::serve(api_state, &bind_addr).await {
+                tracing::error!(error = %e, "API server failed");
+            }
+        });
+    }
+
+    let per_repo_limit = pipeline.engine.per_repo_limit;
+
     let ctx = Arc::new(PipelineContext {
         db: shared_db.clone(),
         repos_config: Arc::new(repos_config),
@@ -658,11 +735,12 @@ async fn cmd_run_parallel(
             .map(|g| g.steps.clone())
             .unwrap_or_default(),
         subsample: pipeline.subsample,
+        worktrees_dir: pipeline.engine.worktrees_dir,
     });
 
     let config = EngineConfig {
         max_agents,
-        per_repo_limit: 1,
+        per_repo_limit,
         session_budget_usd: None,
         poll_interval: std::time::Duration::from_secs(5),
     };
@@ -765,6 +843,7 @@ async fn cmd_run(
                 &budget,
                 subsample.as_ref(),
                 task,
+                None, // sequential mode: no worktree
             )
             .await;
             if let Err(e) = result {
@@ -786,6 +865,7 @@ async fn cmd_run(
                 &event_bus,
                 &integration_steps,
                 task,
+                None, // sequential mode: no worktree
             )
             .await;
             match result {
@@ -842,6 +922,7 @@ async fn cmd_run(
             &budget,
             subsample.as_ref(),
             task,
+            None, // sequential mode: no worktree
         )
         .await;
 

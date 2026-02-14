@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Thrum Live Dashboard</title>
+    <link rel="stylesheet" href="/dashboard/assets/style.css">
+    <link rel="stylesheet" href="/dashboard/assets/live.css">
+    <script src="https://unpkg.com/htmx.org@2.0.4"
+            integrity="sha384-HGfztofotfshcF7+8n44JQL2oJmowVChPTg48S+jvZoztPfvwD79OC/LTtG6dMp+"
+            crossorigin="anonymous"></script>
+    <script src="https://unpkg.com/htmx-ext-sse@2.2.2"
+            integrity="sha384-fw+eTlCc7suMV1y28IbzMEsOGKArwx7mCnNn8aXiRBCPlhXdMiaaPhsPKYr7bz6"
+            crossorigin="anonymous"></script>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>thrum</h1>
+            <div class="version">
+                <span class="connection-dot" id="conn-dot"></span>
+                live dashboard
+            </div>
+        </header>
+
+        <!-- Agent Cards Grid -->
+        <div class="section">
+            <h2>Agents</h2>
+            <div id="agent-grid" class="agent-grid">
+                <div class="empty" id="no-agents">Waiting for agent events&hellip;</div>
+            </div>
+        </div>
+
+        <!-- Live Event Log -->
+        <div class="section">
+            <h2>Event Stream</h2>
+            <div id="event-log" class="event-log"></div>
+        </div>
+    </div>
+
+    <script>
+    // ── State ────────────────────────────────────────────────────
+    const agents = {};
+    const MAX_LOG_LINES = 200;
+    const MAX_AGENT_LOG = 50;
+
+    // ── SSE Connection ──────────────────────────────────────────
+    const evtSource = new EventSource('/api/v1/events/stream');
+
+    evtSource.addEventListener('pipeline_event', function(e) {
+        const event = JSON.parse(e.data);
+        handleEvent(event);
+    });
+
+    evtSource.addEventListener('lagged', function(e) {
+        const info = JSON.parse(e.data);
+        appendLog('warn', 'Skipped ' + info.skipped + ' events (client lagged)');
+    });
+
+    evtSource.onopen = function() {
+        document.getElementById('conn-dot').classList.add('connected');
+        document.getElementById('conn-dot').classList.remove('disconnected');
+    };
+
+    evtSource.onerror = function() {
+        document.getElementById('conn-dot').classList.remove('connected');
+        document.getElementById('conn-dot').classList.add('disconnected');
+    };
+
+    // ── Event Router ────────────────────────────────────────────
+    function handleEvent(event) {
+        const kind = event.kind;
+
+        if (kind.AgentStarted) {
+            const d = kind.AgentStarted;
+            ensureAgent(d.agent_id, d.task_id, d.repo);
+            agents[d.agent_id].stage = 'implementing';
+            agents[d.agent_id].started = event.timestamp;
+            renderAgentCard(d.agent_id);
+            appendLog('info', d.agent_id + ' started on ' + d.task_id);
+        }
+        else if (kind.AgentOutput) {
+            const d = kind.AgentOutput;
+            ensureAgent(d.agent_id, d.task_id);
+            pushAgentLog(d.agent_id, d.stream, d.line);
+            renderAgentCard(d.agent_id);
+        }
+        else if (kind.AgentFinished) {
+            const d = kind.AgentFinished;
+            ensureAgent(d.agent_id, d.task_id);
+            agents[d.agent_id].stage = d.success ? 'finished' : 'failed';
+            agents[d.agent_id].elapsed = d.elapsed_secs;
+            renderAgentCard(d.agent_id);
+            const status = d.success ? 'OK' : 'FAIL';
+            appendLog(d.success ? 'info' : 'error',
+                d.agent_id + ' finished (' + status + ', ' + d.elapsed_secs.toFixed(1) + 's)');
+        }
+        else if (kind.TaskStateChange) {
+            const d = kind.TaskStateChange;
+            for (const [aid, a] of Object.entries(agents)) {
+                if (a.task_id === d.task_id) {
+                    a.stage = d.to;
+                    renderAgentCard(aid);
+                }
+            }
+            appendLog('info', d.task_id + ' (' + d.repo + '): ' + d.from + ' \u2192 ' + d.to);
+        }
+        else if (kind.GateStarted) {
+            const d = kind.GateStarted;
+            for (const [aid, a] of Object.entries(agents)) {
+                if (a.task_id === d.task_id) {
+                    a.stage = 'gate: ' + d.level;
+                    renderAgentCard(aid);
+                }
+            }
+            appendLog('info', d.task_id + ': gate ' + d.level + ' started');
+        }
+        else if (kind.GateFinished) {
+            const d = kind.GateFinished;
+            const status = d.passed ? 'PASS' : 'FAIL';
+            appendLog(d.passed ? 'info' : 'error',
+                d.task_id + ': gate ' + d.level + ' ' + status +
+                ' (' + d.duration_secs.toFixed(1) + 's)');
+        }
+        else if (kind.GateCheckFinished) {
+            const d = kind.GateCheckFinished;
+            const status = d.passed ? 'PASS' : 'FAIL';
+            appendLog(d.passed ? 'info' : 'warn',
+                'gate/' + d.check_name + ': ' + status);
+        }
+        else if (kind.FileChanged) {
+            const d = kind.FileChanged;
+            ensureAgent(d.agent_id, d.task_id);
+            const a = agents[d.agent_id];
+            if (!a.files) a.files = { created: 0, modified: 0, deleted: 0 };
+            if (d.kind === 'Created') a.files.created++;
+            else if (d.kind === 'Modified') a.files.modified++;
+            else if (d.kind === 'Deleted') a.files.deleted++;
+            renderAgentCard(d.agent_id);
+        }
+        else if (kind.DiffUpdate) {
+            const d = kind.DiffUpdate;
+            ensureAgent(d.agent_id, d.task_id);
+            agents[d.agent_id].diff = {
+                files: d.files_changed,
+                ins: d.insertions,
+                del: d.deletions
+            };
+            renderAgentCard(d.agent_id);
+        }
+        else if (kind.EngineLog) {
+            const d = kind.EngineLog;
+            const level = d.level === 'Error' ? 'error' :
+                          d.level === 'Warn' ? 'warn' : 'info';
+            appendLog(level, d.message);
+        }
+    }
+
+    // ── Agent State ─────────────────────────────────────────────
+    function ensureAgent(agentId, taskId, repo) {
+        if (!agents[agentId]) {
+            agents[agentId] = {
+                agent_id: agentId,
+                task_id: taskId || '?',
+                repo: repo || '?',
+                stage: 'starting',
+                log: [],
+                files: null,
+                diff: null,
+                elapsed: null,
+                started: null
+            };
+            var placeholder = document.getElementById('no-agents');
+            if (placeholder) placeholder.remove();
+        }
+        if (taskId) agents[agentId].task_id = taskId;
+        if (repo) agents[agentId].repo = repo;
+    }
+
+    function pushAgentLog(agentId, stream, line) {
+        const a = agents[agentId];
+        if (!a) return;
+        const tag = stream === 'Stderr' ? 'err' : 'out';
+        a.log.push({ tag: tag, line: line });
+        if (a.log.length > MAX_AGENT_LOG) {
+            a.log = a.log.slice(-MAX_AGENT_LOG);
+        }
+    }
+
+    // ── Rendering (safe DOM construction) ───────────────────────
+    function renderAgentCard(agentId) {
+        const a = agents[agentId];
+        if (!a) return;
+        const grid = document.getElementById('agent-grid');
+        const cardId = 'agent-' + cssId(agentId);
+        let card = document.getElementById(cardId);
+        if (!card) {
+            card = document.createElement('div');
+            card.id = cardId;
+            card.className = 'agent-card';
+            grid.appendChild(card);
+        }
+
+        // Clear and rebuild using safe DOM methods
+        card.textContent = '';
+
+        const stageClass = stageToClass(a.stage);
+
+        // Header row: task title + stage badge
+        const header = document.createElement('div');
+        header.className = 'agent-header';
+        const title = document.createElement('div');
+        title.className = 'agent-title';
+        title.textContent = a.task_id;
+        const badge = document.createElement('span');
+        badge.className = 'agent-badge ' + stageClass;
+        badge.textContent = a.stage;
+        header.appendChild(title);
+        header.appendChild(badge);
+        card.appendChild(header);
+
+        // Meta row: repo + elapsed
+        const meta = document.createElement('div');
+        meta.className = 'agent-meta';
+        const repo = document.createElement('span');
+        repo.className = 'agent-repo';
+        repo.textContent = a.repo;
+        meta.appendChild(repo);
+        if (a.elapsed) {
+            const elapsed = document.createElement('span');
+            elapsed.className = 'agent-elapsed';
+            elapsed.textContent = a.elapsed.toFixed(1) + 's';
+            meta.appendChild(elapsed);
+        }
+        card.appendChild(meta);
+
+        // File stats
+        if (a.diff) {
+            const filesDiv = document.createElement('div');
+            filesDiv.className = 'agent-files';
+            addFileStat(filesDiv, a.diff.files + ' files', '');
+            addFileStat(filesDiv, '+' + a.diff.ins, 'ins');
+            addFileStat(filesDiv, '-' + a.diff.del, 'del');
+            card.appendChild(filesDiv);
+        } else if (a.files) {
+            const filesDiv = document.createElement('div');
+            filesDiv.className = 'agent-files';
+            if (a.files.created) addFileStat(filesDiv, '+' + a.files.created, '');
+            if (a.files.modified) addFileStat(filesDiv, '~' + a.files.modified, '');
+            if (a.files.deleted) addFileStat(filesDiv, '-' + a.files.deleted, '');
+            card.appendChild(filesDiv);
+        }
+
+        // Scrollable log
+        if (a.log.length > 0) {
+            const logDiv = document.createElement('div');
+            logDiv.className = 'agent-log';
+            const visible = a.log.slice(-20);
+            for (var i = 0; i < visible.length; i++) {
+                var l = visible[i];
+                const lineEl = document.createElement('div');
+                lineEl.className = 'agent-log-line';
+                const tagSpan = document.createElement('span');
+                tagSpan.className = 'stream-tag ' + l.tag;
+                tagSpan.textContent = l.tag;
+                lineEl.appendChild(tagSpan);
+                const textNode = document.createTextNode(l.line);
+                lineEl.appendChild(textNode);
+                logDiv.appendChild(lineEl);
+            }
+            card.appendChild(logDiv);
+            logDiv.scrollTop = logDiv.scrollHeight;
+        }
+    }
+
+    function addFileStat(parent, text, extraClass) {
+        const span = document.createElement('span');
+        span.className = 'file-stat' + (extraClass ? ' ' + extraClass : '');
+        span.textContent = text;
+        parent.appendChild(span);
+    }
+
+    // ── Global Event Log (safe DOM construction) ────────────────
+    function appendLog(level, message) {
+        const log = document.getElementById('event-log');
+        const now = new Date().toLocaleTimeString('en-GB', { hour12: false });
+
+        const entry = document.createElement('div');
+        entry.className = 'log-entry';
+
+        const timeSpan = document.createElement('span');
+        timeSpan.className = 'log-time';
+        timeSpan.textContent = now;
+        entry.appendChild(timeSpan);
+
+        const levelSpan = document.createElement('span');
+        levelSpan.className = 'log-level ' + level;
+        levelSpan.textContent = level;
+        entry.appendChild(levelSpan);
+
+        const msgSpan = document.createElement('span');
+        msgSpan.className = 'log-message';
+        msgSpan.textContent = message;
+        entry.appendChild(msgSpan);
+
+        log.appendChild(entry);
+
+        // Trim old entries
+        while (log.children.length > MAX_LOG_LINES) {
+            log.removeChild(log.firstChild);
+        }
+        log.scrollTop = log.scrollHeight;
+    }
+
+    // ── Helpers ─────────────────────────────────────────────────
+    function cssId(s) {
+        return String(s).replace(/[^a-zA-Z0-9-]/g, '_');
+    }
+
+    function stageToClass(stage) {
+        if (!stage) return '';
+        var s = stage.toLowerCase();
+        if (s.indexOf('fail') >= 0 || s.indexOf('error') >= 0) return 'stage-failed';
+        if (s.indexOf('gate') >= 0)  return 'stage-gate';
+        if (s.indexOf('finish') >= 0 || s === 'merged') return 'stage-done';
+        if (s.indexOf('review') >= 0 || s.indexOf('approv') >= 0) return 'stage-review';
+        return 'stage-active';
+    }
+    </script>
+</body>
+</html>

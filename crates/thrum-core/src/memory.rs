@@ -34,6 +34,28 @@ pub enum MemoryCategory {
     Context { scope: String },
 }
 
+impl MemoryCategory {
+    /// Returns true if this is an Error category memory.
+    pub fn is_error(&self) -> bool {
+        matches!(self, MemoryCategory::Error { .. })
+    }
+
+    /// Returns true if this is a Pattern category memory.
+    pub fn is_pattern(&self) -> bool {
+        matches!(self, MemoryCategory::Pattern { .. })
+    }
+
+    /// Returns the category label for display/filtering purposes.
+    pub fn label(&self) -> &str {
+        match self {
+            MemoryCategory::Error { .. } => "error",
+            MemoryCategory::Pattern { .. } => "pattern",
+            MemoryCategory::Decision { .. } => "decision",
+            MemoryCategory::Context { .. } => "context",
+        }
+    }
+}
+
 impl MemoryEntry {
     /// Create a new memory entry with a content-derived ID.
     pub fn new(task_id: TaskId, repo: RepoName, category: MemoryCategory, content: String) -> Self {
@@ -213,5 +235,68 @@ mod tests {
         let ctx = entry.to_prompt_context();
         assert!(ctx.contains("[Error: test_failure]"));
         assert!(ctx.contains("ARM encoding"));
+    }
+
+    #[test]
+    fn category_is_error() {
+        let error = MemoryCategory::Error {
+            error_type: "gate1_failure".into(),
+        };
+        let pattern = MemoryCategory::Pattern {
+            pattern_name: "test".into(),
+        };
+        let decision = MemoryCategory::Decision {
+            alternatives: vec!["a".into()],
+        };
+        let context = MemoryCategory::Context {
+            scope: "repo".into(),
+        };
+
+        assert!(error.is_error());
+        assert!(!pattern.is_error());
+        assert!(!decision.is_error());
+        assert!(!context.is_error());
+    }
+
+    #[test]
+    fn category_is_pattern() {
+        let error = MemoryCategory::Error {
+            error_type: "gate1_failure".into(),
+        };
+        let pattern = MemoryCategory::Pattern {
+            pattern_name: "test".into(),
+        };
+
+        assert!(!error.is_pattern());
+        assert!(pattern.is_pattern());
+    }
+
+    #[test]
+    fn category_label() {
+        assert_eq!(
+            MemoryCategory::Error {
+                error_type: "x".into()
+            }
+            .label(),
+            "error"
+        );
+        assert_eq!(
+            MemoryCategory::Pattern {
+                pattern_name: "x".into()
+            }
+            .label(),
+            "pattern"
+        );
+        assert_eq!(
+            MemoryCategory::Decision {
+                alternatives: vec![]
+            }
+            .label(),
+            "decision"
+        );
+        assert_eq!(
+            MemoryCategory::Context { scope: "x".into() }.label(),
+            "context"
+        );
     }
 }

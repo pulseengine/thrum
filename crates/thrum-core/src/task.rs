@@ -217,6 +217,9 @@ pub struct Task {
     pub acceptance_criteria: Vec<String>,
     pub status: TaskStatus,
     pub safety_classification: Option<AsilLevel>,
+    /// A2A context ID for grouping related tasks.
+    #[serde(default)]
+    pub context_id: Option<String>,
     /// Structured specification (SDD). If present, used instead of free-text description.
     #[serde(default)]
     pub spec: Option<Spec>,
@@ -240,6 +243,7 @@ impl Task {
             acceptance_criteria: Vec::new(),
             status: TaskStatus::Pending,
             safety_classification: None,
+            context_id: None,
             spec: None,
             retry_count: 0,
             created_at: now,

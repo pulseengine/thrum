@@ -163,6 +163,22 @@ impl GitRepo {
         Ok(oid.to_string())
     }
 
+    /// Create a git worktree for the given branch, returning an isolated
+    /// working directory. The worktree is placed under `base_dir/<branch_slug>`.
+    ///
+    /// The returned [`Worktree`](crate::worktree::Worktree) auto-cleans on drop.
+    pub fn create_worktree(
+        &self,
+        branch: &str,
+        base_dir: &Path,
+    ) -> Result<crate::worktree::Worktree> {
+        let repo_path = self
+            .repo
+            .workdir()
+            .context("bare repository cannot create worktrees")?;
+        crate::worktree::Worktree::create(repo_path, branch, base_dir)
+    }
+
     /// Detect the default branch (main or master).
     fn default_branch(&self) -> Result<String> {
         if self.repo.find_branch("main", BranchType::Local).is_ok() {
@@ -178,5 +194,70 @@ impl GitRepo {
             .signature()
             .or_else(|_| Signature::now("automator", "automator@pulseengine.dev"))
             .context("failed to create git signature")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Create a temporary git repo with an initial commit.
+    ///
+    /// Strips environment variables that may leak from the outer repo
+    /// (e.g. `GIT_DIR`, `GIT_INDEX_FILE`) so the fresh repo is fully
+    /// isolated.
+    fn init_test_repo() -> (tempfile::TempDir, GitRepo) {
+        let dir = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(dir.path())
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_WORK_TREE")
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "--allow-empty", "-m", "initial"])
+            .current_dir(dir.path())
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_WORK_TREE")
+            .output()
+            .unwrap();
+        let git = GitRepo::open(dir.path()).unwrap();
+        (dir, git)
+    }
+
+    #[test]
+    fn create_worktree_via_git_repo() {
+        let (repo_dir, git) = init_test_repo();
+        let _ = repo_dir; // keep alive
+
+        // Create a branch first
+        git.create_branch("feature-wt").unwrap();
+        // Switch back to main so the branch is available
+        git.checkout("main").unwrap();
+
+        let base = tempfile::tempdir().unwrap();
+        let wt = git.create_worktree("feature-wt", base.path()).unwrap();
+
+        assert!(wt.path.exists());
+        assert!(wt.path.join(".git").exists());
+
+        // Cleanup is automatic via Drop
+        let path = wt.path.clone();
+        drop(wt);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn create_branch_and_get_sha() {
+        let (_dir, git) = init_test_repo();
+        let sha = git.head_sha().unwrap();
+        assert!(!sha.is_empty());
+
+        git.create_branch("test-branch").unwrap();
+        let branch = git.current_branch().unwrap();
+        assert_eq!(branch, "test-branch");
     }
 }
