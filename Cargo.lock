@@ -2956,7 +2956,9 @@ dependencies = [
  "anyhow",
  "axum",
  "chrono",
+ "futures-util",
  "redb",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",
@@ -2964,6 +2966,8 @@ dependencies = [
  "thrum-db",
  "thrum-runner",
  "tokio",
+ "tokio-stream",
+ "tokio-util",
  "toml",
  "tower 0.5.3",
  "tower-http",
@@ -3048,6 +3052,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "thrum-core",
  "thrum-db",
@@ -3180,6 +3185,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

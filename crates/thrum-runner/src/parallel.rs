@@ -67,6 +67,9 @@ pub struct PipelineContext {
     pub integration_steps: Vec<thrum_core::gate::IntegrationStep>,
     /// Test subsampling configuration (None = no subsampling).
     pub subsample: Option<thrum_core::subsample::SubsampleConfig>,
+    /// Base directory for git worktrees (used when `per_repo_limit > 1`).
+    /// Defaults to `./worktrees` relative to the process working directory.
+    pub worktrees_dir: PathBuf,
 }
 
 /// Result of a single agent run.
@@ -211,9 +214,13 @@ fn reap_agent_result(result: Result<AgentResult, tokio::task::JoinError>, event_
 /// Try to dispatch agents for each claim category in priority order.
 ///
 /// Returns the number of agents spawned this batch.
+///
+/// When `per_repo_limit > 1`, each agent is given its own git worktree for
+/// isolated concurrent work on the same repository. With `per_repo_limit == 1`
+/// agents use the main repo working directory (no worktree overhead).
 async fn dispatch_batch(
     ctx: &Arc<PipelineContext>,
-    _config: &EngineConfig,
+    config: &EngineConfig,
     repo_filter: Option<&RepoName>,
     global_sem: &Arc<Semaphore>,
     repo_sems: &Arc<HashMap<String, Arc<Semaphore>>>,
@@ -226,6 +233,7 @@ async fn dispatch_batch(
     ];
 
     let mut dispatched = 0;
+    let use_worktrees = config.per_repo_limit > 1;
 
     for &category in &categories {
         loop {
@@ -270,7 +278,29 @@ async fn dispatch_batch(
                 .repos_config
                 .get(&task.repo)
                 .context(format!("no config for repo {}", task.repo))?;
-            let work_dir = repo_config.path.clone();
+
+            // Create worktree for isolation when running multiple agents per repo.
+            // The worktree is moved into the spawned task and auto-cleaned on drop.
+            let (work_dir, worktree) = if use_worktrees {
+                let branch = task.branch_name();
+                let git = crate::git::GitRepo::open(&repo_config.path)?;
+
+                // Ensure the branch exists before creating the worktree
+                if git.current_branch().ok().as_deref() != Some(&branch) {
+                    let _ = git.create_branch(&branch);
+                }
+
+                let wt = git.create_worktree(&branch, &ctx.worktrees_dir)?;
+                let path = wt.path.clone();
+                tracing::info!(
+                    agent = %agent_id,
+                    worktree = %path.display(),
+                    "created worktree for agent isolation"
+                );
+                (path, Some(wt))
+            } else {
+                (repo_config.path.clone(), None)
+            };
 
             // Update the claimed status with the actual agent ID
             let mut claimed_task = task.clone();
@@ -293,6 +323,7 @@ async fn dispatch_batch(
                 task = %task.id,
                 repo = %task.repo,
                 category = ?category,
+                work_dir = %session.work_dir.display(),
                 "dispatching agent"
             );
 
@@ -307,11 +338,13 @@ async fn dispatch_batch(
 
             join_set.spawn(async move {
                 let mut session = session;
-                let outcome = run_agent_task(&ctx, task, category_copy).await;
+                let outcome = run_agent_task(&ctx, task, category_copy, worktree.as_ref()).await;
                 session.finish();
-                // Permits are dropped when this future completes, releasing semaphores
+                // Permits are dropped when this future completes, releasing semaphores.
+                // The worktree (if any) is dropped here, triggering auto-cleanup.
                 drop(global_permit);
                 drop(repo_permit);
+                drop(worktree);
                 AgentResult { session, outcome }
             });
 
@@ -349,20 +382,35 @@ fn unclaim_task(db: &redb::Database, task: &Task, category: ClaimCategory) -> Re
 /// This is the per-agent entrypoint, called from within a spawned tokio task.
 /// It delegates to the appropriate pipeline function based on claim category.
 ///
-/// A [`FileWatcher`](crate::watcher::FileWatcher) is started on the repo
-/// working directory before the pipeline runs and stopped when it completes.
-async fn run_agent_task(ctx: &PipelineContext, task: Task, category: ClaimCategory) -> Result<()> {
+/// When a `worktree` is provided (parallel multi-agent mode), the agent uses
+/// the worktree path as its working directory instead of the main repo path.
+///
+/// A [`FileWatcher`](crate::watcher::FileWatcher) is started on the working
+/// directory before the pipeline runs and stopped when it completes.
+async fn run_agent_task(
+    ctx: &PipelineContext,
+    task: Task,
+    category: ClaimCategory,
+    worktree: Option<&crate::worktree::Worktree>,
+) -> Result<()> {
     let task_store = TaskStore::new(&ctx.db);
     let gate_store = thrum_db::gate_store::GateStore::new(&ctx.db);
 
     let roles_ref = ctx.roles.as_deref();
 
+    // Determine the effective working directory: worktree path (if isolated)
+    // or main repo path (single-agent mode).
+    let work_dir = worktree.map(|wt| wt.path.clone());
+
     // Start file watcher for real-time change detection
     let agent_id = AgentId::generate(&task.repo, &task.id);
     let repo_config = ctx.repos_config.get(&task.repo);
-    let watcher = if let Some(rc) = repo_config {
+    let watch_dir = work_dir
+        .clone()
+        .or_else(|| repo_config.map(|rc| rc.path.clone()));
+    let watcher = if let Some(dir) = watch_dir {
         match crate::watcher::FileWatcher::start(
-            rc.path.clone(),
+            dir,
             agent_id,
             task.id.clone(),
             ctx.event_bus.clone(),
@@ -389,6 +437,7 @@ async fn run_agent_task(ctx: &PipelineContext, task: Task, category: ClaimCatego
                 &ctx.budget,
                 ctx.subsample.as_ref(),
                 task,
+                work_dir.as_deref(),
             )
             .await
         }
@@ -400,6 +449,7 @@ async fn run_agent_task(ctx: &PipelineContext, task: Task, category: ClaimCatego
                 &ctx.event_bus,
                 &ctx.integration_steps,
                 task,
+                work_dir.as_deref(),
             )
             .await
         }
@@ -415,6 +465,7 @@ async fn run_agent_task(ctx: &PipelineContext, task: Task, category: ClaimCatego
                 &ctx.budget,
                 ctx.subsample.as_ref(),
                 task,
+                work_dir.as_deref(),
             )
             .await
         }
@@ -505,6 +556,9 @@ pub mod pipeline {
     ///
     /// When `subsample` is `Some` and enabled, test commands at each gate are
     /// wrapped through `subsample_test_cmd()` using the configured ratios.
+    ///
+    /// When `work_dir` is `Some`, all operations (git, gates, AI invocations)
+    /// run in the worktree directory instead of the main repo path.
     #[allow(clippy::too_many_arguments)]
     pub async fn run_task_pipeline(
         task_store: &TaskStore<'_>,
@@ -517,10 +571,19 @@ pub mod pipeline {
         budget: &Arc<Mutex<BudgetTracker>>,
         subsample: Option<&SubsampleConfig>,
         mut task: Task,
+        work_dir: Option<&Path>,
     ) -> Result<()> {
-        let repo_config = repos_config
+        let base_repo_config = repos_config
             .get(&task.repo)
             .context(format!("no config for repo {}", task.repo))?;
+
+        // If a worktree work_dir is provided, override the repo path so that
+        // all gate checks, git operations, and AI invocations use it.
+        let repo_config = match work_dir {
+            Some(dir) => base_repo_config.with_work_dir(dir.to_path_buf()),
+            None => base_repo_config.clone(),
+        };
+        let repo_config = &repo_config;
 
         // Role-aware backend selection: resolve implementer role → backend
         let (agent, impl_role_name, impl_budget_usd) = if let Some(roles) = roles {
@@ -577,11 +640,16 @@ pub mod pipeline {
             .await
             .unwrap_or_default();
 
-        // Inject relevant memories as context
+        // Inject relevant memories as context.
+        // Touch accessed entries so frequently-used memories maintain higher
+        // relevance scores under exponential decay.
         let memory_context = {
             let memory_store = thrum_db::memory_store::MemoryStore::new(task_store.db());
             match memory_store.query_for_task(&task.repo, 5) {
                 Ok(memories) if !memories.is_empty() => {
+                    let ids: Vec<_> = memories.iter().map(|m| m.id.clone()).collect();
+                    let _ = memory_store.touch_entries(&ids);
+
                     let ctx: Vec<String> = memories.iter().map(|m| m.to_prompt_context()).collect();
                     format!(
                         "\n\n## Relevant context from previous sessions\n{}",
@@ -642,9 +710,11 @@ pub mod pipeline {
             task.updated_at = Utc::now();
             task_store.update(&task)?;
 
-            // Store failure as memory for future context
+            // Store failure as memory for future context.
+            // Include the task title so the agent can correlate errors with
+            // specific features when working on similar tasks later.
             if let TaskStatus::Gate1Failed { ref report } = task.status {
-                let error_summary: String = report
+                let failed_checks: String = report
                     .checks
                     .iter()
                     .filter(|c| !c.passed)
@@ -657,6 +727,10 @@ pub mod pipeline {
                     })
                     .collect::<Vec<_>>()
                     .join("; ");
+                let error_summary = format!(
+                    "Task '{}' failed Gate 1 (Quality): {failed_checks}",
+                    task.title
+                );
                 let mem = thrum_core::memory::MemoryEntry::new(
                     task.id.clone(),
                     task.repo.clone(),
@@ -750,7 +824,7 @@ pub mod pipeline {
 
             // Store failure as memory for future context
             if let TaskStatus::Gate2Failed { ref report } = task.status {
-                let error_summary: String = report
+                let failed_checks: String = report
                     .checks
                     .iter()
                     .filter(|c| !c.passed)
@@ -763,6 +837,10 @@ pub mod pipeline {
                     })
                     .collect::<Vec<_>>()
                     .join("; ");
+                let error_summary = format!(
+                    "Task '{}' failed Gate 2 (Proof): {failed_checks}",
+                    task.title
+                );
                 let mem = thrum_core::memory::MemoryEntry::new(
                     task.id.clone(),
                     task.repo.clone(),
@@ -796,15 +874,25 @@ pub mod pipeline {
             task.id.0
         );
 
-        // Store successful approach as pattern memory
+        // Store successful approach as pattern memory.
+        // Include acceptance criteria so future similar tasks can reference
+        // what a successful implementation looked like.
         {
+            let criteria_summary = if task.acceptance_criteria.is_empty() {
+                String::new()
+            } else {
+                format!(" (criteria: {})", task.acceptance_criteria.join(", "))
+            };
             let mem = thrum_core::memory::MemoryEntry::new(
                 task.id.clone(),
                 task.repo.clone(),
                 thrum_core::memory::MemoryCategory::Pattern {
                     pattern_name: "successful_implementation".into(),
                 },
-                format!("Task '{}' passed gates and reached approval", task.title),
+                format!(
+                    "Task '{}' passed gates and reached approval{criteria_summary}",
+                    task.title
+                ),
             );
             let memory_store = thrum_db::memory_store::MemoryStore::new(task_store.db());
             let _ = memory_store.store(&mem);
@@ -817,6 +905,8 @@ pub mod pipeline {
     ///
     /// `integration_steps`: if non-empty, runs config-driven integration gate.
     /// If empty, Gate 3 passes vacuously (single-repo or no integration configured).
+    ///
+    /// When `work_dir` is `Some`, merge operations use the worktree path.
     pub async fn post_approval_pipeline(
         task_store: &TaskStore<'_>,
         gate_store: &GateStore<'_>,
@@ -824,10 +914,17 @@ pub mod pipeline {
         event_bus: &EventBus,
         integration_steps: &[thrum_core::gate::IntegrationStep],
         mut task: Task,
+        work_dir: Option<&Path>,
     ) -> Result<()> {
-        let repo_config = repos_config
+        let base_repo_config = repos_config
             .get(&task.repo)
             .context(format!("no config for repo {}", task.repo))?;
+
+        let repo_config = match work_dir {
+            Some(dir) => base_repo_config.with_work_dir(dir.to_path_buf()),
+            None => base_repo_config.clone(),
+        };
+        let repo_config = &repo_config;
 
         emit_state_change(event_bus, &task, "approved", "integrating");
         task.status = TaskStatus::Integrating;
@@ -906,6 +1003,10 @@ pub mod pipeline {
     }
 
     /// Retry a failed task: bump retry count, re-invoke with gate failure feedback.
+    ///
+    /// Queries failure-specific memories from the memory store and injects them
+    /// alongside the gate failure report, giving the agent context about previous
+    /// errors to avoid repeating the same mistakes.
     #[allow(clippy::too_many_arguments)]
     pub async fn retry_task_pipeline(
         task_store: &TaskStore<'_>,
@@ -917,6 +1018,7 @@ pub mod pipeline {
         budget: &Arc<Mutex<BudgetTracker>>,
         subsample: Option<&SubsampleConfig>,
         mut task: Task,
+        work_dir: Option<&Path>,
     ) -> Result<()> {
         let feedback = match &task.status {
             TaskStatus::Gate1Failed { report } => {
@@ -962,6 +1064,28 @@ pub mod pipeline {
             _ => return Ok(()),
         };
 
+        // Query failure-specific memories for context-aware retries.
+        // These are error-category memories from the same repo, surfacing
+        // patterns like "cargo fmt failed" or "proof obligation missing"
+        // that help the agent avoid repeating past mistakes.
+        let failure_memories = {
+            let memory_store = thrum_db::memory_store::MemoryStore::new(task_store.db());
+            match memory_store.query_errors_for_repo(&task.repo, 5) {
+                Ok(memories) if !memories.is_empty() => {
+                    // Touch accessed memories to maintain their relevance
+                    let ids: Vec<_> = memories.iter().map(|m| m.id.clone()).collect();
+                    let _ = memory_store.touch_entries(&ids);
+
+                    let ctx: Vec<String> = memories.iter().map(|m| m.to_prompt_context()).collect();
+                    format!(
+                        "\n\n## Failure-specific context from previous attempts\n{}",
+                        ctx.join("\n")
+                    )
+                }
+                _ => String::new(),
+            }
+        };
+
         task.retry_count += 1;
         task.status = TaskStatus::Pending;
         task.updated_at = Utc::now();
@@ -969,7 +1093,8 @@ pub mod pipeline {
 
         let original_desc = task.description.clone();
         task.description = format!(
-            "{original_desc}\n\n---\n**RETRY {}/{}** — Previous attempt failed:\n{feedback}",
+            "{original_desc}\n\n---\n**RETRY {}/{}** — Previous attempt failed:\n\
+             {feedback}{failure_memories}",
             task.retry_count, MAX_RETRIES
         );
 
@@ -984,6 +1109,7 @@ pub mod pipeline {
             budget,
             subsample,
             task,
+            work_dir,
         )
         .await
     }

@@ -24,6 +24,8 @@ use crate::ApiState;
 
 const DASHBOARD_HTML: &str = include_str!("../assets/dashboard.html");
 const STYLE_CSS: &str = include_str!("../assets/style.css");
+const LIVE_HTML: &str = include_str!("../assets/live.html");
+const LIVE_CSS: &str = include_str!("../assets/live.css");
 
 // ─── Router ─────────────────────────────────────────────────────────────
 
@@ -33,7 +35,9 @@ const STYLE_CSS: &str = include_str!("../assets/style.css");
 pub fn dashboard_router() -> Router<Arc<ApiState>> {
     Router::new()
         .route("/dashboard", get(index))
+        .route("/dashboard/live", get(live_index))
         .route("/dashboard/assets/style.css", get(stylesheet))
+        .route("/dashboard/assets/live.css", get(live_stylesheet))
         .route("/dashboard/partials/status", get(status_partial))
         .route("/dashboard/partials/tasks", get(tasks_partial))
         .route("/dashboard/partials/activity", get(activity_partial))
@@ -47,11 +51,24 @@ async fn index() -> Html<&'static str> {
     Html(DASHBOARD_HTML)
 }
 
+async fn live_index() -> Html<&'static str> {
+    Html(LIVE_HTML)
+}
+
 async fn stylesheet() -> Response {
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
         STYLE_CSS,
+    )
+        .into_response()
+}
+
+async fn live_stylesheet() -> Response {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+        LIVE_CSS,
     )
         .into_response()
 }
