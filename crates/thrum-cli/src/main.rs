@@ -1,3 +1,5 @@
+mod watch;
+
 use anyhow::{Context, Result};
 use chrono::Utc;
 use clap::{Parser, Subcommand};
@@ -133,6 +135,8 @@ enum Commands {
     },
     /// Show changelog since last release tag.
     Changelog,
+    /// Live TUI dashboard showing agent activity.
+    Watch,
 }
 
 #[derive(Subcommand)]
@@ -294,6 +298,56 @@ async fn main() -> Result<()> {
         Commands::Changelog => {
             cmd_changelog();
             Ok(())
+        }
+        Commands::Watch => {
+            let db = open_db()?;
+            let repos_config = ReposConfig::load(&cli.config)?;
+            let pipeline = PipelineConfig::load(&cli.pipeline)?;
+            let registry = build_registry(&pipeline)?;
+
+            let roles_config = if pipeline.roles.is_empty() {
+                thrum_core::role::RolesConfig::default()
+            } else {
+                thrum_core::role::RolesConfig {
+                    roles: pipeline.roles,
+                }
+            };
+
+            let budget_tracker = {
+                let budget_store = BudgetStore::new(&db);
+                match budget_store.load()? {
+                    Some(mut existing) => {
+                        existing.ceiling_usd = pipeline.budget.ceiling_usd;
+                        existing
+                    }
+                    None => BudgetTracker::new(pipeline.budget.ceiling_usd),
+                }
+            };
+            let budget = Arc::new(tokio::sync::Mutex::new(budget_tracker));
+
+            let shared_db = Arc::new(db);
+            let event_bus = thrum_runner::event_bus::EventBus::new();
+
+            let ctx = Arc::new(PipelineContext {
+                db: shared_db,
+                repos_config: Arc::new(repos_config),
+                agents_dir: cli.agents_dir.clone(),
+                registry: Arc::new(registry),
+                session_budget_usd: None,
+                budget,
+                roles: Some(Arc::new(roles_config)),
+                sandbox_config: pipeline.sandbox,
+                event_bus,
+                integration_steps: pipeline
+                    .gates
+                    .integration
+                    .as_ref()
+                    .map(|g| g.steps.clone())
+                    .unwrap_or_default(),
+                subsample: pipeline.subsample,
+            });
+
+            watch::run_watch_tui(ctx).await
         }
     }
 }
