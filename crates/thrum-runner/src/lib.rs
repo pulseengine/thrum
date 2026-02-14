@@ -8,6 +8,7 @@ pub mod git;
 pub mod openai_compat;
 pub mod parallel;
 pub mod sandbox;
+pub mod session_export;
 pub mod subprocess;
 pub mod watcher;
 pub mod worktree;

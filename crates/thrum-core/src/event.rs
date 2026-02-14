@@ -147,6 +147,15 @@ pub enum EventKind {
         key: String,
         value: String,
     },
+
+    /// Convergence detected: task keeps failing with the same error signature.
+    TaskConvergenceDetected {
+        task_id: TaskId,
+        /// The retry strategy being applied (e.g. "expanded-context", "human-review").
+        strategy: String,
+        /// How many times the worst-case failure signature has been seen.
+        repeated_count: u32,
+    },
 }
 
 /// What kind of file system change was detected.
@@ -325,6 +334,15 @@ impl std::fmt::Display for PipelineEvent {
                 key,
                 value,
             } => write!(f, "[{ts}] {agent_id} wrote shared[{key}] = {value}"),
+
+            EventKind::TaskConvergenceDetected {
+                task_id,
+                strategy,
+                repeated_count,
+            } => write!(
+                f,
+                "[{ts}] {task_id}: convergence detected (strategy={strategy}, repeats={repeated_count})"
+            ),
         }
     }
 }

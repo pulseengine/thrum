@@ -65,7 +65,7 @@ pub struct GateReport {
 }
 
 /// Which verification gate.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum GateLevel {
     /// Gate 1: cargo fmt + clippy + test
     Quality,
