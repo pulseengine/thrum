@@ -396,6 +396,11 @@ async fn main() -> Result<()> {
 
             let shared_db = Arc::new(db);
             let event_bus = thrum_runner::event_bus::EventBus::new();
+            let conflict_policy = thrum_core::coordination::ConflictPolicy::default();
+            let coordination = thrum_runner::coordination_hub::CoordinationHub::new(
+                event_bus.clone(),
+                conflict_policy,
+            );
 
             let ctx = Arc::new(PipelineContext {
                 db: shared_db,
@@ -415,6 +420,8 @@ async fn main() -> Result<()> {
                     .unwrap_or_default(),
                 subsample: pipeline.subsample,
                 worktrees_dir: pipeline.engine.worktrees_dir,
+                coordination,
+                conflict_policy,
             });
 
             watch::run_watch_tui(ctx).await
@@ -786,6 +793,10 @@ async fn cmd_run_parallel(
 
     let per_repo_limit = pipeline.engine.per_repo_limit;
 
+    let conflict_policy = thrum_core::coordination::ConflictPolicy::default();
+    let coordination =
+        thrum_runner::coordination_hub::CoordinationHub::new(event_bus.clone(), conflict_policy);
+
     let ctx = Arc::new(PipelineContext {
         db: shared_db.clone(),
         repos_config: Arc::new(repos_config),
@@ -804,6 +815,8 @@ async fn cmd_run_parallel(
             .unwrap_or_default(),
         subsample: pipeline.subsample,
         worktrees_dir: pipeline.engine.worktrees_dir,
+        coordination,
+        conflict_policy,
     });
 
     let config = EngineConfig {

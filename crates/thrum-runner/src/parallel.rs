@@ -7,6 +7,7 @@
 //! - Graceful shutdown via CancellationToken
 
 use crate::backend::BackendRegistry;
+use crate::coordination_hub::CoordinationHub;
 use crate::event_bus::EventBus;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
@@ -15,6 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use thrum_core::agent::{AgentId, AgentSession};
 use thrum_core::budget::BudgetTracker;
+use thrum_core::coordination::ConflictPolicy;
 use thrum_core::event::EventKind;
 use thrum_core::repo::ReposConfig;
 use thrum_core::task::{RepoName, Task};
@@ -70,6 +72,11 @@ pub struct PipelineContext {
     /// Base directory for git worktrees (used when `per_repo_limit > 1`).
     /// Defaults to `./worktrees` relative to the process working directory.
     pub worktrees_dir: PathBuf,
+    /// Agent-to-agent coordination hub for parallel execution.
+    /// Manages file conflict detection, shared memory, and cross-agent notifications.
+    pub coordination: CoordinationHub,
+    /// Policy for handling file conflicts between concurrent agents.
+    pub conflict_policy: ConflictPolicy,
 }
 
 /// Result of a single agent run.
@@ -103,17 +110,25 @@ pub async fn run_parallel(
 
     let mut join_set: JoinSet<AgentResult> = JoinSet::new();
 
+    // Start the coordination conflict listener as a background task.
+    // It watches for FileChanged events and detects overlapping file access.
+    let coordination_cancel = CancellationToken::new();
+    let coordination_handle = ctx
+        .coordination
+        .start_conflict_listener(coordination_cancel.clone());
+
     tracing::info!(
         max_agents = config.max_agents,
         per_repo = config.per_repo_limit,
+        conflict_policy = ?ctx.conflict_policy,
         "parallel engine started"
     );
 
     ctx.event_bus.emit(EventKind::EngineLog {
         level: thrum_core::event::LogLevel::Info,
         message: format!(
-            "parallel engine started (max_agents={}, per_repo={})",
-            config.max_agents, config.per_repo_limit
+            "parallel engine started (max_agents={}, per_repo={}, conflict_policy={:?})",
+            config.max_agents, config.per_repo_limit, ctx.conflict_policy
         ),
     });
 
@@ -168,6 +183,20 @@ pub async fn run_parallel(
         while let Some(result) = join_set.join_next().await {
             reap_agent_result(result, &ctx.event_bus);
         }
+    }
+
+    // Stop the coordination conflict listener and log a summary.
+    coordination_cancel.cancel();
+    let _ = coordination_handle.await;
+    {
+        let summary = ctx.coordination.summary().await;
+        if summary.conflicts_count > 0 {
+            tracing::warn!(
+                conflicts = summary.conflicts_count,
+                "coordination: file conflicts detected during session"
+            );
+        }
+        tracing::info!(coordination = %summary, "coordination session summary");
     }
 
     // Lifecycle: decay and prune stale memory entries at engine shutdown.
@@ -350,6 +379,11 @@ async fn dispatch_batch(
                 "dispatching agent"
             );
 
+            // Register the agent with the coordination hub for conflict detection.
+            ctx.coordination
+                .register_agent(agent_id.clone(), task.id.clone(), task.repo.clone())
+                .await;
+
             ctx.event_bus.emit(EventKind::AgentStarted {
                 agent_id: agent_id.clone(),
                 task_id: task.id.clone(),
@@ -363,6 +397,8 @@ async fn dispatch_batch(
                 let mut session = session;
                 let outcome = run_agent_task(&ctx, task, category_copy, worktree.as_ref()).await;
                 session.finish();
+                // Unregister from coordination hub — clears file ownership tracking.
+                ctx.coordination.unregister_agent(&session.agent_id).await;
                 // Permits are dropped when this future completes, releasing semaphores.
                 // The worktree (if any) is dropped here, triggering auto-cleanup.
                 drop(global_permit);
