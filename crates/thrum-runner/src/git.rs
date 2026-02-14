@@ -44,6 +44,17 @@ impl GitRepo {
         Ok(())
     }
 
+    /// Create a branch ref without checking it out.
+    ///
+    /// Used when creating worktrees: the branch must exist as a ref but must
+    /// NOT be checked out in the main working directory, otherwise
+    /// `git worktree add` will fail with "already used by worktree".
+    pub fn create_branch_detached(&self, name: &str) -> Result<()> {
+        let head_commit = self.repo.head()?.peel_to_commit()?;
+        self.repo.branch(name, &head_commit, false)?;
+        Ok(())
+    }
+
     /// Checkout an existing branch.
     pub fn checkout(&self, branch: &str) -> Result<()> {
         let refname = format!("refs/heads/{branch}");

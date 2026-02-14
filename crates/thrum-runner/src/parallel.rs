@@ -337,10 +337,11 @@ async fn dispatch_batch(
                 let branch = task.branch_name();
                 let git = crate::git::GitRepo::open(&repo_config.path)?;
 
-                // Ensure the branch exists before creating the worktree
-                if git.current_branch().ok().as_deref() != Some(&branch) {
-                    let _ = git.create_branch(&branch);
-                }
+                // Ensure the branch exists before creating the worktree.
+                // Use create_branch_detached to avoid checking out the branch
+                // in the main working directory — git won't allow the same branch
+                // to be checked out in two worktrees simultaneously.
+                let _ = git.create_branch_detached(&branch);
 
                 let wt = git.create_worktree(&branch, &ctx.worktrees_dir)?;
                 let path = wt.path.clone();
