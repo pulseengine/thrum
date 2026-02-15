@@ -12,8 +12,10 @@ use axum::{
     routing::{get, post},
 };
 use chrono::Utc;
+use serde::Deserialize;
 use std::fmt::Write as FmtWrite;
 use std::sync::Arc;
+use thrum_core::repo::ReposConfig;
 use thrum_core::task::{CheckResult, GateReport, TaskId, TaskStatus};
 use thrum_core::telemetry::{TraceFilter, TraceReader};
 use thrum_db::budget_store::BudgetStore;
@@ -52,13 +54,23 @@ pub fn dashboard_router() -> Router<Arc<ApiState>> {
             "/dashboard/partials/task-detail/{id}",
             get(task_detail_partial),
         )
+        .route("/dashboard/tasks/create", post(create_task_action))
         .route("/dashboard/tasks/{id}/approve", post(approve_action))
         .route("/dashboard/tasks/{id}/reject", post(reject_action))
+        .route("/dashboard/tasks/{id}/edit", post(edit_task_action))
+        .route("/dashboard/tasks/{id}/status", post(set_status_action))
+        .route("/dashboard/tasks/{id}/delete", post(delete_task_action))
+        .route("/dashboard/tasks/bulk-approve", post(bulk_approve_action))
         .route("/dashboard/tasks/{id}/review", get(review_page))
         .route(
             "/dashboard/tasks/{id}/review/diff",
             get(review_diff_partial),
         )
+        .route("/dashboard/memory/clear", post(clear_memory_action))
+        .route("/dashboard/memory/decay", post(decay_memory_action))
+        .route("/dashboard/budget/update", post(update_budget_action))
+        .route("/dashboard/partials/config", get(config_partial))
+        .route("/dashboard/a2a/send", post(a2a_send_action))
 }
 
 // ─── Page & Assets ──────────────────────────────────────────────────────
@@ -593,17 +605,51 @@ fn write_card(buf: &mut String, class: &str, count: usize, label: &str) {
     );
 }
 
-/// Task queue table — full table body with action buttons.
+/// Task queue table — full table body with action buttons and bulk approve bar.
 async fn tasks_partial(State(state): State<Arc<ApiState>>) -> Result<Html<String>, DashboardError> {
     let db = state.db();
     let store = TaskStore::new(db);
     let tasks = store.list(None, None)?;
 
-    if tasks.is_empty() {
-        return Ok(Html("<div class=\"empty\">No tasks in queue</div>".into()));
+    let mut html = String::with_capacity(4096);
+
+    // Action result banner
+    html.push_str("<div id=\"task-action-result\"></div>");
+
+    // Bulk approve bar for awaiting-approval tasks
+    let awaiting: Vec<_> = tasks.iter().filter(|t| t.status.needs_human()).collect();
+    if !awaiting.is_empty() {
+        html.push_str(
+            "<form class=\"bulk-bar\" \
+             hx-post=\"/dashboard/tasks/bulk-approve\" \
+             hx-target=\"#task-action-result\" \
+             hx-swap=\"innerHTML\">",
+        );
+        let _ = write!(
+            html,
+            "<span class=\"bulk-label\">{} awaiting approval</span>",
+            awaiting.len(),
+        );
+        for t in &awaiting {
+            let _ = write!(
+                html,
+                "<label class=\"bulk-check\">\
+                 <input type=\"checkbox\" name=\"task_ids\" value=\"{}\"> TASK-{:04}\
+                 </label>",
+                t.id.0, t.id.0,
+            );
+        }
+        html.push_str(
+            "<button type=\"submit\" class=\"btn btn-approve btn-sm\">Approve Selected</button>\
+             </form>",
+        );
     }
 
-    let mut html = String::with_capacity(2048);
+    if tasks.is_empty() {
+        html.push_str("<div class=\"empty\">No tasks in queue</div>");
+        return Ok(Html(html));
+    }
+
     html.push_str("<table class=\"task-table\">");
     html.push_str(
         "<thead><tr>\
@@ -648,7 +694,18 @@ async fn activity_partial(
     for event in &events {
         let level = event.level.as_deref().unwrap_or("info");
         let timestamp = event.timestamp.as_deref().unwrap_or("");
-        let message = event.message.as_deref().unwrap_or("");
+        // The tracing JSON format nests the message inside `fields.message`.
+        // Fall back to extracting it from the fields object.
+        let fields_message;
+        let message = if let Some(msg) = event.message.as_deref() {
+            msg
+        } else if let Some(msg) = event.fields.get("message").and_then(|v| v.as_str()) {
+            msg
+        } else {
+            // Build a summary from all fields as last resort
+            fields_message = event.fields.to_string();
+            fields_message.as_str()
+        };
         let target = event.target.as_deref().unwrap_or("");
 
         // Show only HH:MM:SS portion for readability
@@ -699,15 +756,38 @@ async fn budget_partial(
         0.0
     };
 
+    let fill_class = if pct > 90.0 {
+        "budget-bar-fill danger"
+    } else if pct > 70.0 {
+        "budget-bar-fill warning"
+    } else {
+        "budget-bar-fill"
+    };
     Ok(Html(format!(
         "<div class=\"budget-widget\">\
-         <div class=\"budget-bar\" style=\"width:{pct:.0}%\"></div>\
-         <span class=\"budget-label\">${spent:.2} / ${ceiling:.2} (${remaining:.2} remaining)</span>\
+         <div class=\"budget-header\">\
+         <span class=\"budget-label\">Budget</span>\
+         <span class=\"budget-numbers\">${spent:.2} / ${ceiling:.2} \
+         <span class=\"budget-remaining\">(${remaining:.2} remaining)</span></span>\
+         </div>\
+         <div class=\"budget-bar\"><div class=\"{fill_class}\" style=\"width:{pct:.0}%\"></div></div>\
+         <div id=\"budget-action-result\"></div>\
+         <form class=\"budget-controls\" \
+               hx-post=\"/dashboard/budget/update\" \
+               hx-target=\"#budget-action-result\" \
+               hx-swap=\"innerHTML\">\
+         <input type=\"number\" name=\"ceiling_usd\" value=\"{ceiling:.0}\" \
+                step=\"100\" min=\"0\" class=\"input-sm\" placeholder=\"Ceiling USD\">\
+         <label class=\"bulk-check\">\
+         <input type=\"checkbox\" name=\"reset_spent\" value=\"on\"> Reset spent\
+         </label>\
+         <button type=\"submit\" class=\"btn btn-sm\">Update</button>\
+         </form>\
          </div>"
     )))
 }
 
-/// Memory entries viewer — shows stored memory entries filtered by repo.
+/// Memory entries viewer — shows stored memory entries with clear/decay controls.
 async fn memory_partial(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Html<String>, DashboardError> {
@@ -715,22 +795,48 @@ async fn memory_partial(
     let store = MemoryStore::new(db);
     let entries = store.list_all(None, 50)?;
 
-    let mut html = String::with_capacity(1024);
-    html.push_str("<div class=\"memory-filter\">");
+    let mut html = String::with_capacity(2048);
+
+    // Memory management controls
+    html.push_str("<div id=\"memory-action-result\"></div>");
+    html.push_str(
+        "<div class=\"memory-controls\">\
+         <form class=\"inline-form\" \
+               hx-post=\"/dashboard/memory/clear\" \
+               hx-target=\"#memory-action-result\" \
+               hx-swap=\"innerHTML\">\
+         <input type=\"text\" name=\"repo\" placeholder=\"Repo filter (empty=all)\" class=\"input-sm\">\
+         <button type=\"submit\" class=\"btn btn-reject btn-sm\">Clear</button>\
+         </form>\
+         <form class=\"inline-form\" \
+               hx-post=\"/dashboard/memory/decay\" \
+               hx-target=\"#memory-action-result\" \
+               hx-swap=\"innerHTML\">\
+         <input type=\"number\" name=\"half_life_hours\" value=\"168\" \
+                step=\"24\" min=\"1\" class=\"input-sm\" placeholder=\"Half-life (hours)\">\
+         <button type=\"submit\" class=\"btn btn-sm\">Decay &amp; Prune</button>\
+         </form>\
+         </div>",
+    );
+
+    html.push_str("<div class=\"memory-list\">");
     if entries.is_empty() {
         html.push_str("<div class=\"empty\">No memory entries</div>");
     } else {
         for entry in &entries {
+            let truncated: String = entry.content.chars().take(120).collect();
             let _ = write!(
                 html,
                 "<div class=\"memory-entry\">\
-                 <span class=\"memory-repo\">{}</span>\
-                 <span class=\"memory-content\">{}</span>\
-                 <span class=\"memory-relevance\">{:.2}</span>\
+                 <div class=\"memory-header\">\
+                 <span class=\"memory-repo\">{repo}</span>\
+                 <span class=\"memory-score\">{score:.2}</span>\
+                 </div>\
+                 <div class=\"memory-content\">{content}</div>\
                  </div>",
-                escape_html(&entry.repo.to_string()),
-                escape_html(&entry.content[..entry.content.len().min(80)]),
-                entry.relevance_score,
+                repo = escape_html(&entry.repo.to_string()),
+                score = entry.relevance_score,
+                content = escape_html(&truncated),
             );
         }
     }
@@ -844,7 +950,393 @@ async fn reject_action(
     )))
 }
 
+// ─── Task Management Actions ─────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct CreateTaskForm {
+    repo: String,
+    title: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    acceptance_criteria: String,
+}
+
+async fn create_task_action(
+    State(state): State<Arc<ApiState>>,
+    Form(form): Form<CreateTaskForm>,
+) -> Result<Html<String>, DashboardError> {
+    let db = state.db();
+    let store = TaskStore::new(db);
+    let repo_name = thrum_core::task::RepoName::new(&form.repo);
+    let mut task = thrum_core::task::Task::new(repo_name, form.title, form.description);
+    task.acceptance_criteria = form
+        .acceptance_criteria
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    let task = store.insert(task)?;
+    Ok(Html(format!(
+        "<div class=\"action-result success\">\
+         Created TASK-{:04}: {}</div>",
+        task.id.0,
+        escape_html(&task.title),
+    )))
+}
+
+#[derive(Deserialize)]
+struct EditTaskForm {
+    title: String,
+    description: String,
+    #[serde(default)]
+    acceptance_criteria: String,
+}
+
+async fn edit_task_action(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<i64>,
+    Form(form): Form<EditTaskForm>,
+) -> Result<Html<String>, DashboardError> {
+    let db = state.db();
+    let store = TaskStore::new(db);
+    let mut task = store
+        .get(&TaskId(id))?
+        .ok_or_else(|| DashboardError(format!("task {id} not found")))?;
+    task.title = form.title;
+    task.description = form.description;
+    task.acceptance_criteria = form
+        .acceptance_criteria
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    task.updated_at = Utc::now();
+    store.update(&task)?;
+    Ok(Html(format!(
+        "<div class=\"action-result success\">TASK-{id:04} updated</div>"
+    )))
+}
+
+#[derive(Deserialize)]
+struct SetStatusForm {
+    status: String,
+}
+
+async fn set_status_action(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<i64>,
+    Form(form): Form<SetStatusForm>,
+) -> Result<Html<String>, DashboardError> {
+    let db = state.db();
+    let store = TaskStore::new(db);
+    let mut task = store
+        .get(&TaskId(id))?
+        .ok_or_else(|| DashboardError(format!("task {id} not found")))?;
+    task.status = match form.status.as_str() {
+        "pending" => TaskStatus::Pending,
+        "approved" => TaskStatus::Approved,
+        "integrating" => TaskStatus::Integrating,
+        "merged" => TaskStatus::Merged {
+            commit_sha: "manual".into(),
+        },
+        "rejected" => TaskStatus::Rejected {
+            feedback: "manually rejected from dashboard".into(),
+        },
+        other => {
+            return Ok(Html(format!(
+                "<div class=\"action-result error\">Cannot set status to '{}'</div>",
+                escape_html(other)
+            )));
+        }
+    };
+    task.updated_at = Utc::now();
+    store.update(&task)?;
+    Ok(Html(format!(
+        "<div class=\"action-result success\">\
+         TASK-{id:04} status set to {}</div>",
+        escape_html(&form.status)
+    )))
+}
+
+async fn delete_task_action(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<i64>,
+) -> Result<Html<String>, DashboardError> {
+    let db = state.db();
+    let store = TaskStore::new(db);
+    let existed = store.delete(&TaskId(id))?;
+    if existed {
+        Ok(Html(format!(
+            "<div class=\"action-result success\">TASK-{id:04} deleted</div>"
+        )))
+    } else {
+        Ok(Html(format!(
+            "<div class=\"action-result error\">TASK-{id:04} not found</div>"
+        )))
+    }
+}
+
+#[derive(Deserialize)]
+struct BulkApproveForm {
+    #[serde(default)]
+    task_ids: Vec<String>,
+}
+
+async fn bulk_approve_action(
+    State(state): State<Arc<ApiState>>,
+    Form(form): Form<BulkApproveForm>,
+) -> Result<Html<String>, DashboardError> {
+    let db = state.db();
+    let store = TaskStore::new(db);
+    let mut approved = 0u32;
+    let mut skipped = 0u32;
+    for id_str in &form.task_ids {
+        if let Ok(id) = id_str.parse::<i64>() {
+            if let Ok(Some(mut task)) = store.get(&TaskId(id))
+                && task.status.needs_human()
+            {
+                task.status = TaskStatus::Approved;
+                task.updated_at = Utc::now();
+                if store.update(&task).is_ok() {
+                    approved += 1;
+                    continue;
+                }
+            }
+            skipped += 1;
+        }
+    }
+    Ok(Html(format!(
+        "<div class=\"action-result success\">\
+         Approved {approved} tasks, skipped {skipped}</div>"
+    )))
+}
+
+// ─── Memory & Budget Actions ─────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct ClearMemoryForm {
+    #[serde(default)]
+    repo: String,
+}
+
+async fn clear_memory_action(
+    State(state): State<Arc<ApiState>>,
+    Form(form): Form<ClearMemoryForm>,
+) -> Result<Html<String>, DashboardError> {
+    let db = state.db();
+    let store = MemoryStore::new(db);
+    let count = if form.repo.is_empty() {
+        store.prune_below(f64::INFINITY)?
+    } else {
+        let repo_name = thrum_core::task::RepoName::new(&form.repo);
+        store.clear_for_repo(&repo_name)?
+    };
+    let scope = if form.repo.is_empty() {
+        "all repos".to_string()
+    } else {
+        format!("repo '{}'", escape_html(&form.repo))
+    };
+    Ok(Html(format!(
+        "<div class=\"action-result success\">\
+         Cleared {count} memory entries for {scope}</div>"
+    )))
+}
+
+#[derive(Deserialize)]
+struct DecayMemoryForm {
+    #[serde(default)]
+    half_life_hours: String,
+}
+
+async fn decay_memory_action(
+    State(state): State<Arc<ApiState>>,
+    Form(form): Form<DecayMemoryForm>,
+) -> Result<Html<String>, DashboardError> {
+    let db = state.db();
+    let store = MemoryStore::new(db);
+    let half_life: f64 = form.half_life_hours.parse().unwrap_or(168.0);
+    let decayed = store.decay_all(half_life)?;
+    let pruned = store.prune_below(0.05)?;
+    Ok(Html(format!(
+        "<div class=\"action-result success\">\
+         Decayed {decayed} entries (half-life {half_life:.0}h), pruned {pruned} below threshold</div>"
+    )))
+}
+
+#[derive(Deserialize)]
+struct UpdateBudgetForm {
+    #[serde(default)]
+    ceiling_usd: String,
+    #[serde(default)]
+    reset_spent: Option<String>,
+}
+
+async fn update_budget_action(
+    State(state): State<Arc<ApiState>>,
+    Form(form): Form<UpdateBudgetForm>,
+) -> Result<Html<String>, DashboardError> {
+    let db = state.db();
+    let budget_store = BudgetStore::new(db);
+    let mut tracker = budget_store
+        .load()?
+        .unwrap_or_else(|| thrum_core::budget::BudgetTracker::new(1000.0));
+    let mut changes = Vec::new();
+    if let Ok(ceiling) = form.ceiling_usd.parse::<f64>()
+        && (ceiling - tracker.ceiling_usd).abs() > 0.01
+    {
+        tracker.ceiling_usd = ceiling;
+        changes.push(format!("ceiling set to ${ceiling:.2}"));
+    }
+    if form.reset_spent.as_deref() == Some("on") {
+        let old_spent = tracker.total_spent();
+        tracker.entries.clear();
+        changes.push(format!("reset ${old_spent:.2} spent"));
+    }
+    budget_store.save(&tracker)?;
+    let msg = if changes.is_empty() {
+        "No changes made".to_string()
+    } else {
+        changes.join(", ")
+    };
+    Ok(Html(format!(
+        "<div class=\"action-result success\">Budget updated: {msg}</div>"
+    )))
+}
+
+// ─── Config & A2A Partials ──────────────────────────────────────────────
+
+async fn config_partial(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Html<String>, DashboardError> {
+    let mut html = String::with_capacity(4096);
+    html.push_str("<div class=\"config-panel\">");
+    html.push_str("<h3>Repositories</h3>");
+    match &state.config_path {
+        Some(path) => match ReposConfig::load(path) {
+            Ok(config) => {
+                html.push_str(
+                    "<table class=\"config-table\"><thead><tr>\
+                     <th>Name</th><th>Path</th><th>Build</th><th>Test</th><th>Safety</th>\
+                     </tr></thead><tbody>",
+                );
+                for repo in &config.repo {
+                    let name_esc = escape_html(&repo.name.to_string());
+                    let path_esc = escape_html(&repo.path.display().to_string());
+                    let build_esc = escape_html(&repo.build_cmd);
+                    let test_esc = escape_html(&repo.test_cmd);
+                    let safety = repo
+                        .safety_target
+                        .as_ref()
+                        .map(|s| format!("{s:?}"))
+                        .unwrap_or_else(|| "\u{2014}".into());
+                    let _ = write!(
+                        html,
+                        "<tr><td class=\"task-id\">{name_esc}</td><td>{path_esc}</td>\
+                         <td><code>{build_esc}</code></td><td><code>{test_esc}</code></td>\
+                         <td>{safety}</td></tr>",
+                    );
+                }
+                html.push_str("</tbody></table>");
+            }
+            Err(e) => {
+                let _ = write!(
+                    html,
+                    "<div class=\"empty\">Failed to load repos config: {}</div>",
+                    escape_html(&e.to_string())
+                );
+            }
+        },
+        None => {
+            html.push_str("<div class=\"empty\">No config path configured</div>");
+        }
+    }
+    html.push_str("<h3 style=\"margin-top:16px;\">Pipeline Configuration</h3>");
+    if let Some(pipeline_toml) = state.config_path.as_ref().and_then(|repos_path| {
+        let pipeline_path = repos_path.with_file_name("pipeline.toml");
+        std::fs::read_to_string(pipeline_path).ok()
+    }) {
+        let _ = write!(
+            html,
+            "<pre class=\"config-pre\">{}</pre>",
+            escape_html(&pipeline_toml)
+        );
+    } else {
+        html.push_str("<div class=\"empty\">No pipeline.toml found</div>");
+    }
+    html.push_str("</div>");
+    Ok(Html(html))
+}
+
+#[derive(Deserialize)]
+struct A2aSendForm {
+    repo: String,
+    message: String,
+}
+
+async fn a2a_send_action(
+    State(state): State<Arc<ApiState>>,
+    Form(form): Form<A2aSendForm>,
+) -> Result<Html<String>, DashboardError> {
+    let db = state.db();
+    let store = TaskStore::new(db);
+    let mut lines = form.message.lines();
+    let title = lines.next().unwrap_or("Untitled task").to_string();
+    let description: String = lines.collect::<Vec<_>>().join("\n");
+    let repo_name = thrum_core::task::RepoName::new(&form.repo);
+    let task = thrum_core::task::Task::new(repo_name, title, description);
+    let task = store.insert(task)?;
+    Ok(Html(format!(
+        "<div class=\"action-result success\">\
+         A2A task created: TASK-{:04} ({})</div>",
+        task.id.0,
+        escape_html(&task.title),
+    )))
+}
+
 // ─── Helpers ────────────────────────────────────────────────────────────
+
+/// Render an inline timeline showing pipeline progress as small step indicators.
+fn render_inline_timeline(status: &TaskStatus) -> String {
+    let stage = match status {
+        TaskStatus::Pending => 0,
+        TaskStatus::Claimed { .. } => 0,
+        TaskStatus::Implementing { .. } => 1,
+        TaskStatus::Gate1Failed { .. } => 2,
+        TaskStatus::Reviewing { .. } => 3,
+        TaskStatus::Gate2Failed { .. } => 4,
+        TaskStatus::AwaitingApproval { .. } => 5,
+        TaskStatus::Approved => 5,
+        TaskStatus::Rejected { .. } => 5,
+        TaskStatus::Integrating => 6,
+        TaskStatus::Gate3Failed { .. } => 6,
+        TaskStatus::Merged { .. } => 7,
+    };
+
+    let is_failed = matches!(
+        status,
+        TaskStatus::Gate1Failed { .. }
+            | TaskStatus::Gate2Failed { .. }
+            | TaskStatus::Gate3Failed { .. }
+            | TaskStatus::Rejected { .. }
+    );
+
+    let steps = ["P", "I", "G1", "R", "G2", "A", "Int", "M"];
+    let mut out = String::with_capacity(256);
+    for (i, &step) in steps.iter().enumerate() {
+        let class = if i < stage {
+            "timeline-step done"
+        } else if i == stage && is_failed {
+            "timeline-step failed"
+        } else if i == stage {
+            "timeline-step active"
+        } else {
+            "timeline-step"
+        };
+        let _ = write!(out, "<span class=\"{class}\">{step}</span>");
+    }
+    out
+}
 
 /// Write a single `<tr>` for a task into the buffer.
 fn render_task_row_into(buf: &mut String, task: &thrum_core::task::Task) {
@@ -853,6 +1345,7 @@ fn render_task_row_into(buf: &mut String, task: &thrum_core::task::Task) {
     let repo = escape_html(&task.repo.to_string());
     let title = escape_html(&task.title);
     let retries = task.retry_count;
+    let timeline = render_inline_timeline(&task.status);
 
     let _ = write!(
         buf,
@@ -861,22 +1354,46 @@ fn render_task_row_into(buf: &mut String, task: &thrum_core::task::Task) {
          <td>{repo}</td>\
          <td>{title}</td>\
          <td><span class=\"badge badge-{label}\">{label}</span></td>\
-         <td class=\"timeline\"><span class=\"timeline-bar timeline-{label}\"></span></td>\
+         <td><div class=\"timeline\">{timeline}</div></td>\
          <td>{retries}</td>\
-         <td>",
+         <td><div class=\"actions\">",
     );
 
-    // Show review link for AwaitingApproval tasks
+    // Review link for AwaitingApproval tasks
     if task.status.needs_human() {
         let _ = write!(
             buf,
-            "<div class=\"actions\">\
-             <a href=\"/dashboard/tasks/{id}/review\" class=\"btn btn-approve\">Review</a>\
-             </div>",
+            "<a href=\"/dashboard/tasks/{id}/review\" class=\"btn btn-approve btn-sm\">Review</a>",
         );
     }
 
-    buf.push_str("</td></tr>");
+    // Status dropdown
+    let _ = write!(
+        buf,
+        "<select class=\"status-select\" name=\"status\" \
+         hx-post=\"/dashboard/tasks/{id}/status\" \
+         hx-target=\"#task-action-result\" \
+         hx-swap=\"innerHTML\" \
+         hx-include=\"this\">\
+         <option value=\"\" selected disabled>\u{2699}</option>\
+         <option value=\"pending\">Reset to Pending</option>\
+         <option value=\"approved\">Set Approved</option>\
+         <option value=\"merged\">Mark Merged</option>\
+         <option value=\"rejected\">Mark Rejected</option>\
+         </select>",
+    );
+
+    // Delete button
+    let _ = write!(
+        buf,
+        "<button class=\"btn btn-reject btn-sm\" \
+         hx-post=\"/dashboard/tasks/{id}/delete\" \
+         hx-target=\"#task-action-result\" \
+         hx-swap=\"innerHTML\" \
+         hx-confirm=\"Delete TASK-{id:04}?\">\u{2715}</button>",
+    );
+
+    buf.push_str("</div></td></tr>");
 }
 
 /// Minimal HTML escaping for dynamic content.

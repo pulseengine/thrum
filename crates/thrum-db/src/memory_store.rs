@@ -185,6 +185,46 @@ impl<'a> MemoryStore<'a> {
         Ok(count)
     }
 
+    /// Delete a single memory entry by ID. Returns true if it existed.
+    pub fn delete(&self, id: &MemoryId) -> Result<bool> {
+        let write_txn = self.db.begin_write()?;
+        let existed;
+        {
+            let mut table = write_txn.open_table(MEMORY_TABLE)?;
+            existed = table.remove(id.0.as_str())?.is_some();
+        }
+        write_txn.commit()?;
+        Ok(existed)
+    }
+
+    /// Clear all memory entries for a specific repo. Returns count removed.
+    pub fn clear_for_repo(&self, repo: &RepoName) -> Result<u32> {
+        let write_txn = self.db.begin_write()?;
+        let count;
+        {
+            let mut table = write_txn.open_table(MEMORY_TABLE)?;
+            let mut to_remove = Vec::new();
+
+            {
+                let iter = table.iter()?;
+                for item in iter {
+                    let (key, value) = item?;
+                    let entry: MemoryEntry = serde_json::from_str(value.value())?;
+                    if &entry.repo == repo {
+                        to_remove.push(key.value().to_string());
+                    }
+                }
+            }
+
+            count = to_remove.len() as u32;
+            for key in &to_remove {
+                table.remove(key.as_str())?;
+            }
+        }
+        write_txn.commit()?;
+        Ok(count)
+    }
+
     /// Prune entries below a minimum relevance score. Returns count pruned.
     pub fn prune_below(&self, min_score: f64) -> Result<u32> {
         let write_txn = self.db.begin_write()?;

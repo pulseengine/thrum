@@ -70,6 +70,37 @@ impl GitRepo {
         Ok(statuses.is_empty())
     }
 
+    /// Check if HEAD has any commits beyond the default branch (main/master).
+    pub fn has_commits_beyond_main(&self) -> Result<bool> {
+        let main = self.default_branch()?;
+        let main_ref = format!("refs/heads/{main}");
+        let main_oid = self.repo.revparse_single(&main_ref)?.id();
+        let head_oid = self.repo.head()?.target().context("HEAD has no target")?;
+        if main_oid == head_oid {
+            return Ok(false);
+        }
+        let mut revwalk = self.repo.revwalk()?;
+        revwalk.push(head_oid)?;
+        revwalk.hide(main_oid)?;
+        Ok(revwalk.next().is_some())
+    }
+
+    /// Check if a named branch has any commits beyond the default branch.
+    pub fn branch_has_commits_beyond_main(&self, branch: &str) -> Result<bool> {
+        let main = self.default_branch()?;
+        let main_ref = format!("refs/heads/{main}");
+        let branch_ref = format!("refs/heads/{branch}");
+        let main_oid = self.repo.revparse_single(&main_ref)?.id();
+        let branch_oid = self.repo.revparse_single(&branch_ref)?.id();
+        if main_oid == branch_oid {
+            return Ok(false);
+        }
+        let mut revwalk = self.repo.revwalk()?;
+        revwalk.push(branch_oid)?;
+        revwalk.hide(main_oid)?;
+        Ok(revwalk.next().is_some())
+    }
+
     /// Get a diff summary between the default branch and HEAD.
     pub fn diff_summary(&self) -> Result<String> {
         let main = self.default_branch()?;
@@ -217,25 +248,26 @@ mod tests {
     /// Strips environment variables that may leak from the outer repo
     /// (e.g. `GIT_DIR`, `GIT_INDEX_FILE`) so the fresh repo is fully
     /// isolated.
+    fn git_in(dir: &Path, args: &[&str]) {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_WORK_TREE")
+            .output()
+            .unwrap();
+    }
+
     fn init_test_repo() -> (tempfile::TempDir, GitRepo) {
         let dir = tempfile::tempdir().unwrap();
-        std::process::Command::new("git")
-            .args(["init", "-b", "main"])
-            .current_dir(dir.path())
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_INDEX_FILE")
-            .env_remove("GIT_WORK_TREE")
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["commit", "--allow-empty", "-m", "initial"])
-            .current_dir(dir.path())
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_INDEX_FILE")
-            .env_remove("GIT_WORK_TREE")
-            .output()
-            .unwrap();
-        let git = GitRepo::open(dir.path()).unwrap();
+        let p = dir.path();
+        git_in(p, &["init", "-b", "main"]);
+        git_in(p, &["config", "user.email", "test@test.com"]);
+        git_in(p, &["config", "user.name", "Test"]);
+        git_in(p, &["config", "commit.gpgsign", "false"]);
+        git_in(p, &["commit", "--allow-empty", "-m", "initial"]);
+        let git = GitRepo::open(p).unwrap();
         (dir, git)
     }
 

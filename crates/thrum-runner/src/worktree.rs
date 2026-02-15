@@ -103,34 +103,28 @@ mod tests {
     /// Strips environment variables that may leak from the outer repo
     /// (e.g. `GIT_DIR`, `GIT_INDEX_FILE`) so the fresh repo is fully
     /// isolated.
+    fn git_in(dir: &std::path::Path, args: &[&str]) {
+        Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_WORK_TREE")
+            .output()
+            .unwrap();
+    }
+
     fn init_test_repo() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
-        Command::new("git")
-            .args(["init", "-b", "main"])
-            .current_dir(dir.path())
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_INDEX_FILE")
-            .env_remove("GIT_WORK_TREE")
-            .output()
-            .unwrap();
+        let p = dir.path();
+        git_in(p, &["init", "-b", "main"]);
+        git_in(p, &["config", "user.email", "test@test.com"]);
+        git_in(p, &["config", "user.name", "Test"]);
+        git_in(p, &["config", "commit.gpgsign", "false"]);
         // Create an initial commit so HEAD exists
-        Command::new("git")
-            .args(["commit", "--allow-empty", "-m", "initial"])
-            .current_dir(dir.path())
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_INDEX_FILE")
-            .env_remove("GIT_WORK_TREE")
-            .output()
-            .unwrap();
+        git_in(p, &["commit", "--allow-empty", "-m", "initial"]);
         // Create a branch to attach the worktree to
-        Command::new("git")
-            .args(["branch", "test-branch"])
-            .current_dir(dir.path())
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_INDEX_FILE")
-            .env_remove("GIT_WORK_TREE")
-            .output()
-            .unwrap();
+        git_in(p, &["branch", "test-branch"]);
         dir
     }
 

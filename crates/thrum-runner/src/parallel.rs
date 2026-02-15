@@ -821,6 +821,59 @@ pub mod pipeline {
             );
         }
 
+        // Check if the implementation actually produced any changes.
+        // If the branch has no commits beyond main, the agent returned empty
+        // (e.g., due to rate limits, API errors, or permission issues).
+        // Fail early instead of passing an empty diff through gates.
+        let work_dir = repo_config.path.join(format!(
+            "worktrees/{}",
+            task.branch_name().replace('/', "_")
+        ));
+        let has_changes = if work_dir.exists() {
+            match crate::git::GitRepo::open(&work_dir) {
+                Ok(g) => {
+                    let dirty = !g.is_clean().unwrap_or(true);
+                    let commits = g.has_commits_beyond_main().unwrap_or(false);
+                    dirty || commits
+                }
+                Err(_) => false,
+            }
+        } else {
+            // Fallback: check if branch has commits beyond main in main repo
+            crate::git::GitRepo::open(&repo_config.path)
+                .and_then(|g| g.branch_has_commits_beyond_main(&task.branch_name()))
+                .unwrap_or(false)
+        };
+
+        if !has_changes {
+            tracing::error!(
+                task_id = %task.id,
+                exit_code = ?result.exit_code,
+                "implementation produced no changes — failing task"
+            );
+            emit_state_change(event_bus, &task, "implementing", "gate1_failed");
+            let report = thrum_core::task::GateReport {
+                level: thrum_core::task::GateLevel::Quality,
+                checks: vec![thrum_core::task::CheckResult {
+                    name: "implementation_produced_changes".into(),
+                    passed: false,
+                    stdout: String::new(),
+                    stderr: format!(
+                        "Agent returned without making any changes (exit code: {:?}). \
+                         This usually means the API rate limit was hit or the agent errored.",
+                        result.exit_code,
+                    ),
+                    exit_code: result.exit_code.unwrap_or(-1),
+                }],
+                passed: false,
+                duration_secs: 0.0,
+            };
+            task.status = TaskStatus::Gate1Failed { report };
+            task.updated_at = Utc::now();
+            task_store.update(&task)?;
+            return Ok(());
+        }
+
         // --- Gate 1: Quality ---
         let checkpoint_store = CheckpointStore::new(task_store.db());
         tracing::info!("running Gate 1: Quality");

@@ -620,6 +620,64 @@ header .version {
     color: var(--bg);
 }
 
+.btn-sm {
+    padding: 2px 8px;
+    font-size: 11px;
+}
+
+.input-sm {
+    background: var(--surface-raised);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 4px 8px;
+    font-size: 12px;
+    font-family: inherit;
+}
+
+.input-sm:focus {
+    border-color: var(--accent);
+    outline: none;
+}
+
+.status-select {
+    background: var(--surface-raised);
+    color: var(--text-muted);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 2px 4px;
+    font-size: 11px;
+    font-family: inherit;
+    cursor: pointer;
+}
+
+.status-select:hover {
+    border-color: var(--accent);
+}
+
+.bulk-bar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 12px;
+    margin-bottom: 8px;
+    background: var(--surface-raised);
+    border: 1px solid var(--amber);
+    border-radius: 6px;
+    font-size: 12px;
+}
+
+.bulk-label {
+    color: var(--amber);
+    font-weight: 600;
+}
+
+.bulk-check {
+    color: var(--text);
+    font-size: 12px;
+    cursor: pointer;
+}
+
 /* ── Agent Grid ───────────────────────────── */
 
 .agent-grid {

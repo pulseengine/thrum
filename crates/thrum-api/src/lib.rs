@@ -864,7 +864,7 @@ mod tests {
             .await
             .unwrap();
         let html = String::from_utf8(body.to_vec()).unwrap();
-        assert!(html.contains("memory-filter"));
+        assert!(html.contains("memory-list"));
     }
 
     #[tokio::test]
