@@ -174,6 +174,7 @@ impl AiBackend for OpenAiCompatBackend {
             output_tokens,
             timed_out: false,
             exit_code: None,
+            session_id: None,
         })
     }
 

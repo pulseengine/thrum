@@ -4,6 +4,15 @@
 # For a working multi-repo example, see examples/pulseengine/pipeline.toml.
 # For a minimal single-repo setup, see examples/minimal/pipeline.toml.
 
+# ── Engine Concurrency ──────────────────────────────────────────────
+# When > 1, each agent gets an isolated git worktree so that multiple
+# agents can work concurrently on the same repo without index conflicts.
+
+[engine]
+per_repo_limit = 3
+worktrees_dir = "worktrees"
+max_retries = 3  # Reset via dashboard retry button to give a task another round
+
 # ── Gate 1: Code Quality ──────────────────────────────────────────────
 # Runs fmt, clippy, and test checks against each repo.
 
@@ -89,6 +98,7 @@ type = "agent"
 command = "claude"
 prompt_args = ["-p", "{prompt}", "--output-format", "json"]
 model = "claude-opus-4-6"
+timeout_secs = 1200
 enabled = true
 
 # Uncomment to add OpenCode as an alternative agent:

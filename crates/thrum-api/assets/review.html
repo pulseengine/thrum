@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Review Task — Thrum</title>
+    <link rel="stylesheet" href="/dashboard/assets/style.css">
+    <link rel="stylesheet" href="/dashboard/assets/review.css">
+    <script src="https://unpkg.com/htmx.org@2.0.4"
+            integrity="sha384-HGfztofotfshcF7+8n44JQL2oJmowVChPTg48S+jvZoztPfvwD79OC/LTtG6dMp+"
+            crossorigin="anonymous"></script>
+</head>
+<body>
+    <div class="container review-container">
+        <header>
+            <h1><a href="/dashboard" class="back-link">thrum</a></h1>
+            <div class="version">
+                <span class="htmx-indicator pulse" id="action-indicator"></span>
+                review
+            </div>
+        </header>
+
+        <!-- Task header is injected server-side by the handler -->
+        {{REVIEW_CONTENT}}
+    </div>
+
+    <script>
+    // Toggle expandable sections
+    function toggleSection(id) {
+        var el = document.getElementById(id);
+        var btn = el.previousElementSibling.querySelector('.toggle-btn');
+        if (el.classList.contains('collapsed')) {
+            el.classList.remove('collapsed');
+            btn.textContent = '▼';
+        } else {
+            el.classList.add('collapsed');
+            btn.textContent = '▶';
+        }
+    }
+
+    // After approve/reject, redirect back to dashboard
+    document.body.addEventListener('htmx:afterRequest', function(event) {
+        var elt = event.detail.elt;
+        if (event.detail.successful &&
+            (elt.id === 'approve-btn' || elt.id === 'reject-form')) {
+            setTimeout(function() { window.location.href = '/dashboard'; }, 500);
+        }
+    });
+    </script>
+</body>
+</html>

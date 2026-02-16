@@ -121,6 +121,7 @@ impl AiBackend for AnthropicApiBackend {
             output_tokens: Some(resp.usage.output_tokens),
             timed_out: false,
             exit_code: None,
+            session_id: None,
         })
     }
 

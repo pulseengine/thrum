@@ -2,6 +2,10 @@
 //!
 //! Spawns `claude -p "prompt" --output-format json` as a subprocess.
 //! This backend has full agent capabilities: file editing, terminal, git.
+//!
+//! Supports session continuation: when a previous session ID is provided
+//! via `AiRequest::resume_session_id`, uses `--resume {id}` to continue
+//! the existing session, preserving agent context across retries.
 
 use crate::backend::{AiBackend, AiRequest, AiResponse, BackendCapability};
 use crate::subprocess::{SubprocessOutput, run_cmd};
@@ -10,8 +14,8 @@ use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// Default timeout for a Claude session (10 minutes).
-const CLAUDE_TIMEOUT: Duration = Duration::from_secs(600);
+/// Default timeout for a Claude session (20 minutes).
+const CLAUDE_TIMEOUT: Duration = Duration::from_secs(1200);
 
 /// Claude Code CLI backend.
 pub struct ClaudeCliBackend {
@@ -51,6 +55,14 @@ impl AiBackend for ClaudeCliBackend {
         let cwd = request.cwd.as_deref().unwrap_or(&self.default_cwd);
 
         let mut cmd_parts = vec!["claude".to_string()];
+
+        // Session continuation: resume an existing session to preserve context
+        if let Some(ref session_id) = request.resume_session_id {
+            cmd_parts.push("--resume".into());
+            cmd_parts.push(session_id.clone());
+            tracing::info!(session_id, "resuming Claude session");
+        }
+
         cmd_parts.push("-p".into());
 
         let escaped = request.prompt.replace('\'', "'\\''");
@@ -75,7 +87,7 @@ impl AiBackend for ClaudeCliBackend {
         tracing::info!(prompt_len = request.prompt.len(), cwd = %cwd.display(), "invoking claude CLI");
 
         let output = run_cmd(&cmd, cwd, self.timeout).await?;
-        let content = parse_claude_output(&output);
+        let (content, session_id) = parse_claude_output(&output);
 
         Ok(AiResponse {
             content,
@@ -84,6 +96,7 @@ impl AiBackend for ClaudeCliBackend {
             output_tokens: None,
             timed_out: output.timed_out,
             exit_code: Some(output.exit_code),
+            session_id,
         })
     }
 
@@ -102,18 +115,38 @@ impl AiBackend for ClaudeCliBackend {
     }
 }
 
-fn parse_claude_output(output: &SubprocessOutput) -> String {
+/// Parse Claude CLI JSON output, extracting both the result text and session ID.
+///
+/// Claude Code's `--output-format json` returns a JSON object with:
+/// - `result`: the text output from the agent
+/// - `session_id`: a unique identifier for the session (used for `--resume`)
+fn parse_claude_output(output: &SubprocessOutput) -> (String, Option<String>) {
     if output.timed_out {
-        return String::new();
+        // On timeout, still try to extract session_id from any partial output
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&output.stdout) {
+            let session_id = json
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            return (String::new(), session_id);
+        }
+        return (String::new(), None);
     }
+
     // Try JSON parse, fall back to raw stdout
     if let Ok(json) = serde_json::from_str::<serde_json::Value>(&output.stdout) {
-        json.get("result")
+        let content = json
+            .get("result")
             .and_then(|v| v.as_str())
             .unwrap_or(&output.stdout)
-            .to_string()
+            .to_string();
+        let session_id = json
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        (content, session_id)
     } else {
-        output.stdout.clone()
+        (output.stdout.clone(), None)
     }
 }
 
@@ -138,4 +171,79 @@ pub async fn load_agent_prompt(agent_file: &Path, claude_md: Option<&Path>) -> R
     }
 
     Ok(prompt)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_json_with_session_id() {
+        let output = SubprocessOutput {
+            stdout: r#"{"result": "done", "session_id": "ses-abc123"}"#.into(),
+            stderr: String::new(),
+            exit_code: 0,
+            timed_out: false,
+        };
+        let (content, session_id) = parse_claude_output(&output);
+        assert_eq!(content, "done");
+        assert_eq!(session_id.as_deref(), Some("ses-abc123"));
+    }
+
+    #[test]
+    fn parse_json_without_session_id() {
+        let output = SubprocessOutput {
+            stdout: r#"{"result": "done"}"#.into(),
+            stderr: String::new(),
+            exit_code: 0,
+            timed_out: false,
+        };
+        let (content, session_id) = parse_claude_output(&output);
+        assert_eq!(content, "done");
+        assert!(session_id.is_none());
+    }
+
+    #[test]
+    fn parse_timeout_extracts_session_id() {
+        let output = SubprocessOutput {
+            stdout: r#"{"result": "partial", "session_id": "ses-timeout"}"#.into(),
+            stderr: "timed out".into(),
+            exit_code: -1,
+            timed_out: true,
+        };
+        let (content, session_id) = parse_claude_output(&output);
+        assert!(content.is_empty());
+        assert_eq!(session_id.as_deref(), Some("ses-timeout"));
+    }
+
+    #[test]
+    fn parse_timeout_no_output() {
+        let output = SubprocessOutput {
+            stdout: String::new(),
+            stderr: "timed out".into(),
+            exit_code: -1,
+            timed_out: true,
+        };
+        let (content, session_id) = parse_claude_output(&output);
+        assert!(content.is_empty());
+        assert!(session_id.is_none());
+    }
+
+    #[test]
+    fn parse_non_json_output() {
+        let output = SubprocessOutput {
+            stdout: "raw text output".into(),
+            stderr: String::new(),
+            exit_code: 0,
+            timed_out: false,
+        };
+        let (content, session_id) = parse_claude_output(&output);
+        assert_eq!(content, "raw text output");
+        assert!(session_id.is_none());
+    }
+
+    #[test]
+    fn default_timeout_is_1200s() {
+        assert_eq!(CLAUDE_TIMEOUT, Duration::from_secs(1200));
+    }
 }

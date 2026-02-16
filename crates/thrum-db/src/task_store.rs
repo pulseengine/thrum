@@ -209,6 +209,18 @@ impl<'a> TaskStore<'a> {
         Ok(result)
     }
 
+    /// Delete a task by ID. Returns true if the task existed.
+    pub fn delete(&self, id: &TaskId) -> Result<bool> {
+        let write_txn = self.db.begin_write()?;
+        let existed;
+        {
+            let mut tasks = write_txn.open_table(TASKS_TABLE)?;
+            existed = tasks.remove(id.0)?.is_some();
+        }
+        write_txn.commit()?;
+        Ok(existed)
+    }
+
     /// Count tasks by status.
     pub fn status_counts(&self) -> Result<std::collections::HashMap<String, usize>> {
         let read_txn = self.db.begin_read()?;

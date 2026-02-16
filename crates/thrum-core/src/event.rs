@@ -7,9 +7,12 @@
 //! broadcast bus lives in `thrum-runner`.
 
 use crate::agent::AgentId;
+use crate::checkpoint::CompletedPhase;
+use crate::coordination::{ConflictPolicy, FileConflict};
 use crate::task::{GateLevel, RepoName, TaskId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 /// A timestamped pipeline event.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,6 +111,51 @@ pub enum EventKind {
 
     /// Engine-level log message (info, warn, error).
     EngineLog { level: LogLevel, message: String },
+
+    /// Agent session checkpoint saved for resumable runs.
+    CheckpointSaved {
+        task_id: TaskId,
+        repo: RepoName,
+        phase: CompletedPhase,
+    },
+
+    /// Agent session continued from a previous invocation (timeout/failure recovery).
+    SessionContinued {
+        task_id: TaskId,
+        repo: RepoName,
+        session_id: String,
+    },
+
+    // -- Agent-to-agent coordination events --
+    /// Two agents touched the same file — a file conflict was detected.
+    FileConflictDetected {
+        conflict: FileConflict,
+        policy: ConflictPolicy,
+    },
+
+    /// An agent published a cross-agent notification.
+    CrossAgentNotification {
+        source: AgentId,
+        source_task: TaskId,
+        message: String,
+        affected_files: Vec<PathBuf>,
+    },
+
+    /// An agent wrote to the shared memory store.
+    SharedMemoryWrite {
+        agent_id: AgentId,
+        key: String,
+        value: String,
+    },
+
+    /// Convergence detected: task keeps failing with the same error signature.
+    TaskConvergenceDetected {
+        task_id: TaskId,
+        /// The retry strategy being applied (e.g. "expanded-context", "human-review").
+        strategy: String,
+        /// How many times the worst-case failure signature has been seen.
+        repeated_count: u32,
+    },
 }
 
 /// What kind of file system change was detected.
@@ -244,6 +292,57 @@ impl std::fmt::Display for PipelineEvent {
                 };
                 write!(f, "[{ts}] [{tag}] {message}")
             }
+
+            EventKind::CheckpointSaved {
+                task_id,
+                repo,
+                phase,
+            } => write!(f, "[{ts}] {task_id} ({repo}): checkpoint saved at {phase}"),
+
+            EventKind::SessionContinued {
+                task_id,
+                repo,
+                session_id,
+            } => write!(
+                f,
+                "[{ts}] {task_id} ({repo}): session continued ({session_id})"
+            ),
+
+            EventKind::FileConflictDetected {
+                conflict, policy, ..
+            } => {
+                let policy_tag = match policy {
+                    ConflictPolicy::WarnAndContinue => "warn",
+                    ConflictPolicy::Serialize => "serialize",
+                };
+                write!(
+                    f,
+                    "[{ts}] CONFLICT ({policy_tag}): {} between {} and {} on {}",
+                    conflict.path.display(),
+                    conflict.first_agent,
+                    conflict.second_agent,
+                    conflict.repo,
+                )
+            }
+
+            EventKind::CrossAgentNotification {
+                source, message, ..
+            } => write!(f, "[{ts}] {source} notifies: {message}"),
+
+            EventKind::SharedMemoryWrite {
+                agent_id,
+                key,
+                value,
+            } => write!(f, "[{ts}] {agent_id} wrote shared[{key}] = {value}"),
+
+            EventKind::TaskConvergenceDetected {
+                task_id,
+                strategy,
+                repeated_count,
+            } => write!(
+                f,
+                "[{ts}] {task_id}: convergence detected (strategy={strategy}, repeats={repeated_count})"
+            ),
         }
     }
 }
@@ -346,5 +445,78 @@ mod tests {
         });
         let s = event.to_string();
         assert!(s.contains("[WARN] approaching budget limit"));
+    }
+
+    #[test]
+    fn file_conflict_detected_display() {
+        use crate::coordination::{ConflictPolicy, FileConflict};
+        let conflict = FileConflict {
+            path: PathBuf::from("src/shared.rs"),
+            first_agent: AgentId("agent-1".into()),
+            second_agent: AgentId("agent-2".into()),
+            first_task: TaskId(1),
+            second_task: TaskId(2),
+            repo: RepoName::new("loom"),
+            detected_at: chrono::Utc::now(),
+        };
+        let event = PipelineEvent::new(EventKind::FileConflictDetected {
+            conflict,
+            policy: ConflictPolicy::WarnAndContinue,
+        });
+        let s = event.to_string();
+        assert!(s.contains("CONFLICT (warn)"));
+        assert!(s.contains("src/shared.rs"));
+        assert!(s.contains("agent-1"));
+        assert!(s.contains("agent-2"));
+    }
+
+    #[test]
+    fn file_conflict_serialize_roundtrip() {
+        use crate::coordination::{ConflictPolicy, FileConflict};
+        let conflict = FileConflict {
+            path: PathBuf::from("src/api.rs"),
+            first_agent: AgentId("agent-1".into()),
+            second_agent: AgentId("agent-2".into()),
+            first_task: TaskId(1),
+            second_task: TaskId(2),
+            repo: RepoName::new("synth"),
+            detected_at: chrono::Utc::now(),
+        };
+        let event = PipelineEvent::new(EventKind::FileConflictDetected {
+            conflict,
+            policy: ConflictPolicy::Serialize,
+        });
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: PipelineEvent = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed.kind,
+            EventKind::FileConflictDetected {
+                policy: ConflictPolicy::Serialize,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn cross_agent_notification_display() {
+        let event = PipelineEvent::new(EventKind::CrossAgentNotification {
+            source: AgentId("agent-3".into()),
+            source_task: TaskId(5),
+            message: "API signature changed in foo.rs".into(),
+            affected_files: vec![PathBuf::from("src/foo.rs")],
+        });
+        let s = event.to_string();
+        assert!(s.contains("agent-3 notifies: API signature changed"));
+    }
+
+    #[test]
+    fn shared_memory_write_display() {
+        let event = PipelineEvent::new(EventKind::SharedMemoryWrite {
+            agent_id: AgentId("agent-1".into()),
+            key: "api_version".into(),
+            value: "v2".into(),
+        });
+        let s = event.to_string();
+        assert!(s.contains("shared[api_version] = v2"));
     }
 }

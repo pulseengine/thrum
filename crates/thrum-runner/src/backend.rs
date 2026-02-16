@@ -40,6 +40,10 @@ pub struct AiResponse {
     pub timed_out: bool,
     /// Exit code (for CLI-based backends).
     pub exit_code: Option<i32>,
+    /// Session ID from the backend, used for session continuation on retries.
+    /// Claude Code returns this in its JSON output; OpenCode tracks it internally.
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 /// Configuration for an AI invocation.
@@ -55,6 +59,9 @@ pub struct AiRequest {
     pub max_tokens: Option<u32>,
     /// Temperature (0.0 - 1.0).
     pub temperature: Option<f32>,
+    /// Session ID from a previous invocation, used to resume the session.
+    /// Claude Code uses `--resume {id}`, OpenCode uses `-s {id}`.
+    pub resume_session_id: Option<String>,
 }
 
 impl AiRequest {
@@ -65,6 +72,7 @@ impl AiRequest {
             cwd: None,
             max_tokens: None,
             temperature: None,
+            resume_session_id: None,
         }
     }
 
@@ -80,6 +88,11 @@ impl AiRequest {
 
     pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
         self.max_tokens = Some(max_tokens);
+        self
+    }
+
+    pub fn with_resume_session(mut self, session_id: String) -> Self {
+        self.resume_session_id = Some(session_id);
         self
     }
 }
@@ -220,7 +233,7 @@ pub fn build_registry_from_config(
             continue;
         }
 
-        let timeout = std::time::Duration::from_secs(cfg.timeout_secs.unwrap_or(600));
+        let timeout = std::time::Duration::from_secs(cfg.timeout_secs.unwrap_or(1200));
 
         match cfg.backend_type.as_str() {
             "agent" => {
@@ -237,6 +250,11 @@ pub fn build_registry_from_config(
                         .prompt_args
                         .clone()
                         .unwrap_or_else(|| vec!["-m".into(), "{prompt}".into()]);
+                    // Infer session flag from known tools
+                    let session_flag = match command.as_str() {
+                        "opencode" => Some("-s".into()),
+                        _ => None,
+                    };
                     let backend = crate::cli_agent::CliAgentBackend {
                         name: cfg.name.clone(),
                         command: command.clone(),
@@ -244,6 +262,7 @@ pub fn build_registry_from_config(
                         model_name: cfg.model.clone().unwrap_or_else(|| "unknown".into()),
                         default_cwd: default_cwd.to_path_buf(),
                         timeout,
+                        session_flag,
                     };
                     registry.register(Box::new(backend));
                 } else {
@@ -365,6 +384,7 @@ mod tests {
                 output_tokens: None,
                 timed_out: false,
                 exit_code: None,
+                session_id: None,
             })
         }
         async fn health_check(&self) -> Result<()> {

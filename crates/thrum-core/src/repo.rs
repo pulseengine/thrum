@@ -21,6 +21,19 @@ pub struct RepoConfig {
     pub safety_target: Option<AsilLevel>,
 }
 
+impl RepoConfig {
+    /// Return a clone with `path` overridden to `work_dir`.
+    ///
+    /// Used for worktree-based isolation: gate checks, AI requests, and git
+    /// operations all derive their working directory from `repo_config.path`,
+    /// so swapping it is sufficient to redirect everything into a worktree.
+    pub fn with_work_dir(&self, work_dir: PathBuf) -> Self {
+        let mut cloned = self.clone();
+        cloned.path = work_dir;
+        cloned
+    }
+}
+
 /// Top-level repos configuration (parsed from repos.toml).
 #[derive(Debug, Clone, Deserialize)]
 pub struct ReposConfig {
@@ -38,5 +51,39 @@ impl ReposConfig {
     /// Find config for a specific repo.
     pub fn get(&self, name: &RepoName) -> Option<&RepoConfig> {
         self.repo.iter().find(|r| &r.name == name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_repo_config() -> RepoConfig {
+        RepoConfig {
+            name: RepoName::new("test"),
+            path: PathBuf::from("/original/path"),
+            build_cmd: "cargo build".into(),
+            test_cmd: "cargo test".into(),
+            lint_cmd: "cargo clippy".into(),
+            fmt_cmd: "cargo fmt --check".into(),
+            verify_cmd: None,
+            proofs_cmd: None,
+            claude_md: None,
+            safety_target: None,
+        }
+    }
+
+    #[test]
+    fn with_work_dir_overrides_path_only() {
+        let config = test_repo_config();
+        let overridden = config.with_work_dir(PathBuf::from("/worktree/path"));
+
+        assert_eq!(overridden.path, PathBuf::from("/worktree/path"));
+        // Everything else should be preserved
+        assert_eq!(overridden.name, config.name);
+        assert_eq!(overridden.build_cmd, config.build_cmd);
+        assert_eq!(overridden.test_cmd, config.test_cmd);
+        assert_eq!(overridden.lint_cmd, config.lint_cmd);
+        assert_eq!(overridden.fmt_cmd, config.fmt_cmd);
     }
 }

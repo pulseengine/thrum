@@ -3,138 +3,57 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Thrum Dashboard</title>
+    <title>Thrum Live Dashboard</title>
     <link rel="stylesheet" href="/dashboard/assets/style.css">
+    <link rel="stylesheet" href="/dashboard/assets/live.css">
     <script src="https://unpkg.com/htmx.org@2.0.4"
             integrity="sha384-HGfztofotfshcF7+8n44JQL2oJmowVChPTg48S+jvZoztPfvwD79OC/LTtG6dMp+"
             crossorigin="anonymous"></script>
-    <script src="https://unpkg.com/idiomorph@0.3.0/dist/idiomorph-ext.min.js"></script>
+    <script src="https://unpkg.com/htmx-ext-sse@2.2.2"
+            integrity="sha384-fw+eTlCc7suMV1y28IbzMEsOGKArwx7mCnNn8aXiRBCPlhXdMiaaPhsPKYr7bz6"
+            crossorigin="anonymous"></script>
 </head>
-<body hx-ext="morph">
+<body>
     <div class="container">
         <header>
             <h1>thrum</h1>
             <div class="version">
                 <span class="connection-dot" id="conn-dot"></span>
-                <span class="htmx-indicator pulse" id="poll-indicator"></span>
-                dashboard
+                live dashboard
             </div>
         </header>
 
-        <!-- Budget Usage — polls every 15s, morph preserves form state -->
-        <div id="budget-bar"
-             hx-get="/dashboard/partials/budget"
-             hx-trigger="load, every 15s"
-             hx-swap="morph:innerHTML"
-             hx-indicator="#poll-indicator">
-        </div>
-
-        <!-- Status Counts — polls every 10s -->
-        <div id="status-counts"
-             hx-get="/dashboard/partials/status"
-             hx-trigger="load, every 10s, refreshNow"
-             hx-swap="morph:innerHTML"
-             hx-indicator="#poll-indicator">
-        </div>
-
-        <!-- Task Queue — polls every 15s, morph preserves dropdowns/checkboxes -->
+        <!-- Agent Cards Grid -->
         <div class="section">
-            <h2>Task Queue</h2>
-            <!-- Action result lives OUTSIDE the morphed container so morph cycles don't clear it -->
-            <div id="task-action-result"></div>
-            <div id="task-table"
-                 hx-get="/dashboard/partials/tasks"
-                 hx-trigger="load, every 15s, refreshNow"
-                 hx-swap="morph:innerHTML"
-                 hx-indicator="#poll-indicator">
-            </div>
-        </div>
-
-        <!-- Agent Activity — real-time via SSE -->
-        <div class="section">
-            <h2>Agent Activity <span class="section-badge" id="agent-count"></span></h2>
+            <h2>Agents</h2>
             <div id="agent-grid" class="agent-grid">
                 <div class="empty" id="no-agents">Waiting for agent events&hellip;</div>
             </div>
         </div>
 
-        <!-- Memory Entries — polls every 30s, morph preserves form inputs -->
+        <!-- Live Event Log -->
         <div class="section">
-            <h2>Memory</h2>
-            <div id="memory-section"
-                 hx-get="/dashboard/partials/memory"
-                 hx-trigger="load, every 30s"
-                 hx-swap="morph:innerHTML"
-                 hx-indicator="#poll-indicator">
-            </div>
-        </div>
-
-        <!-- Activity Log — recent traces polled + live events via SSE -->
-        <div class="section">
-            <h2>Activity Log</h2>
-            <div id="activity-log"
-                 hx-get="/dashboard/partials/activity"
-                 hx-trigger="load, every 10s"
-                 hx-swap="morph:innerHTML"
-                 hx-indicator="#poll-indicator">
-            </div>
+            <h2>Event Stream</h2>
             <div id="event-log" class="event-log"></div>
         </div>
     </div>
 
-    <!-- Reject Modal -->
-    <div class="modal-backdrop" id="reject-modal">
-        <div class="modal">
-            <h3>Reject Task</h3>
-            <form id="reject-form" hx-swap="none">
-                <input type="hidden" name="task_id" id="reject-task-id">
-                <textarea name="feedback" placeholder="Feedback for the agent (required)..." required></textarea>
-                <div class="modal-actions">
-                    <button type="button" class="btn" onclick="closeRejectModal()">Cancel</button>
-                    <button type="submit" class="btn btn-reject">Reject</button>
-                </div>
-            </form>
-        </div>
-    </div>
-
     <script>
-    // ── Reject Modal ────────────────────────────────────────────
-    function openRejectModal(taskId) {
-        document.getElementById('reject-task-id').value = taskId;
-        document.getElementById('reject-modal').classList.add('active');
-        var form = document.getElementById('reject-form');
-        form.setAttribute('hx-post', '/dashboard/tasks/' + taskId + '/reject');
-        form.setAttribute('hx-target', '#task-row-' + taskId);
-        form.setAttribute('hx-swap', 'outerHTML');
-        htmx.process(form);
-        form.querySelector('textarea').value = '';
-        form.querySelector('textarea').focus();
-    }
+    // ── State ────────────────────────────────────────────────────
+    const agents = {};
+    const MAX_LOG_LINES = 200;
+    const MAX_AGENT_LOG = 50;
 
-    function closeRejectModal() {
-        document.getElementById('reject-modal').classList.remove('active');
-    }
-
-    document.body.addEventListener('htmx:afterRequest', function(event) {
-        if (event.detail.elt.id === 'reject-form' && event.detail.successful) {
-            closeRejectModal();
-        }
-    });
-
-    // ── SSE for Agent Activity & Event Stream ───────────────────
-    var agents = {};
-    var MAX_LOG_LINES = 200;
-    var MAX_AGENT_LOG = 50;
-
-    var evtSource = new EventSource('/api/v1/events/stream');
+    // ── SSE Connection ──────────────────────────────────────────
+    const evtSource = new EventSource('/api/v1/events/stream');
 
     evtSource.addEventListener('pipeline_event', function(e) {
-        var event = JSON.parse(e.data);
+        const event = JSON.parse(e.data);
         handleEvent(event);
     });
 
     evtSource.addEventListener('lagged', function(e) {
-        var info = JSON.parse(e.data);
+        const info = JSON.parse(e.data);
         appendLog('warn', 'Skipped ' + info.skipped + ' events (client lagged)');
     });
 
@@ -150,10 +69,10 @@
 
     // ── Event Router ────────────────────────────────────────────
     function handleEvent(event) {
-        var kind = event.kind;
+        const kind = event.kind;
 
         if (kind.AgentStarted) {
-            var d = kind.AgentStarted;
+            const d = kind.AgentStarted;
             ensureAgent(d.agent_id, d.task_id, d.repo);
             agents[d.agent_id].stage = 'implementing';
             agents[d.agent_id].started = event.timestamp;
@@ -161,61 +80,58 @@
             appendLog('info', d.agent_id + ' started on ' + d.task_id);
         }
         else if (kind.AgentOutput) {
-            var d = kind.AgentOutput;
+            const d = kind.AgentOutput;
             ensureAgent(d.agent_id, d.task_id);
             pushAgentLog(d.agent_id, d.stream, d.line);
             renderAgentCard(d.agent_id);
         }
         else if (kind.AgentFinished) {
-            var d = kind.AgentFinished;
+            const d = kind.AgentFinished;
             ensureAgent(d.agent_id, d.task_id);
             agents[d.agent_id].stage = d.success ? 'finished' : 'failed';
             agents[d.agent_id].elapsed = d.elapsed_secs;
             renderAgentCard(d.agent_id);
-            var status = d.success ? 'OK' : 'FAIL';
+            const status = d.success ? 'OK' : 'FAIL';
             appendLog(d.success ? 'info' : 'error',
                 d.agent_id + ' finished (' + status + ', ' + d.elapsed_secs.toFixed(1) + 's)');
         }
         else if (kind.TaskStateChange) {
-            var d = kind.TaskStateChange;
-            for (var aid in agents) {
-                if (agents[aid].task_id === d.task_id) {
-                    agents[aid].stage = d.to;
+            const d = kind.TaskStateChange;
+            for (const [aid, a] of Object.entries(agents)) {
+                if (a.task_id === d.task_id) {
+                    a.stage = d.to;
                     renderAgentCard(aid);
                 }
             }
             appendLog('info', d.task_id + ' (' + d.repo + '): ' + d.from + ' \u2192 ' + d.to);
-            // Refresh task table and status counts immediately on state change
-            htmx.trigger(document.getElementById('task-table'), 'refreshNow');
-            htmx.trigger(document.getElementById('status-counts'), 'refreshNow');
         }
         else if (kind.GateStarted) {
-            var d = kind.GateStarted;
-            for (var aid in agents) {
-                if (agents[aid].task_id === d.task_id) {
-                    agents[aid].stage = 'gate: ' + d.level;
+            const d = kind.GateStarted;
+            for (const [aid, a] of Object.entries(agents)) {
+                if (a.task_id === d.task_id) {
+                    a.stage = 'gate: ' + d.level;
                     renderAgentCard(aid);
                 }
             }
             appendLog('info', d.task_id + ': gate ' + d.level + ' started');
         }
         else if (kind.GateFinished) {
-            var d = kind.GateFinished;
-            var status = d.passed ? 'PASS' : 'FAIL';
+            const d = kind.GateFinished;
+            const status = d.passed ? 'PASS' : 'FAIL';
             appendLog(d.passed ? 'info' : 'error',
                 d.task_id + ': gate ' + d.level + ' ' + status +
                 ' (' + d.duration_secs.toFixed(1) + 's)');
         }
         else if (kind.GateCheckFinished) {
-            var d = kind.GateCheckFinished;
-            var status = d.passed ? 'PASS' : 'FAIL';
+            const d = kind.GateCheckFinished;
+            const status = d.passed ? 'PASS' : 'FAIL';
             appendLog(d.passed ? 'info' : 'warn',
                 'gate/' + d.check_name + ': ' + status);
         }
         else if (kind.FileChanged) {
-            var d = kind.FileChanged;
+            const d = kind.FileChanged;
             ensureAgent(d.agent_id, d.task_id);
-            var a = agents[d.agent_id];
+            const a = agents[d.agent_id];
             if (!a.files) a.files = { created: 0, modified: 0, deleted: 0 };
             if (d.kind === 'Created') a.files.created++;
             else if (d.kind === 'Modified') a.files.modified++;
@@ -223,7 +139,7 @@
             renderAgentCard(d.agent_id);
         }
         else if (kind.DiffUpdate) {
-            var d = kind.DiffUpdate;
+            const d = kind.DiffUpdate;
             ensureAgent(d.agent_id, d.task_id);
             agents[d.agent_id].diff = {
                 files: d.files_changed,
@@ -233,9 +149,9 @@
             renderAgentCard(d.agent_id);
         }
         else if (kind.EngineLog) {
-            var d = kind.EngineLog;
-            var level = d.level === 'Error' ? 'error' :
-                        d.level === 'Warn' ? 'warn' : 'info';
+            const d = kind.EngineLog;
+            const level = d.level === 'Error' ? 'error' :
+                          d.level === 'Warn' ? 'warn' : 'info';
             appendLog(level, d.message);
         }
     }
@@ -259,32 +175,25 @@
         }
         if (taskId) agents[agentId].task_id = taskId;
         if (repo) agents[agentId].repo = repo;
-        updateAgentCount();
-    }
-
-    function updateAgentCount() {
-        var count = Object.keys(agents).length;
-        var badge = document.getElementById('agent-count');
-        badge.textContent = count > 0 ? count : '';
     }
 
     function pushAgentLog(agentId, stream, line) {
-        var a = agents[agentId];
+        const a = agents[agentId];
         if (!a) return;
-        var tag = stream === 'Stderr' ? 'err' : 'out';
+        const tag = stream === 'Stderr' ? 'err' : 'out';
         a.log.push({ tag: tag, line: line });
         if (a.log.length > MAX_AGENT_LOG) {
             a.log = a.log.slice(-MAX_AGENT_LOG);
         }
     }
 
-    // ── Agent Card Rendering ────────────────────────────────────
+    // ── Rendering (safe DOM construction) ───────────────────────
     function renderAgentCard(agentId) {
-        var a = agents[agentId];
+        const a = agents[agentId];
         if (!a) return;
-        var grid = document.getElementById('agent-grid');
-        var cardId = 'agent-' + cssId(agentId);
-        var card = document.getElementById(cardId);
+        const grid = document.getElementById('agent-grid');
+        const cardId = 'agent-' + cssId(agentId);
+        let card = document.getElementById(cardId);
         if (!card) {
             card = document.createElement('div');
             card.id = cardId;
@@ -292,31 +201,33 @@
             grid.appendChild(card);
         }
 
+        // Clear and rebuild using safe DOM methods
         card.textContent = '';
-        var stageClass = stageToClass(a.stage);
 
-        // Header
-        var header = document.createElement('div');
+        const stageClass = stageToClass(a.stage);
+
+        // Header row: task title + stage badge
+        const header = document.createElement('div');
         header.className = 'agent-header';
-        var title = document.createElement('div');
+        const title = document.createElement('div');
         title.className = 'agent-title';
         title.textContent = a.task_id;
-        var badge = document.createElement('span');
+        const badge = document.createElement('span');
         badge.className = 'agent-badge ' + stageClass;
         badge.textContent = a.stage;
         header.appendChild(title);
         header.appendChild(badge);
         card.appendChild(header);
 
-        // Meta
-        var meta = document.createElement('div');
+        // Meta row: repo + elapsed
+        const meta = document.createElement('div');
         meta.className = 'agent-meta';
-        var repo = document.createElement('span');
+        const repo = document.createElement('span');
         repo.className = 'agent-repo';
         repo.textContent = a.repo;
         meta.appendChild(repo);
         if (a.elapsed) {
-            var elapsed = document.createElement('span');
+            const elapsed = document.createElement('span');
             elapsed.className = 'agent-elapsed';
             elapsed.textContent = a.elapsed.toFixed(1) + 's';
             meta.appendChild(elapsed);
@@ -325,14 +236,14 @@
 
         // File stats
         if (a.diff) {
-            var filesDiv = document.createElement('div');
+            const filesDiv = document.createElement('div');
             filesDiv.className = 'agent-files';
             addFileStat(filesDiv, a.diff.files + ' files', '');
             addFileStat(filesDiv, '+' + a.diff.ins, 'ins');
             addFileStat(filesDiv, '-' + a.diff.del, 'del');
             card.appendChild(filesDiv);
         } else if (a.files) {
-            var filesDiv = document.createElement('div');
+            const filesDiv = document.createElement('div');
             filesDiv.className = 'agent-files';
             if (a.files.created) addFileStat(filesDiv, '+' + a.files.created, '');
             if (a.files.modified) addFileStat(filesDiv, '~' + a.files.modified, '');
@@ -340,20 +251,21 @@
             card.appendChild(filesDiv);
         }
 
-        // Log
+        // Scrollable log
         if (a.log.length > 0) {
-            var logDiv = document.createElement('div');
+            const logDiv = document.createElement('div');
             logDiv.className = 'agent-log';
-            var visible = a.log.slice(-20);
+            const visible = a.log.slice(-20);
             for (var i = 0; i < visible.length; i++) {
                 var l = visible[i];
-                var lineEl = document.createElement('div');
+                const lineEl = document.createElement('div');
                 lineEl.className = 'agent-log-line';
-                var tagSpan = document.createElement('span');
+                const tagSpan = document.createElement('span');
                 tagSpan.className = 'stream-tag ' + l.tag;
                 tagSpan.textContent = l.tag;
                 lineEl.appendChild(tagSpan);
-                lineEl.appendChild(document.createTextNode(l.line));
+                const textNode = document.createTextNode(l.line);
+                lineEl.appendChild(textNode);
                 logDiv.appendChild(lineEl);
             }
             card.appendChild(logDiv);
@@ -362,54 +274,43 @@
     }
 
     function addFileStat(parent, text, extraClass) {
-        var span = document.createElement('span');
+        const span = document.createElement('span');
         span.className = 'file-stat' + (extraClass ? ' ' + extraClass : '');
         span.textContent = text;
         parent.appendChild(span);
     }
 
-    // ── Live Event Log ──────────────────────────────────────────
+    // ── Global Event Log (safe DOM construction) ────────────────
     function appendLog(level, message) {
-        var log = document.getElementById('event-log');
-        var now = new Date().toLocaleTimeString('en-GB', { hour12: false });
+        const log = document.getElementById('event-log');
+        const now = new Date().toLocaleTimeString('en-GB', { hour12: false });
 
-        var entry = document.createElement('div');
+        const entry = document.createElement('div');
         entry.className = 'log-entry';
 
-        var timeSpan = document.createElement('span');
+        const timeSpan = document.createElement('span');
         timeSpan.className = 'log-time';
         timeSpan.textContent = now;
         entry.appendChild(timeSpan);
 
-        var levelSpan = document.createElement('span');
+        const levelSpan = document.createElement('span');
         levelSpan.className = 'log-level ' + level;
         levelSpan.textContent = level;
         entry.appendChild(levelSpan);
 
-        var msgSpan = document.createElement('span');
+        const msgSpan = document.createElement('span');
         msgSpan.className = 'log-message';
         msgSpan.textContent = message;
         entry.appendChild(msgSpan);
 
         log.appendChild(entry);
+
+        // Trim old entries
         while (log.children.length > MAX_LOG_LINES) {
             log.removeChild(log.firstChild);
         }
         log.scrollTop = log.scrollHeight;
     }
-
-    // ── Auto-clear action results after 5s ──────────────────────
-    document.body.addEventListener('htmx:afterSwap', function(event) {
-        if (event.detail.target.id === 'task-action-result') {
-            setTimeout(function() {
-                var el = document.getElementById('task-action-result');
-                if (el) el.innerHTML = '';
-            }, 5000);
-            // Also refresh the task table to reflect the change
-            htmx.trigger(document.getElementById('task-table'), 'refreshNow');
-            htmx.trigger(document.getElementById('status-counts'), 'refreshNow');
-        }
-    });
 
     // ── Helpers ─────────────────────────────────────────────────
     function cssId(s) {

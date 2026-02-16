@@ -1,7 +1,8 @@
 //! Git worktree lifecycle management.
 //!
-//! Not used in phase 1 (per-repo limit = 1, so agents use the main working
-//! directory). Ready for phase 2 when per-repo > 1 requires isolated checkouts.
+//! When `per_repo_limit > 1`, each agent gets its own worktree so that multiple
+//! agents can work concurrently on the same repository without git index
+//! conflicts. The worktree is automatically cleaned up when dropped.
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -37,6 +38,9 @@ impl Worktree {
         let output = Command::new("git")
             .args(["worktree", "add", worktree_path.to_str().unwrap(), branch])
             .current_dir(repo_path)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_WORK_TREE")
             .output()
             .context("failed to run git worktree add")?;
 
@@ -62,6 +66,9 @@ impl Worktree {
         let output = Command::new("git")
             .args(["worktree", "remove", "--force", self.path.to_str().unwrap()])
             .current_dir(&self.repo_path)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_WORK_TREE")
             .output()
             .context("failed to run git worktree remove")?;
 
@@ -83,5 +90,92 @@ impl Drop for Worktree {
         {
             tracing::warn!(error = %e, "best-effort worktree cleanup failed");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+
+    /// Create a temporary git repo for testing.
+    ///
+    /// Strips environment variables that may leak from the outer repo
+    /// (e.g. `GIT_DIR`, `GIT_INDEX_FILE`) so the fresh repo is fully
+    /// isolated.
+    fn git_in(dir: &std::path::Path, args: &[&str]) {
+        Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_WORK_TREE")
+            .output()
+            .unwrap();
+    }
+
+    fn init_test_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        git_in(p, &["init", "-b", "main"]);
+        git_in(p, &["config", "user.email", "test@test.com"]);
+        git_in(p, &["config", "user.name", "Test"]);
+        git_in(p, &["config", "commit.gpgsign", "false"]);
+        // Create an initial commit so HEAD exists
+        git_in(p, &["commit", "--allow-empty", "-m", "initial"]);
+        // Create a branch to attach the worktree to
+        git_in(p, &["branch", "test-branch"]);
+        dir
+    }
+
+    #[test]
+    fn create_and_cleanup_worktree() {
+        let repo_dir = init_test_repo();
+        let base = tempfile::tempdir().unwrap();
+
+        let wt = Worktree::create(repo_dir.path(), "test-branch", base.path()).unwrap();
+        assert!(
+            wt.path.exists(),
+            "worktree directory should exist after create"
+        );
+        assert!(
+            wt.path.join(".git").exists(),
+            "worktree should have a .git file/dir"
+        );
+
+        let path = wt.path.clone();
+        wt.cleanup().unwrap();
+        assert!(
+            !path.exists(),
+            "worktree directory should be removed after cleanup"
+        );
+    }
+
+    #[test]
+    fn drop_cleans_up_worktree() {
+        let repo_dir = init_test_repo();
+        let base = tempfile::tempdir().unwrap();
+
+        let wt = Worktree::create(repo_dir.path(), "test-branch", base.path()).unwrap();
+        let path = wt.path.clone();
+        assert!(path.exists());
+
+        drop(wt);
+        assert!(!path.exists(), "drop should auto-cleanup the worktree");
+    }
+
+    #[test]
+    fn branch_slug_normalizes_special_chars() {
+        let slug: String = "auto/TASK-42/foo/bar"
+            .chars()
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        assert_eq!(slug, "auto_TASK-42_foo_bar");
     }
 }

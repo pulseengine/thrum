@@ -2,6 +2,9 @@
 //!
 //! These are agent-capable tools that run as CLI processes,
 //! similar to Claude Code but with different interfaces.
+//!
+//! Supports session continuation: when `AiRequest::resume_session_id` is set,
+//! appends the session flag (e.g., `-s {id}` for OpenCode) to resume context.
 
 use crate::backend::{AiBackend, AiRequest, AiResponse, BackendCapability};
 use crate::subprocess::run_cmd;
@@ -25,6 +28,9 @@ pub struct CliAgentBackend {
     pub default_cwd: PathBuf,
     /// Session timeout.
     pub timeout: Duration,
+    /// Flag for session continuation (e.g., "-s" for OpenCode).
+    /// When set, `--resume_session_id` causes `{session_flag} {id}` to be appended.
+    pub session_flag: Option<String>,
 }
 
 impl CliAgentBackend {
@@ -36,7 +42,8 @@ impl CliAgentBackend {
             prompt_args: vec!["-m".into(), "{prompt}".into()],
             model_name: "devstral-small-2505".into(),
             default_cwd,
-            timeout: Duration::from_secs(600),
+            timeout: Duration::from_secs(1200),
+            session_flag: None,
         }
     }
 
@@ -48,7 +55,8 @@ impl CliAgentBackend {
             prompt_args: vec!["-m".into(), "{prompt}".into()],
             model_name: "devstral-small-2505".into(),
             default_cwd,
-            timeout: Duration::from_secs(600),
+            timeout: Duration::from_secs(1200),
+            session_flag: Some("-s".into()),
         }
     }
 }
@@ -78,7 +86,17 @@ impl AiBackend for CliAgentBackend {
             .map(|a| a.replace("{prompt}", &format!("'{escaped}'")))
             .collect();
 
-        let cmd = format!("{} {}", self.command, args.join(" "));
+        let mut cmd = format!("{} {}", self.command, args.join(" "));
+
+        // Session continuation: append session flag if backend supports it
+        if let (Some(flag), Some(session_id)) = (&self.session_flag, &request.resume_session_id) {
+            cmd.push_str(&format!(" {flag} {session_id}"));
+            tracing::info!(
+                agent = %self.name,
+                session_id = session_id.as_str(),
+                "resuming CLI agent session"
+            );
+        }
 
         tracing::info!(
             agent = %self.name,
@@ -96,6 +114,7 @@ impl AiBackend for CliAgentBackend {
             output_tokens: None,
             timed_out: output.timed_out,
             exit_code: Some(output.exit_code),
+            session_id: None, // Generic CLI agents don't yet report session IDs
         })
     }
 

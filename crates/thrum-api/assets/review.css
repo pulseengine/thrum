@@ -1,0 +1,485 @@
+/* Thrum Review Page — additional styles */
+
+.review-container {
+    max-width: 1400px;
+}
+
+.back-link {
+    color: var(--accent);
+    text-decoration: none;
+}
+
+.back-link:hover {
+    text-decoration: underline;
+}
+
+/* ── Review Header ─────────────────────────── */
+
+.review-header {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 20px 24px;
+    margin-bottom: 20px;
+}
+
+.review-header .task-title {
+    font-size: 18px;
+    font-weight: 600;
+    color: var(--text);
+    margin-bottom: 8px;
+}
+
+.review-header .task-meta {
+    display: flex;
+    gap: 16px;
+    flex-wrap: wrap;
+    font-size: 12px;
+    color: var(--text-muted);
+}
+
+.review-header .task-meta span {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+
+/* ── Delta Summary ─────────────────────────── */
+
+.delta-summary {
+    display: flex;
+    gap: 16px;
+    margin-bottom: 20px;
+    flex-wrap: wrap;
+}
+
+.delta-stat {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 18px;
+    text-align: center;
+    min-width: 100px;
+}
+
+.delta-stat .stat-value {
+    font-size: 22px;
+    font-weight: 700;
+}
+
+.delta-stat .stat-label {
+    font-size: 11px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 1px;
+}
+
+.delta-stat.files .stat-value { color: var(--accent); }
+.delta-stat.insertions .stat-value { color: var(--green); }
+.delta-stat.deletions .stat-value { color: var(--red); }
+
+/* ── Sections ──────────────────────────────── */
+
+.review-section {
+    margin-bottom: 20px;
+}
+
+.review-section .section-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    cursor: pointer;
+    padding: 10px 16px;
+    background: var(--surface-raised);
+    border: 1px solid var(--border);
+    border-radius: 8px 8px 0 0;
+    user-select: none;
+}
+
+.review-section .section-header h3 {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    margin: 0;
+}
+
+.toggle-btn {
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    font-size: 12px;
+    cursor: pointer;
+    padding: 0 4px;
+}
+
+.section-body {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-top: none;
+    border-radius: 0 0 8px 8px;
+    overflow: hidden;
+}
+
+.section-body.collapsed {
+    display: none;
+}
+
+/* ── Diff View ─────────────────────────────── */
+
+.diff-view {
+    overflow-x: auto;
+    font-size: 12px;
+    line-height: 1.5;
+    max-height: 600px;
+    overflow-y: auto;
+}
+
+.diff-view pre {
+    margin: 0;
+    padding: 12px 16px;
+    white-space: pre;
+    font-family: ui-monospace, 'Cascadia Code', 'Fira Code', monospace;
+}
+
+.diff-line {
+    display: block;
+    padding: 0 8px;
+    min-height: 1.5em;
+}
+
+.diff-line-add {
+    background: rgba(74, 222, 128, 0.1);
+    color: var(--green);
+}
+
+.diff-line-del {
+    background: rgba(248, 113, 113, 0.1);
+    color: var(--red);
+}
+
+.diff-line-hunk {
+    background: rgba(108, 140, 255, 0.08);
+    color: var(--accent);
+    font-weight: 600;
+    padding-top: 6px;
+    padding-bottom: 2px;
+}
+
+.diff-line-file {
+    background: var(--surface-raised);
+    color: var(--text);
+    font-weight: 700;
+    padding: 8px;
+    border-bottom: 1px solid var(--border);
+}
+
+.diff-empty {
+    padding: 24px;
+    text-align: center;
+    color: var(--text-muted);
+    font-style: italic;
+}
+
+/* ── Task Description / Acceptance Criteria ── */
+
+.review-text {
+    padding: 16px 20px;
+    font-size: 13px;
+    line-height: 1.7;
+    color: var(--text);
+}
+
+.review-text p {
+    margin-bottom: 8px;
+}
+
+.criteria-list {
+    list-style: none;
+    padding: 0;
+}
+
+.criteria-list li {
+    padding: 6px 0;
+    padding-left: 20px;
+    position: relative;
+}
+
+.criteria-list li::before {
+    content: '☐';
+    position: absolute;
+    left: 0;
+    color: var(--text-muted);
+}
+
+/* ── Agent Insights ────────────────────────── */
+
+.reviewer-output {
+    padding: 16px 20px;
+    font-size: 13px;
+    line-height: 1.7;
+    white-space: pre-wrap;
+    word-break: break-word;
+    color: var(--text);
+}
+
+/* ── Gate Reports ──────────────────────────── */
+
+.gate-report {
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+}
+
+.gate-report:last-child {
+    border-bottom: none;
+}
+
+.gate-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 8px;
+}
+
+.gate-header .gate-label {
+    font-size: 13px;
+    font-weight: 600;
+}
+
+.gate-header .gate-duration {
+    font-size: 11px;
+    color: var(--text-muted);
+    margin-left: auto;
+}
+
+.gate-passed { color: var(--green); }
+.gate-failed { color: var(--red); }
+
+.check-list {
+    list-style: none;
+    padding: 0;
+}
+
+.check-item {
+    padding: 6px 0;
+    margin-left: 16px;
+}
+
+.check-name {
+    font-size: 12px;
+    font-weight: 600;
+}
+
+.check-pass { color: var(--green); }
+.check-fail { color: var(--red); }
+
+.check-icon {
+    margin-right: 6px;
+}
+
+.check-output {
+    margin-top: 6px;
+    margin-left: 20px;
+}
+
+.check-output-toggle {
+    background: none;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text-muted);
+    font-size: 11px;
+    font-family: inherit;
+    padding: 2px 8px;
+    cursor: pointer;
+    margin-bottom: 4px;
+}
+
+.check-output-toggle:hover {
+    border-color: var(--accent);
+    color: var(--text);
+}
+
+.check-output-content {
+    display: none;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 8px 12px;
+    font-size: 11px;
+    font-family: ui-monospace, 'Cascadia Code', 'Fira Code', monospace;
+    max-height: 200px;
+    overflow: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+    color: var(--text-muted);
+    margin-top: 4px;
+}
+
+.check-output-content.expanded {
+    display: block;
+}
+
+/* ── Memory Context ────────────────────────── */
+
+.memory-list {
+    padding: 12px 16px;
+}
+
+.memory-entry {
+    padding: 8px 12px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    margin-bottom: 8px;
+    font-size: 12px;
+}
+
+.memory-entry:last-child {
+    margin-bottom: 0;
+}
+
+.memory-category {
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 4px;
+}
+
+.memory-category.error   { color: var(--red); }
+.memory-category.pattern { color: var(--green); }
+.memory-category.decision { color: var(--amber); }
+.memory-category.context { color: var(--cyan); }
+
+.memory-content {
+    color: var(--text);
+    line-height: 1.5;
+}
+
+.memory-empty {
+    padding: 16px;
+    text-align: center;
+    color: var(--text-muted);
+    font-style: italic;
+    font-size: 12px;
+}
+
+/* ── Convergence Status ────────────────────── */
+
+.convergence-info {
+    padding: 16px 20px;
+}
+
+.convergence-strategy {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 12px;
+}
+
+.strategy-badge {
+    display: inline-block;
+    padding: 3px 10px;
+    border-radius: 12px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+}
+
+.strategy-badge.normal           { background: #1a2a1a; color: var(--green); }
+.strategy-badge.expanded-context { background: #2a2a1a; color: var(--amber); }
+.strategy-badge.different-approach { background: #2a1a1a; color: var(--red); }
+.strategy-badge.human-review     { background: #2a1a2a; color: #c084fc; }
+
+.failure-history {
+    list-style: none;
+    padding: 0;
+}
+
+.failure-history li {
+    padding: 6px 12px;
+    border-left: 2px solid var(--red);
+    margin-bottom: 6px;
+    font-size: 12px;
+    color: var(--text-muted);
+}
+
+.failure-history .failure-check {
+    color: var(--text);
+    font-weight: 600;
+}
+
+.failure-history .failure-count {
+    color: var(--amber);
+}
+
+/* ── Approve/Reject Actions ────────────────── */
+
+.review-actions {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 20px 24px;
+    margin-top: 24px;
+}
+
+.review-actions h3 {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    margin-bottom: 12px;
+}
+
+.review-actions textarea {
+    width: 100%;
+    min-height: 80px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px;
+    color: var(--text);
+    font-family: inherit;
+    font-size: 13px;
+    resize: vertical;
+    margin-bottom: 14px;
+}
+
+.review-actions textarea:focus {
+    outline: none;
+    border-color: var(--accent);
+}
+
+.review-actions .action-buttons {
+    display: flex;
+    gap: 10px;
+    justify-content: flex-end;
+}
+
+.btn-lg {
+    padding: 8px 24px;
+    font-size: 14px;
+    font-weight: 600;
+}
+
+/* Action feedback */
+.action-result {
+    margin-top: 12px;
+    padding: 10px 16px;
+    border-radius: 6px;
+    font-size: 13px;
+    text-align: center;
+}
+
+.action-result.success {
+    background: rgba(74, 222, 128, 0.15);
+    color: var(--green);
+    border: 1px solid var(--green);
+}
+
+.action-result.error {
+    background: rgba(248, 113, 113, 0.15);
+    color: var(--red);
+    border: 1px solid var(--red);
+}

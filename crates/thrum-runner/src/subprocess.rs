@@ -29,6 +29,8 @@ pub async fn run_cmd(cmd: &str, cwd: &Path, timeout: Duration) -> Result<Subproc
         .arg("-c")
         .arg(cmd)
         .current_dir(cwd)
+        // Allow Claude CLI subprocess to run inside a parent Claude session.
+        .env_remove("CLAUDECODE")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -89,6 +91,8 @@ pub async fn run_cmd_streaming(
         .arg("-c")
         .arg(cmd)
         .current_dir(cwd)
+        // Allow Claude CLI subprocess to run inside a parent Claude session.
+        .env_remove("CLAUDECODE")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()

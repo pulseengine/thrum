@@ -1,0 +1,161 @@
+/* Thrum Live Dashboard — SSE-powered agent cards */
+
+/* ── Connection Indicator ─────────────────────── */
+
+.connection-dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--text-muted);
+    margin-right: 6px;
+    vertical-align: middle;
+}
+
+.connection-dot.connected {
+    background: var(--green);
+    box-shadow: 0 0 6px var(--green);
+}
+
+.connection-dot.disconnected {
+    background: var(--red);
+    animation: pulse 1.5s ease-in-out infinite;
+}
+
+/* ── Agent Grid ───────────────────────────────── */
+
+.agent-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(380px, 1fr));
+    gap: 14px;
+}
+
+/* ── Agent Card ───────────────────────────────── */
+
+.agent-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.agent-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.agent-title {
+    font-weight: 600;
+    color: var(--accent);
+    font-size: 13px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 70%;
+}
+
+.agent-badge {
+    display: inline-block;
+    padding: 2px 10px;
+    border-radius: 12px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+    flex-shrink: 0;
+}
+
+.stage-active   { background: #1a2a3a; color: var(--cyan); }
+.stage-gate     { background: #2a2a1a; color: var(--amber); }
+.stage-review   { background: #2a2a1a; color: var(--amber); border: 1px solid var(--amber); }
+.stage-done     { background: #1a2a1a; color: var(--green); }
+.stage-failed   { background: #2a1a1a; color: var(--red); }
+
+/* ── Agent Meta ───────────────────────────────── */
+
+.agent-meta {
+    display: flex;
+    justify-content: space-between;
+    font-size: 12px;
+    color: var(--text-muted);
+}
+
+.agent-repo {
+    color: var(--text-muted);
+}
+
+.agent-elapsed {
+    color: var(--text-muted);
+    font-variant-numeric: tabular-nums;
+}
+
+/* ── File Stats ───────────────────────────────── */
+
+.agent-files {
+    display: flex;
+    gap: 10px;
+    font-size: 12px;
+}
+
+.file-stat {
+    color: var(--text-muted);
+    font-variant-numeric: tabular-nums;
+}
+
+.file-stat.ins {
+    color: var(--green);
+}
+
+.file-stat.del {
+    color: var(--red);
+}
+
+/* ── Agent Log (scrollable) ───────────────────── */
+
+.agent-log {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px;
+    max-height: 160px;
+    overflow-y: auto;
+    font-size: 11px;
+    line-height: 1.5;
+}
+
+.agent-log-line {
+    white-space: pre-wrap;
+    word-break: break-all;
+    color: var(--text);
+}
+
+.stream-tag {
+    display: inline-block;
+    width: 28px;
+    font-weight: 600;
+    margin-right: 6px;
+    flex-shrink: 0;
+}
+
+.stream-tag.out {
+    color: var(--text-muted);
+}
+
+.stream-tag.err {
+    color: var(--red);
+}
+
+/* ── Event Log ────────────────────────────────── */
+
+.event-log {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px;
+    max-height: 300px;
+    overflow-y: auto;
+    font-size: 12px;
+}

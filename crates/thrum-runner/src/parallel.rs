@@ -7,6 +7,7 @@
 //! - Graceful shutdown via CancellationToken
 
 use crate::backend::BackendRegistry;
+use crate::coordination_hub::CoordinationHub;
 use crate::event_bus::EventBus;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
@@ -15,6 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use thrum_core::agent::{AgentId, AgentSession};
 use thrum_core::budget::BudgetTracker;
+use thrum_core::coordination::ConflictPolicy;
 use thrum_core::event::EventKind;
 use thrum_core::repo::ReposConfig;
 use thrum_core::task::{RepoName, Task};
@@ -67,6 +69,14 @@ pub struct PipelineContext {
     pub integration_steps: Vec<thrum_core::gate::IntegrationStep>,
     /// Test subsampling configuration (None = no subsampling).
     pub subsample: Option<thrum_core::subsample::SubsampleConfig>,
+    /// Base directory for git worktrees (used when `per_repo_limit > 1`).
+    /// Defaults to `./worktrees` relative to the process working directory.
+    pub worktrees_dir: PathBuf,
+    /// Agent-to-agent coordination hub for parallel execution.
+    /// Manages file conflict detection, shared memory, and cross-agent notifications.
+    pub coordination: CoordinationHub,
+    /// Policy for handling file conflicts between concurrent agents.
+    pub conflict_policy: ConflictPolicy,
 }
 
 /// Result of a single agent run.
@@ -100,19 +110,32 @@ pub async fn run_parallel(
 
     let mut join_set: JoinSet<AgentResult> = JoinSet::new();
 
+    // Start the coordination conflict listener as a background task.
+    // It watches for FileChanged events and detects overlapping file access.
+    let coordination_cancel = CancellationToken::new();
+    let coordination_handle = ctx
+        .coordination
+        .start_conflict_listener(coordination_cancel.clone());
+
     tracing::info!(
         max_agents = config.max_agents,
         per_repo = config.per_repo_limit,
+        conflict_policy = ?ctx.conflict_policy,
         "parallel engine started"
     );
 
     ctx.event_bus.emit(EventKind::EngineLog {
         level: thrum_core::event::LogLevel::Info,
         message: format!(
-            "parallel engine started (max_agents={}, per_repo={})",
-            config.max_agents, config.per_repo_limit
+            "parallel engine started (max_agents={}, per_repo={}, conflict_policy={:?})",
+            config.max_agents, config.per_repo_limit, ctx.conflict_policy
         ),
     });
+
+    // Recover stuck tasks from a previous engine run.
+    // Tasks in "claimed", "implementing", or "integrating" state with no
+    // corresponding agent are orphaned — reset them to a dispatchable state.
+    recover_stuck_tasks(&ctx.db, &ctx.event_bus)?;
 
     loop {
         if shutdown.is_cancelled() {
@@ -167,6 +190,43 @@ pub async fn run_parallel(
         }
     }
 
+    // Stop the coordination conflict listener and log a summary.
+    coordination_cancel.cancel();
+    let _ = coordination_handle.await;
+    {
+        let summary = ctx.coordination.summary().await;
+        if summary.conflicts_count > 0 {
+            tracing::warn!(
+                conflicts = summary.conflicts_count,
+                "coordination: file conflicts detected during session"
+            );
+        }
+        tracing::info!(coordination = %summary, "coordination session summary");
+    }
+
+    // Lifecycle: decay and prune stale memory entries at engine shutdown.
+    // Uses 72-hour half-life (memories lose half their relevance every 3 days)
+    // and prunes entries that have decayed below 0.05 (effectively forgotten).
+    {
+        let memory_store = thrum_db::memory_store::MemoryStore::new(&ctx.db);
+        match memory_store.decay_all(72.0) {
+            Ok(n) => {
+                if n > 0 {
+                    tracing::info!(entries = n, "decayed memory relevance scores");
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "failed to decay memory entries"),
+        }
+        match memory_store.prune_below(0.05) {
+            Ok(n) => {
+                if n > 0 {
+                    tracing::info!(pruned = n, "pruned low-relevance memory entries");
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "failed to prune memory entries"),
+        }
+    }
+
     tracing::info!("parallel engine stopped");
     ctx.event_bus.emit(EventKind::EngineLog {
         level: thrum_core::event::LogLevel::Info,
@@ -211,9 +271,13 @@ fn reap_agent_result(result: Result<AgentResult, tokio::task::JoinError>, event_
 /// Try to dispatch agents for each claim category in priority order.
 ///
 /// Returns the number of agents spawned this batch.
+///
+/// When `per_repo_limit > 1`, each agent is given its own git worktree for
+/// isolated concurrent work on the same repository. With `per_repo_limit == 1`
+/// agents use the main repo working directory (no worktree overhead).
 async fn dispatch_batch(
     ctx: &Arc<PipelineContext>,
-    _config: &EngineConfig,
+    config: &EngineConfig,
     repo_filter: Option<&RepoName>,
     global_sem: &Arc<Semaphore>,
     repo_sems: &Arc<HashMap<String, Arc<Semaphore>>>,
@@ -226,6 +290,7 @@ async fn dispatch_batch(
     ];
 
     let mut dispatched = 0;
+    let use_worktrees = config.per_repo_limit > 1;
 
     for &category in &categories {
         loop {
@@ -270,7 +335,30 @@ async fn dispatch_batch(
                 .repos_config
                 .get(&task.repo)
                 .context(format!("no config for repo {}", task.repo))?;
-            let work_dir = repo_config.path.clone();
+
+            // Create worktree for isolation when running multiple agents per repo.
+            // The worktree is moved into the spawned task and auto-cleaned on drop.
+            let (work_dir, worktree) = if use_worktrees {
+                let branch = task.branch_name();
+                let git = crate::git::GitRepo::open(&repo_config.path)?;
+
+                // Ensure the branch exists before creating the worktree.
+                // Use create_branch_detached to avoid checking out the branch
+                // in the main working directory — git won't allow the same branch
+                // to be checked out in two worktrees simultaneously.
+                let _ = git.create_branch_detached(&branch);
+
+                let wt = git.create_worktree(&branch, &ctx.worktrees_dir)?;
+                let path = wt.path.clone();
+                tracing::info!(
+                    agent = %agent_id,
+                    worktree = %path.display(),
+                    "created worktree for agent isolation"
+                );
+                (path, Some(wt))
+            } else {
+                (repo_config.path.clone(), None)
+            };
 
             // Update the claimed status with the actual agent ID
             let mut claimed_task = task.clone();
@@ -293,8 +381,14 @@ async fn dispatch_batch(
                 task = %task.id,
                 repo = %task.repo,
                 category = ?category,
+                work_dir = %session.work_dir.display(),
                 "dispatching agent"
             );
+
+            // Register the agent with the coordination hub for conflict detection.
+            ctx.coordination
+                .register_agent(agent_id.clone(), task.id.clone(), task.repo.clone())
+                .await;
 
             ctx.event_bus.emit(EventKind::AgentStarted {
                 agent_id: agent_id.clone(),
@@ -307,11 +401,15 @@ async fn dispatch_batch(
 
             join_set.spawn(async move {
                 let mut session = session;
-                let outcome = run_agent_task(&ctx, task, category_copy).await;
+                let outcome = run_agent_task(&ctx, task, category_copy, worktree.as_ref()).await;
                 session.finish();
-                // Permits are dropped when this future completes, releasing semaphores
+                // Unregister from coordination hub — clears file ownership tracking.
+                ctx.coordination.unregister_agent(&session.agent_id).await;
+                // Permits are dropped when this future completes, releasing semaphores.
+                // The worktree (if any) is dropped here, triggering auto-cleanup.
                 drop(global_permit);
                 drop(repo_permit);
+                drop(worktree);
                 AgentResult { session, outcome }
             });
 
@@ -349,20 +447,35 @@ fn unclaim_task(db: &redb::Database, task: &Task, category: ClaimCategory) -> Re
 /// This is the per-agent entrypoint, called from within a spawned tokio task.
 /// It delegates to the appropriate pipeline function based on claim category.
 ///
-/// A [`FileWatcher`](crate::watcher::FileWatcher) is started on the repo
-/// working directory before the pipeline runs and stopped when it completes.
-async fn run_agent_task(ctx: &PipelineContext, task: Task, category: ClaimCategory) -> Result<()> {
+/// When a `worktree` is provided (parallel multi-agent mode), the agent uses
+/// the worktree path as its working directory instead of the main repo path.
+///
+/// A [`FileWatcher`](crate::watcher::FileWatcher) is started on the working
+/// directory before the pipeline runs and stopped when it completes.
+async fn run_agent_task(
+    ctx: &PipelineContext,
+    task: Task,
+    category: ClaimCategory,
+    worktree: Option<&crate::worktree::Worktree>,
+) -> Result<()> {
     let task_store = TaskStore::new(&ctx.db);
     let gate_store = thrum_db::gate_store::GateStore::new(&ctx.db);
 
     let roles_ref = ctx.roles.as_deref();
 
+    // Determine the effective working directory: worktree path (if isolated)
+    // or main repo path (single-agent mode).
+    let work_dir = worktree.map(|wt| wt.path.clone());
+
     // Start file watcher for real-time change detection
     let agent_id = AgentId::generate(&task.repo, &task.id);
     let repo_config = ctx.repos_config.get(&task.repo);
-    let watcher = if let Some(rc) = repo_config {
+    let watch_dir = work_dir
+        .clone()
+        .or_else(|| repo_config.map(|rc| rc.path.clone()));
+    let watcher = if let Some(dir) = watch_dir {
         match crate::watcher::FileWatcher::start(
-            rc.path.clone(),
+            dir,
             agent_id,
             task.id.clone(),
             ctx.event_bus.clone(),
@@ -389,6 +502,7 @@ async fn run_agent_task(ctx: &PipelineContext, task: Task, category: ClaimCatego
                 &ctx.budget,
                 ctx.subsample.as_ref(),
                 task,
+                work_dir.as_deref(),
             )
             .await
         }
@@ -400,6 +514,7 @@ async fn run_agent_task(ctx: &PipelineContext, task: Task, category: ClaimCatego
                 &ctx.event_bus,
                 &ctx.integration_steps,
                 task,
+                work_dir.as_deref(),
             )
             .await
         }
@@ -415,6 +530,7 @@ async fn run_agent_task(ctx: &PipelineContext, task: Task, category: ClaimCatego
                 &ctx.budget,
                 ctx.subsample.as_ref(),
                 task,
+                work_dir.as_deref(),
             )
             .await
         }
@@ -428,6 +544,71 @@ async fn run_agent_task(ctx: &PipelineContext, task: Task, category: ClaimCatego
     result
 }
 
+/// Recover tasks stuck in transient states from a previous engine run.
+///
+/// On engine startup, any tasks in "claimed", "implementing", or "integrating"
+/// state are orphaned (their agent is no longer running). This function resets
+/// them to a re-dispatchable state so they don't stay stuck forever.
+fn recover_stuck_tasks(db: &redb::Database, event_bus: &crate::event_bus::EventBus) -> Result<()> {
+    let task_store = TaskStore::new(db);
+    let all_tasks = task_store.list(None, None)?;
+    let mut recovered = 0;
+
+    for mut task in all_tasks {
+        let reset_to = match &task.status {
+            thrum_core::task::TaskStatus::Claimed { .. }
+            | thrum_core::task::TaskStatus::Implementing { .. } => {
+                // Agent was working on this but the engine stopped.
+                // Reset to Pending so it gets re-dispatched.
+                Some(thrum_core::task::TaskStatus::Pending)
+            }
+            thrum_core::task::TaskStatus::Integrating => {
+                // Post-approval integration was in progress.
+                // Reset to Approved so it re-enters the integration path.
+                Some(thrum_core::task::TaskStatus::Approved)
+            }
+            thrum_core::task::TaskStatus::Reviewing { .. } => {
+                // Review was in progress — implementation is done, just re-run review.
+                // Reset to Pending to run the full pipeline again (safe, gates will catch issues).
+                Some(thrum_core::task::TaskStatus::Pending)
+            }
+            _ => None,
+        };
+
+        if let Some(new_status) = reset_to {
+            let old_label = task.status.label().to_string();
+            let new_label = new_status.label();
+            tracing::warn!(
+                task_id = %task.id,
+                from = old_label,
+                to = new_label,
+                "recovering stuck task from previous engine run"
+            );
+            task.status = new_status;
+            task.updated_at = chrono::Utc::now();
+            task_store.update(&task)?;
+            recovered += 1;
+
+            event_bus.emit(EventKind::TaskStateChange {
+                task_id: task.id.clone(),
+                repo: task.repo.clone(),
+                from: old_label,
+                to: task.status.label().to_string(),
+            });
+        }
+    }
+
+    if recovered > 0 {
+        tracing::info!(count = recovered, "recovered stuck tasks");
+        event_bus.emit(EventKind::EngineLog {
+            level: thrum_core::event::LogLevel::Info,
+            message: format!("recovered {recovered} stuck tasks from previous run"),
+        });
+    }
+
+    Ok(())
+}
+
 /// Pipeline functions extracted for sharing between sequential and parallel paths.
 pub mod pipeline {
     use crate::backend::{AiBackend, AiRequest, AiResponse, BackendRegistry};
@@ -439,14 +620,56 @@ pub mod pipeline {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use thrum_core::budget::{self, BudgetEntry, BudgetTracker, SessionType};
+    use thrum_core::checkpoint::Checkpoint;
     use thrum_core::event::EventKind;
     use thrum_core::gate::{run_gate, run_integration_gate_configured};
     use thrum_core::repo::ReposConfig;
     use thrum_core::subsample::SubsampleConfig;
     use thrum_core::task::{CheckpointSummary, GateLevel, MAX_RETRIES, Task, TaskStatus};
+    use thrum_db::checkpoint_store::CheckpointStore;
     use thrum_db::gate_store::GateStore;
+    use thrum_db::session_store::SessionStore;
     use thrum_db::task_store::TaskStore;
     use tokio::sync::Mutex;
+
+    /// Base backoff delay (seconds) for the first retry. Scales exponentially.
+    /// retry 1: 30s, retry 2: 120s, retry 3+: 300s
+    const RETRY_BACKOFF_SECS: [u64; 4] = [0, 30, 120, 300];
+
+    /// Extra cooldown (seconds) when a rate limit is detected.
+    const RATE_LIMIT_COOLDOWN_SECS: u64 = 300;
+
+    /// Check if an agent invocation result looks like an API rate limit.
+    ///
+    /// Heuristics:
+    /// - Non-zero exit code (not timeout)
+    /// - Content is empty/very short OR contains rate-limit keywords
+    fn is_likely_rate_limited(result: &AiResponse) -> bool {
+        let failed = result.exit_code.is_some_and(|c| c != 0) && !result.timed_out;
+        if !failed {
+            return false;
+        }
+
+        let content_lower = result.content.to_lowercase();
+        let rate_limit_patterns = [
+            "rate limit",
+            "usage limit",
+            "hit your limit",
+            "too many requests",
+            "429",
+            "quota exceeded",
+            "overloaded",
+        ];
+
+        // Very short output with error exit is suspicious
+        if result.content.len() < 200 {
+            return true;
+        }
+
+        rate_limit_patterns
+            .iter()
+            .any(|p| content_lower.contains(p))
+    }
 
     /// Emit a task state change event.
     fn emit_state_change(event_bus: &EventBus, task: &Task, from: &str, to: &str) {
@@ -456,6 +679,45 @@ pub mod pipeline {
             from: from.to_string(),
             to: to.to_string(),
         });
+    }
+
+    /// Save a checkpoint and emit a CheckpointSaved event.
+    fn save_checkpoint(
+        checkpoint_store: &CheckpointStore<'_>,
+        event_bus: &EventBus,
+        checkpoint: &Checkpoint,
+    ) {
+        if let Err(e) = checkpoint_store.save(checkpoint) {
+            tracing::warn!(
+                task_id = %checkpoint.task_id,
+                phase = %checkpoint.completed_phase,
+                error = %e,
+                "failed to save checkpoint"
+            );
+        } else {
+            tracing::info!(
+                task_id = %checkpoint.task_id,
+                phase = %checkpoint.completed_phase,
+                "checkpoint saved"
+            );
+            event_bus.emit(EventKind::CheckpointSaved {
+                task_id: checkpoint.task_id.clone(),
+                repo: checkpoint.repo.clone(),
+                phase: checkpoint.completed_phase.clone(),
+            });
+        }
+    }
+
+    /// Remove a checkpoint after a task reaches a terminal state (merged)
+    /// or moves to AwaitingApproval (checkpoint data is now in the task status).
+    fn remove_checkpoint(checkpoint_store: &CheckpointStore<'_>, task: &Task) {
+        if let Err(e) = checkpoint_store.remove(&task.id) {
+            tracing::debug!(
+                task_id = %task.id,
+                error = %e,
+                "failed to remove checkpoint (non-fatal)"
+            );
+        }
     }
 
     /// Record the cost of an AI invocation into the shared budget tracker.
@@ -505,6 +767,9 @@ pub mod pipeline {
     ///
     /// When `subsample` is `Some` and enabled, test commands at each gate are
     /// wrapped through `subsample_test_cmd()` using the configured ratios.
+    ///
+    /// When `work_dir` is `Some`, all operations (git, gates, AI invocations)
+    /// run in the worktree directory instead of the main repo path.
     #[allow(clippy::too_many_arguments)]
     pub async fn run_task_pipeline(
         task_store: &TaskStore<'_>,
@@ -517,10 +782,19 @@ pub mod pipeline {
         budget: &Arc<Mutex<BudgetTracker>>,
         subsample: Option<&SubsampleConfig>,
         mut task: Task,
+        work_dir: Option<&Path>,
     ) -> Result<()> {
-        let repo_config = repos_config
+        let base_repo_config = repos_config
             .get(&task.repo)
             .context(format!("no config for repo {}", task.repo))?;
+
+        // If a worktree work_dir is provided, override the repo path so that
+        // all gate checks, git operations, and AI invocations use it.
+        let repo_config = match work_dir {
+            Some(dir) => base_repo_config.with_work_dir(dir.to_path_buf()),
+            None => base_repo_config.clone(),
+        };
+        let repo_config = &repo_config;
 
         // Role-aware backend selection: resolve implementer role → backend
         let (agent, impl_role_name, impl_budget_usd) = if let Some(roles) = roles {
@@ -577,11 +851,16 @@ pub mod pipeline {
             .await
             .unwrap_or_default();
 
-        // Inject relevant memories as context
+        // Inject relevant memories as context.
+        // Touch accessed entries so frequently-used memories maintain higher
+        // relevance scores under exponential decay.
         let memory_context = {
             let memory_store = thrum_db::memory_store::MemoryStore::new(task_store.db());
             match memory_store.query_for_task(&task.repo, 5) {
                 Ok(memories) if !memories.is_empty() => {
+                    let ids: Vec<_> = memories.iter().map(|m| m.id.clone()).collect();
+                    let _ = memory_store.touch_entries(&ids);
+
                     let ctx: Vec<String> = memories.iter().map(|m| m.to_prompt_context()).collect();
                     format!(
                         "\n\n## Relevant context from previous sessions\n{}",
@@ -597,11 +876,41 @@ pub mod pipeline {
             build_implementation_prompt(&task, &branch)
         );
 
-        let request = AiRequest::new(&prompt)
+        // Look up a previous session ID for session continuation on retries.
+        // If this task was retried, the session store may contain the session
+        // ID from the prior (timed-out or failed) invocation.
+        let session_store = SessionStore::new(task_store.db());
+        let resume_session_id = session_store.get(&task.id).unwrap_or(None);
+        if let Some(ref sid) = resume_session_id {
+            tracing::info!(
+                task_id = %task.id,
+                session_id = sid,
+                "found previous session ID for continuation"
+            );
+            event_bus.emit(EventKind::SessionContinued {
+                task_id: task.id.clone(),
+                repo: task.repo.clone(),
+                session_id: sid.clone(),
+            });
+        }
+
+        let mut request = AiRequest::new(&prompt)
             .with_system(system_prompt)
             .with_cwd(repo_config.path.clone());
+        if let Some(sid) = resume_session_id {
+            request = request.with_resume_session(sid);
+        }
 
         let result = agent.invoke(&request).await?;
+
+        // Store the session ID for potential future retries (timeout/failure recovery).
+        // This persists even if the invocation timed out — especially important then,
+        // since the agent's partial work is preserved in the session.
+        if let Some(ref sid) = result.session_id
+            && let Err(e) = session_store.save(&task.id, sid)
+        {
+            tracing::warn!(error = %e, "failed to store session ID");
+        }
 
         // Record implementation cost
         record_invocation_cost(
@@ -621,7 +930,139 @@ pub mod pipeline {
             );
         }
 
+        // Detect API rate limit early. If the agent hit a usage limit, cool down
+        // before failing. This gives the limit time to reset and prevents the
+        // retry from immediately hitting the same wall.
+        if is_likely_rate_limited(&result) {
+            tracing::warn!(
+                task_id = %task.id,
+                exit_code = ?result.exit_code,
+                content_len = result.content.len(),
+                "API rate limit likely hit — cooling down for {}s",
+                RATE_LIMIT_COOLDOWN_SECS
+            );
+            event_bus.emit(EventKind::EngineLog {
+                level: thrum_core::event::LogLevel::Warn,
+                message: format!(
+                    "TASK-{:04} rate limit detected (exit {:?}, {}B output). \
+                     Cooling down {}s before marking as failed.",
+                    task.id.0,
+                    result.exit_code,
+                    result.content.len(),
+                    RATE_LIMIT_COOLDOWN_SECS,
+                ),
+            });
+            tokio::time::sleep(std::time::Duration::from_secs(RATE_LIMIT_COOLDOWN_SECS)).await;
+        }
+
+        // Check if the implementation actually produced any changes.
+        // If the branch has no commits beyond main, the agent returned empty
+        // (e.g., due to rate limits, API errors, or permission issues).
+        // Fail early instead of passing an empty diff through gates.
+        //
+        // IMPORTANT: default to has_changes=true on ANY error. It's better to
+        // run gates on unchanged code than to silently discard real agent work.
+        // Git status can fail due to index lock contention between concurrent agents.
+        let work_dir = repo_config.path.join(format!(
+            "worktrees/{}",
+            task.branch_name().replace('/', "_")
+        ));
+        let has_changes = if work_dir.exists() {
+            match crate::git::GitRepo::open(&work_dir) {
+                Ok(g) => {
+                    // Retry once after a short delay if git status fails
+                    // (transient index lock from concurrent agents).
+                    let clean_result = g.is_clean().or_else(|e| {
+                        tracing::warn!(
+                            task_id = %task.id,
+                            error = %e,
+                            "git status failed, retrying after 1s (likely index lock)"
+                        );
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                        g.is_clean()
+                    });
+                    let dirty = match clean_result {
+                        Ok(clean) => !clean,
+                        Err(e) => {
+                            tracing::error!(
+                                task_id = %task.id,
+                                error = %e,
+                                "git status failed twice — assuming dirty (fail-safe)"
+                            );
+                            true // fail-safe: assume dirty
+                        }
+                    };
+                    let commits = match g.has_commits_beyond_main() {
+                        Ok(v) => v,
+                        Err(e) => {
+                            tracing::warn!(
+                                task_id = %task.id,
+                                error = %e,
+                                "has_commits_beyond_main failed — ignoring (dirty check is primary)"
+                            );
+                            false
+                        }
+                    };
+                    dirty || commits
+                }
+                Err(e) => {
+                    tracing::error!(
+                        task_id = %task.id,
+                        error = %e,
+                        work_dir = %work_dir.display(),
+                        "failed to open worktree git repo — assuming has changes (fail-safe)"
+                    );
+                    true // fail-safe: assume changes exist
+                }
+            }
+        } else {
+            // Fallback: check if branch has commits beyond main in main repo
+            match crate::git::GitRepo::open(&repo_config.path)
+                .and_then(|g| g.branch_has_commits_beyond_main(&task.branch_name()))
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        task_id = %task.id,
+                        error = %e,
+                        "branch_has_commits_beyond_main failed — assuming no changes"
+                    );
+                    false
+                }
+            }
+        };
+
+        if !has_changes {
+            tracing::error!(
+                task_id = %task.id,
+                exit_code = ?result.exit_code,
+                "implementation produced no changes — failing task"
+            );
+            emit_state_change(event_bus, &task, "implementing", "gate1_failed");
+            let report = thrum_core::task::GateReport {
+                level: thrum_core::task::GateLevel::Quality,
+                checks: vec![thrum_core::task::CheckResult {
+                    name: "implementation_produced_changes".into(),
+                    passed: false,
+                    stdout: String::new(),
+                    stderr: format!(
+                        "Agent returned without making any changes (exit code: {:?}). \
+                         This usually means the API rate limit was hit or the agent errored.",
+                        result.exit_code,
+                    ),
+                    exit_code: result.exit_code.unwrap_or(-1),
+                }],
+                passed: false,
+                duration_secs: 0.0,
+            };
+            task.status = TaskStatus::Gate1Failed { report };
+            task.updated_at = Utc::now();
+            task_store.update(&task)?;
+            return Ok(());
+        }
+
         // --- Gate 1: Quality ---
+        let checkpoint_store = CheckpointStore::new(task_store.db());
         tracing::info!("running Gate 1: Quality");
         event_bus.emit(EventKind::GateStarted {
             task_id: task.id.clone(),
@@ -638,38 +1079,60 @@ pub mod pipeline {
 
         if !gate1.passed {
             emit_state_change(event_bus, &task, "implementing", "gate1_failed");
-            task.status = TaskStatus::Gate1Failed { report: gate1 };
+            task.status = TaskStatus::Gate1Failed {
+                report: gate1.clone(),
+            };
             task.updated_at = Utc::now();
             task_store.update(&task)?;
 
-            // Store failure as memory for future context
-            if let TaskStatus::Gate1Failed { ref report } = task.status {
-                let error_summary: String = report
-                    .checks
-                    .iter()
-                    .filter(|c| !c.passed)
-                    .map(|c| {
-                        format!(
-                            "{}: {}",
-                            c.name,
-                            c.stderr.chars().take(200).collect::<String>()
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("; ");
-                let mem = thrum_core::memory::MemoryEntry::new(
-                    task.id.clone(),
-                    task.repo.clone(),
-                    thrum_core::memory::MemoryCategory::Error {
-                        error_type: "gate1_failure".into(),
-                    },
-                    error_summary,
-                );
-                let memory_store = thrum_db::memory_store::MemoryStore::new(task_store.db());
-                let _ = memory_store.store(&mem);
-            }
+            // Store failure as memory for future context.
+            // Include the task title so the agent can correlate errors with
+            // specific features when working on similar tasks later.
+            let failed_checks: String = gate1
+                .checks
+                .iter()
+                .filter(|c| !c.passed)
+                .map(|c| {
+                    format!(
+                        "{}: {}",
+                        c.name,
+                        c.stderr.chars().take(200).collect::<String>()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            let error_summary = format!(
+                "Task '{}' failed Gate 1 (Quality): {failed_checks}",
+                task.title
+            );
+            let mem = thrum_core::memory::MemoryEntry::new(
+                task.id.clone(),
+                task.repo.clone(),
+                thrum_core::memory::MemoryCategory::Error {
+                    error_type: "gate1_failure".into(),
+                },
+                error_summary,
+            );
+            let memory_store = thrum_db::memory_store::MemoryStore::new(task_store.db());
+            let _ = memory_store.store(&mem);
+
+            // Record failure signatures for convergence detection.
+            // On retry, the convergence store is read to determine if the
+            // agent is stuck repeating the same failure.
+            record_convergence_failures(task_store.db(), &task.id, &gate1);
 
             return Ok(());
+        }
+
+        // --- Checkpoint: Gate 1 passed ---
+        {
+            let mut cp = Checkpoint::after_implementation(
+                task.id.clone(),
+                task.repo.clone(),
+                branch.clone(),
+            );
+            cp.advance_to_gate1(gate1.clone());
+            save_checkpoint(&checkpoint_store, event_bus, &cp);
         }
 
         // --- Review (role-aware backend selection) ---
@@ -727,6 +1190,28 @@ pub mod pipeline {
         task.updated_at = Utc::now();
         task_store.update(&task)?;
 
+        // --- Checkpoint: Review completed ---
+        {
+            let cp_store = CheckpointStore::new(task_store.db());
+            match cp_store.get(&task.id) {
+                Ok(Some(mut cp)) => {
+                    cp.advance_to_review(review_result.content.clone());
+                    save_checkpoint(&cp_store, event_bus, &cp);
+                }
+                _ => {
+                    // No existing checkpoint — create a fresh one with review state
+                    let mut cp = Checkpoint::after_implementation(
+                        task.id.clone(),
+                        task.repo.clone(),
+                        branch.clone(),
+                    );
+                    cp.advance_to_gate1(gate1.clone());
+                    cp.advance_to_review(review_result.content.clone());
+                    save_checkpoint(&cp_store, event_bus, &cp);
+                }
+            }
+        }
+
         // --- Gate 2: Proofs ---
         tracing::info!("running Gate 2: Proof");
         event_bus.emit(EventKind::GateStarted {
@@ -744,41 +1229,70 @@ pub mod pipeline {
 
         if !gate2.passed {
             emit_state_change(event_bus, &task, "reviewing", "gate2_failed");
-            task.status = TaskStatus::Gate2Failed { report: gate2 };
+            task.status = TaskStatus::Gate2Failed {
+                report: gate2.clone(),
+            };
             task.updated_at = Utc::now();
             task_store.update(&task)?;
 
             // Store failure as memory for future context
-            if let TaskStatus::Gate2Failed { ref report } = task.status {
-                let error_summary: String = report
-                    .checks
-                    .iter()
-                    .filter(|c| !c.passed)
-                    .map(|c| {
-                        format!(
-                            "{}: {}",
-                            c.name,
-                            c.stderr.chars().take(200).collect::<String>()
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("; ");
-                let mem = thrum_core::memory::MemoryEntry::new(
-                    task.id.clone(),
-                    task.repo.clone(),
-                    thrum_core::memory::MemoryCategory::Error {
-                        error_type: "gate2_failure".into(),
-                    },
-                    error_summary,
-                );
-                let memory_store = thrum_db::memory_store::MemoryStore::new(task_store.db());
-                let _ = memory_store.store(&mem);
-            }
+            let failed_checks: String = gate2
+                .checks
+                .iter()
+                .filter(|c| !c.passed)
+                .map(|c| {
+                    format!(
+                        "{}: {}",
+                        c.name,
+                        c.stderr.chars().take(200).collect::<String>()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            let error_summary = format!(
+                "Task '{}' failed Gate 2 (Proof): {failed_checks}",
+                task.title
+            );
+            let mem = thrum_core::memory::MemoryEntry::new(
+                task.id.clone(),
+                task.repo.clone(),
+                thrum_core::memory::MemoryCategory::Error {
+                    error_type: "gate2_failure".into(),
+                },
+                error_summary,
+            );
+            let memory_store = thrum_db::memory_store::MemoryStore::new(task_store.db());
+            let _ = memory_store.store(&mem);
+
+            // Record failure signatures for convergence detection.
+            record_convergence_failures(task_store.db(), &task.id, &gate2);
 
             return Ok(());
         }
 
-        // --- Checkpoint: Await Human Approval ---
+        // --- Checkpoint: Gate 2 passed ---
+        {
+            let cp_store = CheckpointStore::new(task_store.db());
+            match cp_store.get(&task.id) {
+                Ok(Some(mut cp)) => {
+                    cp.advance_to_gate2(gate2.clone());
+                    save_checkpoint(&cp_store, event_bus, &cp);
+                }
+                _ => {
+                    let mut cp = Checkpoint::after_implementation(
+                        task.id.clone(),
+                        task.repo.clone(),
+                        branch.clone(),
+                    );
+                    cp.advance_to_gate1(gate1.clone());
+                    cp.advance_to_review(review_result.content.clone());
+                    cp.advance_to_gate2(gate2.clone());
+                    save_checkpoint(&cp_store, event_bus, &cp);
+                }
+            }
+        }
+
+        // --- Await Human Approval ---
         let summary = CheckpointSummary {
             diff_summary: diff,
             reviewer_output: review_result.content,
@@ -790,21 +1304,35 @@ pub mod pipeline {
         task.updated_at = Utc::now();
         task_store.update(&task)?;
 
+        // Clean up checkpoint and session — task state now captures all needed data
+        remove_checkpoint(&checkpoint_store, &task);
+        let _ = session_store.remove(&task.id);
+
         tracing::info!(
             task_id = %task.id,
             "task awaiting approval — use `thrum task approve {}`",
             task.id.0
         );
 
-        // Store successful approach as pattern memory
+        // Store successful approach as pattern memory.
+        // Include acceptance criteria so future similar tasks can reference
+        // what a successful implementation looked like.
         {
+            let criteria_summary = if task.acceptance_criteria.is_empty() {
+                String::new()
+            } else {
+                format!(" (criteria: {})", task.acceptance_criteria.join(", "))
+            };
             let mem = thrum_core::memory::MemoryEntry::new(
                 task.id.clone(),
                 task.repo.clone(),
                 thrum_core::memory::MemoryCategory::Pattern {
                     pattern_name: "successful_implementation".into(),
                 },
-                format!("Task '{}' passed gates and reached approval", task.title),
+                format!(
+                    "Task '{}' passed gates and reached approval{criteria_summary}",
+                    task.title
+                ),
             );
             let memory_store = thrum_db::memory_store::MemoryStore::new(task_store.db());
             let _ = memory_store.store(&mem);
@@ -817,6 +1345,8 @@ pub mod pipeline {
     ///
     /// `integration_steps`: if non-empty, runs config-driven integration gate.
     /// If empty, Gate 3 passes vacuously (single-repo or no integration configured).
+    ///
+    /// When `work_dir` is `Some`, merge operations use the worktree path.
     pub async fn post_approval_pipeline(
         task_store: &TaskStore<'_>,
         gate_store: &GateStore<'_>,
@@ -824,10 +1354,17 @@ pub mod pipeline {
         event_bus: &EventBus,
         integration_steps: &[thrum_core::gate::IntegrationStep],
         mut task: Task,
+        work_dir: Option<&Path>,
     ) -> Result<()> {
-        let repo_config = repos_config
+        let base_repo_config = repos_config
             .get(&task.repo)
             .context(format!("no config for repo {}", task.repo))?;
+
+        let repo_config = match work_dir {
+            Some(dir) => base_repo_config.with_work_dir(dir.to_path_buf()),
+            None => base_repo_config.clone(),
+        };
+        let repo_config = &repo_config;
 
         emit_state_change(event_bus, &task, "approved", "integrating");
         task.status = TaskStatus::Integrating;
@@ -896,6 +1433,11 @@ pub mod pipeline {
         task.updated_at = Utc::now();
         task_store.update(&task)?;
 
+        // Clean up any stale checkpoint and session for this task
+        let checkpoint_store = CheckpointStore::new(task_store.db());
+        remove_checkpoint(&checkpoint_store, &task);
+        let _ = SessionStore::new(task_store.db()).remove(&task.id);
+
         tracing::info!(
             task_id = %task.id,
             commit = %commit_sha,
@@ -905,7 +1447,17 @@ pub mod pipeline {
         Ok(())
     }
 
-    /// Retry a failed task: bump retry count, re-invoke with gate failure feedback.
+    /// Retry a failed task with convergence-aware strategy rotation.
+    ///
+    /// Instead of blind retries, analyzes failure history to detect convergence
+    /// (the agent repeating the same failure). When convergence is detected,
+    /// the strategy escalates:
+    /// 1. Normal: standard retry with failure feedback
+    /// 2. ExpandedContext: more detail, explicit "read the full error" directive
+    /// 3. DifferentApproach: "your approach is NOT working, try something else"
+    /// 4. HumanReview: stops automatic retry, flags for human intervention
+    ///
+    /// Also queries failure-specific memories from the memory store for context.
     #[allow(clippy::too_many_arguments)]
     pub async fn retry_task_pipeline(
         task_store: &TaskStore<'_>,
@@ -917,8 +1469,11 @@ pub mod pipeline {
         budget: &Arc<Mutex<BudgetTracker>>,
         subsample: Option<&SubsampleConfig>,
         mut task: Task,
+        work_dir: Option<&Path>,
     ) -> Result<()> {
-        let feedback = match &task.status {
+        use thrum_core::convergence::RetryStrategy;
+
+        let (feedback, convergence_augmentation) = match &task.status {
             TaskStatus::Gate1Failed { report } => {
                 let failed_checks: Vec<_> = report
                     .checks
@@ -932,10 +1487,15 @@ pub mod pipeline {
                         )
                     })
                     .collect();
-                format!(
+                let feedback = format!(
                     "Gate 1 (Quality) failed. Fix these issues:\n{}",
                     failed_checks.join("\n")
-                )
+                );
+
+                // Convergence analysis: compare new failure against history
+                let augmentation =
+                    analyze_convergence(task_store.db(), &task.id, report, event_bus);
+                (feedback, augmentation)
             }
             TaskStatus::Gate2Failed { report } => {
                 let failed_checks: Vec<_> = report
@@ -950,16 +1510,90 @@ pub mod pipeline {
                         )
                     })
                     .collect();
-                format!(
+                let feedback = format!(
                     "Gate 2 (Proof) failed. Fix these issues:\n{}",
                     failed_checks.join("\n")
-                )
+                );
+
+                let augmentation =
+                    analyze_convergence(task_store.db(), &task.id, report, event_bus);
+                (feedback, augmentation)
             }
             TaskStatus::Claimed { .. } => {
                 // Was claimed from a retryable state — check original retry count
-                "Previous gate failure (details in prior attempts).".to_string()
+                let feedback = "Previous gate failure (details in prior attempts).".to_string();
+                (feedback, ConvergenceAugmentation::normal())
             }
             _ => return Ok(()),
+        };
+
+        // If convergence analysis says human review is needed, don't retry.
+        // The task stays in its failed state and will not be automatically claimed.
+        if convergence_augmentation.strategy == RetryStrategy::HumanReview {
+            tracing::warn!(
+                task_id = %task.id,
+                strategy = "human-review",
+                "convergence detected: flagging task for human review instead of retrying"
+            );
+            event_bus.emit(EventKind::TaskConvergenceDetected {
+                task_id: task.id.clone(),
+                strategy: "human-review".into(),
+                repeated_count: convergence_augmentation.max_occurrence,
+            });
+            // Don't increment retry_count or reset status — leave in failed state
+            return Ok(());
+        }
+
+        tracing::info!(
+            task_id = %task.id,
+            strategy = convergence_augmentation.strategy.label(),
+            repeated_failures = convergence_augmentation.repeated_count,
+            "retrying with convergence-aware strategy"
+        );
+
+        // Exponential backoff: wait before retrying to avoid rapid churn.
+        // This prevents burning through all retries in seconds when hitting
+        // rate limits or transient API errors.
+        {
+            let backoff_secs = RETRY_BACKOFF_SECS[task.retry_count.min(3) as usize];
+            if backoff_secs > 0 {
+                tracing::info!(
+                    task_id = %task.id,
+                    retry = task.retry_count,
+                    backoff_secs,
+                    "applying exponential backoff before retry"
+                );
+                event_bus.emit(EventKind::EngineLog {
+                    level: thrum_core::event::LogLevel::Info,
+                    message: format!(
+                        "TASK-{:04} retry {}/{}: backing off {}s before next attempt",
+                        task.id.0, task.retry_count, MAX_RETRIES, backoff_secs
+                    ),
+                });
+                tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+            }
+        }
+
+        // Query failure-specific memories for context-aware retries.
+        // These are error-category memories from the same repo, surfacing
+        // patterns like "cargo fmt failed" or "proof obligation missing"
+        // that help the agent avoid repeating past mistakes.
+        let failure_memories = {
+            let memory_store = thrum_db::memory_store::MemoryStore::new(task_store.db());
+            match memory_store.query_errors_for_repo(&task.repo, 5) {
+                Ok(memories) if !memories.is_empty() => {
+                    // Touch accessed memories to maintain their relevance
+                    let ids: Vec<_> = memories.iter().map(|m| m.id.clone()).collect();
+                    let _ = memory_store.touch_entries(&ids);
+
+                    let ctx: Vec<String> = memories.iter().map(|m| m.to_prompt_context()).collect();
+                    format!(
+                        "\n\n## Failure-specific context from previous attempts\n{}",
+                        ctx.join("\n")
+                    )
+                }
+                _ => String::new(),
+            }
         };
 
         task.retry_count += 1;
@@ -969,8 +1603,12 @@ pub mod pipeline {
 
         let original_desc = task.description.clone();
         task.description = format!(
-            "{original_desc}\n\n---\n**RETRY {}/{}** — Previous attempt failed:\n{feedback}",
-            task.retry_count, MAX_RETRIES
+            "{original_desc}\n\n---\n**RETRY {}/{} [strategy: {}]** — Previous attempt failed:\n\
+             {feedback}{failure_memories}{convergence_prompt}",
+            task.retry_count,
+            MAX_RETRIES,
+            convergence_augmentation.strategy.label(),
+            convergence_prompt = convergence_augmentation.prompt,
         );
 
         run_task_pipeline(
@@ -984,8 +1622,274 @@ pub mod pipeline {
             budget,
             subsample,
             task,
+            work_dir,
         )
         .await
+    }
+
+    /// Resume a task from its last checkpoint, skipping already-completed gates.
+    ///
+    /// Detects the existing branch and checkpoint, then picks up the pipeline
+    /// from the phase after the last checkpoint. This avoids re-running
+    /// expensive AI invocations and gate checks that already passed.
+    ///
+    /// Returns `Ok(true)` if resumption was performed, `Ok(false)` if no
+    /// checkpoint was found (caller should run the full pipeline instead).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn resume_task_pipeline(
+        task_store: &TaskStore<'_>,
+        gate_store: &GateStore<'_>,
+        repos_config: &ReposConfig,
+        agents_dir: &Path,
+        registry: &BackendRegistry,
+        roles: Option<&thrum_core::role::RolesConfig>,
+        event_bus: &EventBus,
+        budget: &Arc<Mutex<BudgetTracker>>,
+        subsample: Option<&SubsampleConfig>,
+        mut task: Task,
+        work_dir: Option<&Path>,
+    ) -> Result<bool> {
+        let checkpoint_store = CheckpointStore::new(task_store.db());
+        let checkpoint = match checkpoint_store.get(&task.id)? {
+            Some(cp) => cp,
+            None => return Ok(false), // No checkpoint — cannot resume
+        };
+
+        let base_repo_config = repos_config
+            .get(&task.repo)
+            .context(format!("no config for repo {}", task.repo))?;
+
+        let repo_config = match work_dir {
+            Some(dir) => base_repo_config.with_work_dir(dir.to_path_buf()),
+            None => base_repo_config.clone(),
+        };
+        let repo_config = &repo_config;
+
+        let branch = checkpoint.branch.clone();
+
+        tracing::info!(
+            task_id = %task.id,
+            phase = %checkpoint.completed_phase,
+            branch = %branch,
+            "resuming task from checkpoint"
+        );
+
+        // Ensure the task is in Implementing state for resumption
+        let prev_status = task.status.label().to_string();
+        task.status = TaskStatus::Implementing {
+            branch: branch.clone(),
+            started_at: Utc::now(),
+        };
+        task.updated_at = Utc::now();
+        task_store.update(&task)?;
+        emit_state_change(event_bus, &task, &prev_status, "implementing (resumed)");
+
+        // Verify the branch still exists
+        let git = GitRepo::open(&repo_config.path)?;
+        if let Err(e) = git.create_branch(&branch) {
+            tracing::debug!(
+                error = %e,
+                "branch already exists (expected for resume)"
+            );
+        }
+
+        // Determine what we can skip based on checkpoint phase
+        let gate1_report = if checkpoint.gate1_passed() {
+            tracing::info!(
+                task_id = %task.id,
+                "skipping Gate 1 (already passed in checkpoint)"
+            );
+            checkpoint
+                .gate1_report
+                .clone()
+                .context("checkpoint says gate1 passed but no report found")?
+        } else {
+            // Gate 1 not yet passed — run it
+            tracing::info!("running Gate 1: Quality (resume)");
+            event_bus.emit(EventKind::GateStarted {
+                task_id: task.id.clone(),
+                level: GateLevel::Quality,
+            });
+            let gate1 = run_gate(&GateLevel::Quality, repo_config, subsample, Some(task.id.0))?;
+            gate_store.store(&task.id, &gate1)?;
+            event_bus.emit(EventKind::GateFinished {
+                task_id: task.id.clone(),
+                level: GateLevel::Quality,
+                passed: gate1.passed,
+                duration_secs: gate1.duration_secs,
+            });
+
+            if !gate1.passed {
+                emit_state_change(event_bus, &task, "implementing", "gate1_failed");
+                task.status = TaskStatus::Gate1Failed { report: gate1 };
+                task.updated_at = Utc::now();
+                task_store.update(&task)?;
+                // Remove stale checkpoint on failure
+                remove_checkpoint(&checkpoint_store, &task);
+                return Ok(true);
+            }
+
+            // Save checkpoint after gate1
+            let mut cp = checkpoint.clone();
+            cp.advance_to_gate1(gate1.clone());
+            save_checkpoint(&checkpoint_store, event_bus, &cp);
+
+            gate1
+        };
+
+        let reviewer_output = if checkpoint.review_completed() {
+            tracing::info!(
+                task_id = %task.id,
+                "skipping review (already completed in checkpoint)"
+            );
+            checkpoint.reviewer_output.clone().unwrap_or_default()
+        } else {
+            // Run review
+            let (reviewer, review_budget_usd): (&dyn AiBackend, f64) = if let Some(roles) = roles {
+                let rev_role = roles.reviewer();
+                let budget_usd = rev_role.budget_usd.unwrap_or(1.0);
+                let backend = registry
+                    .resolve_role(&rev_role)
+                    .or_else(|| registry.chat())
+                    .or_else(|| registry.agent())
+                    .context("no backend available for reviewer role")?;
+                (backend, budget_usd)
+            } else {
+                let backend = registry
+                    .chat()
+                    .or_else(|| registry.agent())
+                    .context("no backend available for review")?;
+                (backend, 1.0)
+            };
+
+            let reviewer_prompt_file = agents_dir.join("reviewer.md");
+            let reviewer_system = load_agent_prompt(&reviewer_prompt_file, None)
+                .await
+                .unwrap_or_default();
+
+            let diff = git.diff_summary().unwrap_or_default();
+            let review_request = AiRequest::new(format!(
+                "Review this change for correctness, proof obligations, and style:\n\n{diff}"
+            ))
+            .with_system(reviewer_system);
+
+            let review_result = reviewer.invoke(&review_request).await?;
+            record_invocation_cost(
+                budget,
+                task.id.0,
+                SessionType::Review,
+                &review_result,
+                review_budget_usd,
+            )
+            .await;
+
+            emit_state_change(event_bus, &task, "implementing", "reviewing");
+            task.status = TaskStatus::Reviewing {
+                reviewer_output: review_result.content.clone(),
+            };
+            task.updated_at = Utc::now();
+            task_store.update(&task)?;
+
+            // Save checkpoint after review
+            {
+                let cp_store = CheckpointStore::new(task_store.db());
+                if let Ok(Some(mut cp)) = cp_store.get(&task.id) {
+                    cp.advance_to_review(review_result.content.clone());
+                    save_checkpoint(&cp_store, event_bus, &cp);
+                }
+            }
+
+            review_result.content
+        };
+
+        let gate2_report = if checkpoint.gate2_passed() {
+            tracing::info!(
+                task_id = %task.id,
+                "skipping Gate 2 (already passed in checkpoint)"
+            );
+            checkpoint.gate2_report.clone()
+        } else {
+            // Run Gate 2
+            tracing::info!("running Gate 2: Proof (resume)");
+            event_bus.emit(EventKind::GateStarted {
+                task_id: task.id.clone(),
+                level: GateLevel::Proof,
+            });
+            let gate2 = run_gate(&GateLevel::Proof, repo_config, subsample, Some(task.id.0))?;
+            gate_store.store(&task.id, &gate2)?;
+            event_bus.emit(EventKind::GateFinished {
+                task_id: task.id.clone(),
+                level: GateLevel::Proof,
+                passed: gate2.passed,
+                duration_secs: gate2.duration_secs,
+            });
+
+            if !gate2.passed {
+                emit_state_change(event_bus, &task, "reviewing", "gate2_failed");
+                task.status = TaskStatus::Gate2Failed { report: gate2 };
+                task.updated_at = Utc::now();
+                task_store.update(&task)?;
+                remove_checkpoint(&checkpoint_store, &task);
+                return Ok(true);
+            }
+
+            // Save checkpoint after gate2
+            {
+                let cp_store = CheckpointStore::new(task_store.db());
+                if let Ok(Some(mut cp)) = cp_store.get(&task.id) {
+                    cp.advance_to_gate2(gate2.clone());
+                    save_checkpoint(&cp_store, event_bus, &cp);
+                }
+            }
+
+            Some(gate2)
+        };
+
+        // --- AwaitingApproval ---
+        let diff = git.diff_summary().unwrap_or_default();
+        let summary = CheckpointSummary {
+            diff_summary: diff,
+            reviewer_output,
+            gate1_report,
+            gate2_report,
+        };
+        emit_state_change(event_bus, &task, "reviewing", "awaiting_approval");
+        task.status = TaskStatus::AwaitingApproval { summary };
+        task.updated_at = Utc::now();
+        task_store.update(&task)?;
+
+        // Clean up checkpoint — task state now captures all needed data
+        remove_checkpoint(&checkpoint_store, &task);
+
+        tracing::info!(
+            task_id = %task.id,
+            "resumed task now awaiting approval — use `thrum task approve {}`",
+            task.id.0
+        );
+
+        // Store successful approach as pattern memory
+        {
+            let criteria_summary = if task.acceptance_criteria.is_empty() {
+                String::new()
+            } else {
+                format!(" (criteria: {})", task.acceptance_criteria.join(", "))
+            };
+            let mem = thrum_core::memory::MemoryEntry::new(
+                task.id.clone(),
+                task.repo.clone(),
+                thrum_core::memory::MemoryCategory::Pattern {
+                    pattern_name: "successful_implementation".into(),
+                },
+                format!(
+                    "Task '{}' passed gates and reached approval (resumed){criteria_summary}",
+                    task.title
+                ),
+            );
+            let memory_store = thrum_db::memory_store::MemoryStore::new(task_store.db());
+            let _ = memory_store.store(&mem);
+        }
+
+        Ok(true)
     }
 
     pub fn build_implementation_prompt(task: &Task, branch: &str) -> String {
@@ -1010,6 +1914,214 @@ pub mod pipeline {
                     .collect::<Vec<_>>()
                     .join("\n"),
             )
+        }
+    }
+
+    /// Result of convergence analysis, carrying the strategy and prompt augmentation.
+    struct ConvergenceAugmentation {
+        strategy: thrum_core::convergence::RetryStrategy,
+        prompt: String,
+        repeated_count: u32,
+        max_occurrence: u32,
+    }
+
+    impl ConvergenceAugmentation {
+        fn normal() -> Self {
+            Self {
+                strategy: thrum_core::convergence::RetryStrategy::Normal,
+                prompt: String::new(),
+                repeated_count: 0,
+                max_occurrence: 0,
+            }
+        }
+    }
+
+    /// Record failure signatures from a gate report into the convergence store.
+    ///
+    /// Called when a gate fails. Updates existing records (incrementing occurrence
+    /// count) or creates new ones. This data is read during retry to detect
+    /// convergence.
+    fn record_convergence_failures(
+        db: &redb::Database,
+        task_id: &thrum_core::task::TaskId,
+        report: &thrum_core::task::GateReport,
+    ) {
+        use thrum_core::convergence::{FailureRecord, FailureSignature};
+        use thrum_db::convergence_store::ConvergenceStore;
+
+        let store = ConvergenceStore::new(db);
+        let signatures = FailureSignature::from_gate_report(report);
+
+        for sig in signatures {
+            // Find the stderr for this check
+            let stderr = report
+                .checks
+                .iter()
+                .find(|c| c.name == sig.check_name && !c.passed)
+                .map(|c| c.stderr.chars().take(1000).collect::<String>())
+                .unwrap_or_default();
+
+            match store.get(task_id, &sig.error_hash) {
+                Ok(Some(mut existing)) => {
+                    existing.record_occurrence(stderr);
+                    if let Err(e) = store.store(&existing) {
+                        tracing::warn!(
+                            task_id = %task_id,
+                            error = %e,
+                            "failed to update convergence record"
+                        );
+                    }
+                }
+                Ok(None) => {
+                    let record = FailureRecord::new(task_id.clone(), sig, stderr);
+                    if let Err(e) = store.store(&record) {
+                        tracing::warn!(
+                            task_id = %task_id,
+                            error = %e,
+                            "failed to store convergence record"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        task_id = %task_id,
+                        error = %e,
+                        "failed to query convergence store"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Analyze convergence for a task and produce a strategy-specific prompt augmentation.
+    ///
+    /// Reads historical failure records from the convergence store, compares them
+    /// against the new gate report, and determines the retry strategy. Also emits
+    /// a convergence event when repeated failures are detected.
+    fn analyze_convergence(
+        db: &redb::Database,
+        task_id: &thrum_core::task::TaskId,
+        report: &thrum_core::task::GateReport,
+        event_bus: &EventBus,
+    ) -> ConvergenceAugmentation {
+        use thrum_core::convergence::ConvergenceAnalysis;
+        use thrum_db::convergence_store::ConvergenceStore;
+
+        let store = ConvergenceStore::new(db);
+        let existing_records = match store.get_for_task(task_id) {
+            Ok(records) => records,
+            Err(e) => {
+                tracing::warn!(
+                    task_id = %task_id,
+                    error = %e,
+                    "failed to read convergence history, falling back to normal retry"
+                );
+                return ConvergenceAugmentation::normal();
+            }
+        };
+
+        let analysis = ConvergenceAnalysis::analyze(&existing_records, report);
+        let max_occurrence = analysis
+            .occurrence_counts
+            .values()
+            .copied()
+            .max()
+            .unwrap_or(1);
+
+        if !analysis.repeated_signatures.is_empty() {
+            tracing::info!(
+                task_id = %task_id,
+                strategy = analysis.strategy.label(),
+                repeated_count = analysis.repeated_signatures.len(),
+                max_occurrence,
+                "convergence analysis complete"
+            );
+
+            event_bus.emit(EventKind::TaskConvergenceDetected {
+                task_id: task_id.clone(),
+                strategy: analysis.strategy.label().to_string(),
+                repeated_count: max_occurrence,
+            });
+        }
+
+        let prompt = analysis
+            .strategy
+            .prompt_augmentation(&analysis.repeated_signatures);
+
+        ConvergenceAugmentation {
+            strategy: analysis.strategy,
+            prompt,
+            repeated_count: analysis.repeated_signatures.len() as u32,
+            max_occurrence,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn make_response(exit_code: Option<i32>, content: &str, timed_out: bool) -> AiResponse {
+            AiResponse {
+                content: content.to_string(),
+                model: "test".into(),
+                input_tokens: None,
+                output_tokens: None,
+                timed_out,
+                exit_code,
+                session_id: None,
+            }
+        }
+
+        #[test]
+        fn rate_limit_empty_output_with_error() {
+            let r = make_response(Some(1), "", false);
+            assert!(is_likely_rate_limited(&r));
+        }
+
+        #[test]
+        fn rate_limit_short_output_with_error() {
+            let r = make_response(Some(1), "Error occurred", false);
+            assert!(is_likely_rate_limited(&r));
+        }
+
+        #[test]
+        fn rate_limit_keyword_in_long_output() {
+            let long = "x".repeat(300) + " You've hit your limit for today.";
+            let r = make_response(Some(1), &long, false);
+            assert!(is_likely_rate_limited(&r));
+        }
+
+        #[test]
+        fn rate_limit_429_keyword() {
+            let r = make_response(Some(1), "HTTP 429 Too Many Requests", false);
+            assert!(is_likely_rate_limited(&r));
+        }
+
+        #[test]
+        fn not_rate_limited_on_success() {
+            let r = make_response(Some(0), "", false);
+            assert!(!is_likely_rate_limited(&r));
+        }
+
+        #[test]
+        fn not_rate_limited_on_timeout() {
+            let r = make_response(Some(-1), "", true);
+            assert!(!is_likely_rate_limited(&r));
+        }
+
+        #[test]
+        fn not_rate_limited_long_real_output() {
+            let long = "Implementation complete. ".repeat(50);
+            let r = make_response(Some(1), &long, false);
+            assert!(!is_likely_rate_limited(&r));
+        }
+
+        #[test]
+        fn backoff_schedule() {
+            assert_eq!(RETRY_BACKOFF_SECS[0], 0); // initial (no backoff)
+            assert_eq!(RETRY_BACKOFF_SECS[1], 30); // first retry
+            assert_eq!(RETRY_BACKOFF_SECS[2], 120); // second retry
+            assert_eq!(RETRY_BACKOFF_SECS[3], 300); // third retry
         }
     }
 }

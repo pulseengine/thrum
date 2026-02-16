@@ -3,6 +3,7 @@ mod watch;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use clap::{Parser, Subcommand};
+use redb::ReadableTable;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -96,6 +97,17 @@ enum Commands {
         /// Number of parallel agents (default: 1 = sequential).
         #[arg(long, default_value = "1")]
         agents: usize,
+        /// Also start the A2A/HTTP API server alongside the engine.
+        #[arg(long)]
+        serve: bool,
+        /// Bind address for the API server (requires --serve).
+        #[arg(long, default_value = "127.0.0.1:3000")]
+        bind: String,
+        /// Resume tasks from their last checkpoint instead of starting over.
+        /// When set, the engine detects existing checkpoints and skips
+        /// already-completed gates for in-progress tasks.
+        #[arg(long)]
+        resume: bool,
     },
     /// Manage tasks in the queue.
     Task {
@@ -135,6 +147,11 @@ enum Commands {
     },
     /// Show changelog since last release tag.
     Changelog,
+    /// Inspect and manage agent memory entries.
+    Memory {
+        #[command(subcommand)]
+        action: MemoryAction,
+    },
     /// Live TUI dashboard showing agent activity.
     Watch,
 }
@@ -181,6 +198,36 @@ enum TraceAction {
 }
 
 #[derive(Subcommand)]
+enum MemoryAction {
+    /// List memory entries, optionally filtered by repo or category.
+    List {
+        #[arg(long)]
+        repo: Option<String>,
+        /// Filter by category: error, pattern, decision, context.
+        #[arg(long)]
+        category: Option<String>,
+        #[arg(long, default_value = "20")]
+        limit: usize,
+    },
+    /// Show a single memory entry by ID.
+    Show { id: String },
+    /// Manually trigger decay and pruning of stale entries.
+    Decay {
+        /// Half-life in hours (default: 72).
+        #[arg(long, default_value = "72.0")]
+        half_life: f64,
+        /// Minimum relevance score; entries below this are pruned.
+        #[arg(long, default_value = "0.05")]
+        prune_threshold: f64,
+    },
+    /// Clear all memory entries for a repo (or all repos).
+    Clear {
+        #[arg(long)]
+        repo: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum TaskAction {
     /// Add a new task to the queue.
     Add {
@@ -219,6 +266,24 @@ enum TaskAction {
         #[arg(long)]
         status: String,
     },
+    /// Show checkpoint info for a task (if any).
+    Checkpoint { id: i64 },
+    /// Show stored session ID for a task (used for session continuation on retries).
+    Session { id: i64 },
+    /// Export the full agent conversation transcript for a task.
+    ///
+    /// Calls the agent CLI's export command (e.g., `claude export`) using the
+    /// stored session ID. Output is saved in the traces/ directory alongside
+    /// OTEL trace files.
+    Export {
+        id: i64,
+        /// Output format: "markdown" (default) or "html".
+        #[arg(long, default_value = "markdown")]
+        format: String,
+        /// Override the output path (default: traces/export-TASK-XXXX-{timestamp}.{ext}).
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
 }
 
 #[tokio::main]
@@ -241,17 +306,30 @@ async fn main() -> Result<()> {
     let open_db = || thrum_db::open_db(&cli.db);
 
     match cli.command {
-        Commands::Run { repo, once, agents } => {
+        Commands::Run {
+            repo,
+            once,
+            agents,
+            serve,
+            bind,
+            resume,
+        } => {
             let repo_filter = repo.map(RepoName::new);
             let repos_config = ReposConfig::load(&cli.config)?;
-            if agents > 1 && !once {
+            // Use parallel path when multiple agents OR when --serve is requested
+            // (serve needs Arc<Database> + shared EventBus which only the parallel path provides)
+            if (agents > 1 && !once) || serve {
                 cmd_run_parallel(
                     &cli.db,
                     repos_config,
                     &cli.agents_dir,
                     &cli.pipeline,
                     repo_filter,
-                    agents,
+                    agents.max(1),
+                    serve,
+                    &bind,
+                    &cli.trace_dir,
+                    cli.config.clone(),
                 )
                 .await
             } else {
@@ -263,13 +341,18 @@ async fn main() -> Result<()> {
                     &cli.pipeline,
                     repo_filter,
                     once,
+                    resume,
                 )
                 .await
             }
         }
         Commands::Task { action } => {
             let db = open_db()?;
-            cmd_task(&db, action)
+            cmd_task(&db, action, &cli.trace_dir)
+        }
+        Commands::Memory { action } => {
+            let db = open_db()?;
+            cmd_memory(&db, action)
         }
         Commands::Trace { action } => {
             let db = open_db()?;
@@ -327,6 +410,11 @@ async fn main() -> Result<()> {
 
             let shared_db = Arc::new(db);
             let event_bus = thrum_runner::event_bus::EventBus::new();
+            let conflict_policy = thrum_core::coordination::ConflictPolicy::default();
+            let coordination = thrum_runner::coordination_hub::CoordinationHub::new(
+                event_bus.clone(),
+                conflict_policy,
+            );
 
             let ctx = Arc::new(PipelineContext {
                 db: shared_db,
@@ -345,6 +433,9 @@ async fn main() -> Result<()> {
                     .map(|g| g.steps.clone())
                     .unwrap_or_default(),
                 subsample: pipeline.subsample,
+                worktrees_dir: pipeline.engine.worktrees_dir,
+                coordination,
+                conflict_policy,
             });
 
             watch::run_watch_tui(ctx).await
@@ -400,6 +491,40 @@ struct PipelineConfig {
     /// Test subsampling: run a fraction of tests at Gate 1 for speed.
     #[serde(default)]
     subsample: Option<thrum_core::subsample::SubsampleConfig>,
+    /// Engine concurrency settings.
+    #[serde(default)]
+    engine: EngineToml,
+}
+
+/// Engine concurrency settings from `[engine]` section in pipeline.toml.
+#[derive(serde::Deserialize)]
+struct EngineToml {
+    /// Maximum concurrent agents working on the same repo.
+    ///
+    /// When > 1, each agent gets an isolated git worktree so that multiple
+    /// agents can work concurrently without index conflicts.
+    #[serde(default = "default_per_repo_limit")]
+    per_repo_limit: usize,
+    /// Base directory for git worktrees.
+    #[serde(default = "default_worktrees_dir")]
+    worktrees_dir: PathBuf,
+}
+
+fn default_per_repo_limit() -> usize {
+    1
+}
+
+fn default_worktrees_dir() -> PathBuf {
+    PathBuf::from("worktrees")
+}
+
+impl Default for EngineToml {
+    fn default() -> Self {
+        Self {
+            per_repo_limit: default_per_repo_limit(),
+            worktrees_dir: default_worktrees_dir(),
+        }
+    }
 }
 
 /// Budget configuration from [budget] section in pipeline.toml.
@@ -596,6 +721,7 @@ fn check_repos_advanced(db: &redb::Database, repos_config: &ReposConfig) {
 ///
 /// Re-opens the DB as Arc<Database> because the parallel engine needs owned
 /// shared access across spawned tasks (redb serializes writers internally).
+#[allow(clippy::too_many_arguments)]
 async fn cmd_run_parallel(
     db_path: &Path,
     repos_config: ReposConfig,
@@ -603,6 +729,10 @@ async fn cmd_run_parallel(
     pipeline_config: &Path,
     repo_filter: Option<RepoName>,
     max_agents: usize,
+    serve: bool,
+    bind: &str,
+    trace_dir: &Path,
+    config_path: PathBuf,
 ) -> Result<()> {
     let pipeline = PipelineConfig::load(pipeline_config)?;
     let registry = build_registry(&pipeline)?;
@@ -641,6 +771,46 @@ async fn cmd_run_parallel(
 
     let event_bus = thrum_runner::event_bus::EventBus::new();
 
+    // Create the cancellation token early so the API server can share it.
+    let shutdown = CancellationToken::new();
+    let shutdown_signal = shutdown.clone();
+
+    // Signal handler for graceful shutdown
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            tracing::info!("received Ctrl+C, initiating graceful shutdown");
+            shutdown_signal.cancel();
+        }
+    });
+
+    // Spawn A2A/HTTP API server if --serve was passed.
+    // Uses the same Arc<Database> to avoid redb exclusive lock conflict.
+    // The API server receives the CancellationToken so it shuts down
+    // when the engine stops, releasing the shared DB lock.
+    if serve {
+        let api_state = Arc::new(thrum_api::ApiState::with_shared_db(
+            shared_db.clone(),
+            trace_dir.to_path_buf(),
+            Some(config_path),
+            event_bus.clone(),
+        ));
+        let bind_addr = bind.to_string();
+        let api_shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            if let Err(e) =
+                thrum_api::serve_with_shutdown(api_state, &bind_addr, api_shutdown).await
+            {
+                tracing::error!(error = %e, "API server failed");
+            }
+        });
+    }
+
+    let per_repo_limit = pipeline.engine.per_repo_limit;
+
+    let conflict_policy = thrum_core::coordination::ConflictPolicy::default();
+    let coordination =
+        thrum_runner::coordination_hub::CoordinationHub::new(event_bus.clone(), conflict_policy);
+
     let ctx = Arc::new(PipelineContext {
         db: shared_db.clone(),
         repos_config: Arc::new(repos_config),
@@ -658,28 +828,26 @@ async fn cmd_run_parallel(
             .map(|g| g.steps.clone())
             .unwrap_or_default(),
         subsample: pipeline.subsample,
+        worktrees_dir: pipeline.engine.worktrees_dir,
+        coordination,
+        conflict_policy,
     });
 
     let config = EngineConfig {
         max_agents,
-        per_repo_limit: 1,
+        per_repo_limit,
         session_budget_usd: None,
         poll_interval: std::time::Duration::from_secs(5),
     };
 
-    let shutdown = CancellationToken::new();
-    let shutdown_clone = shutdown.clone();
-
-    // Signal handler for graceful shutdown
-    tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            tracing::info!("received Ctrl+C, initiating graceful shutdown");
-            shutdown_clone.cancel();
-        }
-    });
+    // Keep a clone to signal the API server after the engine finishes.
+    let final_shutdown = shutdown.clone();
 
     tracing::info!(agents = max_agents, "starting parallel execution engine");
     let result = thrum_runner::parallel::run_parallel(ctx, config, repo_filter, shutdown).await;
+
+    // Signal the API server to shut down (no-op if already cancelled via Ctrl+C).
+    final_shutdown.cancel();
 
     // Persist budget tracker to DB after run completes
     {
@@ -706,6 +874,7 @@ async fn cmd_run(
     pipeline_config: &Path,
     repo_filter: Option<RepoName>,
     once: bool,
+    resume: bool,
 ) -> Result<()> {
     let task_store = TaskStore::new(db);
     let gate_store = GateStore::new(db);
@@ -750,6 +919,8 @@ async fn cmd_run(
             .into_iter()
             .next()
         {
+            // Note: exponential backoff is applied inside retry_task_pipeline
+            // (see RETRY_BACKOFF_SECS). No extra delay needed here.
             tracing::info!(
                 task_id = %task.id,
                 retry = task.retry_count,
@@ -765,6 +936,7 @@ async fn cmd_run(
                 &budget,
                 subsample.as_ref(),
                 task,
+                None, // sequential mode: no worktree
             )
             .await;
             if let Err(e) = result {
@@ -786,6 +958,7 @@ async fn cmd_run(
                 &event_bus,
                 &integration_steps,
                 task,
+                None, // sequential mode: no worktree
             )
             .await;
             match result {
@@ -796,6 +969,72 @@ async fn cmd_run(
                 break;
             }
             continue;
+        }
+
+        // Phase B½: Resume tasks with checkpoints (if --resume flag is set)
+        if resume {
+            let checkpoint_store = thrum_db::checkpoint_store::CheckpointStore::new(db);
+            let checkpoints = checkpoint_store.list().unwrap_or_default();
+            for checkpoint in checkpoints {
+                // Only resume tasks matching the repo filter
+                if let Some(ref filter) = repo_filter
+                    && &checkpoint.repo != filter
+                {
+                    continue;
+                }
+
+                if let Some(task) = task_store.get(&checkpoint.task_id)? {
+                    // Only resume tasks that are in a resumable state
+                    // (implementing or claimed — not already in a gate-failed/merged state)
+                    let resumable = matches!(
+                        task.status,
+                        TaskStatus::Implementing { .. }
+                            | TaskStatus::Claimed { .. }
+                            | TaskStatus::Pending
+                    );
+                    if !resumable {
+                        continue;
+                    }
+
+                    tracing::info!(
+                        task_id = %task.id,
+                        phase = %checkpoint.completed_phase,
+                        "resuming task from checkpoint"
+                    );
+
+                    let result = thrum_runner::parallel::pipeline::resume_task_pipeline(
+                        &task_store,
+                        &gate_store,
+                        repos_config,
+                        agents_dir,
+                        &registry,
+                        None,
+                        &event_bus,
+                        &budget,
+                        subsample.as_ref(),
+                        task,
+                        None,
+                    )
+                    .await;
+
+                    match result {
+                        Ok(true) => {
+                            tracing::info!("resumed task pipeline completed");
+                        }
+                        Ok(false) => {
+                            tracing::debug!("no checkpoint found for resume");
+                        }
+                        Err(e) => {
+                            tracing::error!("resume pipeline failed: {e:#}");
+                        }
+                    }
+
+                    if once {
+                        break;
+                    }
+                    continue;
+                }
+            }
         }
 
         // Phase C: Pick next pending task
@@ -842,6 +1081,7 @@ async fn cmd_run(
             &budget,
             subsample.as_ref(),
             task,
+            None, // sequential mode: no worktree
         )
         .await;
 
@@ -853,6 +1093,13 @@ async fn cmd_run(
         if once {
             break;
         }
+    }
+
+    // Lifecycle: decay and prune stale memory entries after run completes
+    {
+        let memory_store = thrum_db::memory_store::MemoryStore::new(db);
+        let _ = memory_store.decay_all(72.0);
+        let _ = memory_store.prune_below(0.05);
     }
 
     // Persist budget tracker
@@ -1221,7 +1468,7 @@ fn cmd_traces(trace_dir: &Path, action: TracesAction) -> Result<()> {
 
 // ─── Task management ────────────────────────────────────────────────────
 
-fn cmd_task(db: &redb::Database, action: TaskAction) -> Result<()> {
+fn cmd_task(db: &redb::Database, action: TaskAction, trace_dir: &Path) -> Result<()> {
     let store = TaskStore::new(db);
 
     match action {
@@ -1328,6 +1575,231 @@ fn cmd_task(db: &redb::Database, action: TaskAction) -> Result<()> {
                 task.status.label(),
                 task.title
             );
+        }
+        TaskAction::Checkpoint { id } => {
+            let task_id = TaskId(id);
+            let checkpoint_store = thrum_db::checkpoint_store::CheckpointStore::new(db);
+            match checkpoint_store.get(&task_id)? {
+                Some(cp) => {
+                    println!("{}", serde_json::to_string_pretty(&cp)?);
+                }
+                None => {
+                    println!("No checkpoint found for TASK-{id:04}");
+                }
+            }
+        }
+
+        TaskAction::Session { id } => {
+            let task_id = TaskId(id);
+            let session_store = thrum_db::session_store::SessionStore::new(db);
+            match session_store.get(&task_id)? {
+                Some(sid) => {
+                    println!("TASK-{id:04} session ID: {sid}");
+                }
+                None => {
+                    println!("No stored session for TASK-{id:04}");
+                }
+            }
+        }
+
+        TaskAction::Export { id, format, output } => {
+            use thrum_core::session_export::ExportFormat;
+
+            let task_id = TaskId(id);
+            let format: ExportFormat = format.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+
+            // Look up the stored session ID
+            let session_store = thrum_db::session_store::SessionStore::new(db);
+            let session_id = session_store.get(&task_id)?.context(format!(
+                "no stored session for TASK-{id:04}. \
+                     The task may not have been run yet, or the session was cleaned up after merge."
+            ))?;
+
+            println!("Exporting session {session_id} for TASK-{id:04} as {format}...");
+
+            // Run the export (async)
+            let rt = tokio::runtime::Handle::current();
+            let export_dir = output
+                .as_deref()
+                .map(|p| p.parent().unwrap_or(trace_dir))
+                .unwrap_or(trace_dir);
+
+            let result = rt.block_on(thrum_runner::session_export::export_session(
+                &session_id,
+                id,
+                format,
+                export_dir,
+                None, // auto-detect backend
+            ))?;
+
+            // If a custom output path was specified, rename the file
+            if let Some(ref custom_path) = output {
+                std::fs::rename(&result.path, custom_path).context(format!(
+                    "failed to move export to {}",
+                    custom_path.display()
+                ))?;
+                println!(
+                    "Exported TASK-{id:04} session to {} ({} bytes)",
+                    custom_path.display(),
+                    result.size_bytes
+                );
+            } else {
+                println!(
+                    "Exported TASK-{id:04} session to {} ({} bytes)",
+                    result.path.display(),
+                    result.size_bytes
+                );
+            }
+
+            // Also list any previous exports for this task
+            let existing = thrum_runner::session_export::list_exports(trace_dir, id)?;
+            if existing.len() > 1 {
+                println!(
+                    "\n{} total export(s) for TASK-{id:04} in {}:",
+                    existing.len(),
+                    trace_dir.display()
+                );
+                for path in &existing {
+                    println!(
+                        "  {}",
+                        path.file_name().unwrap_or_default().to_string_lossy()
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn cmd_memory(db: &redb::Database, action: MemoryAction) -> Result<()> {
+    use thrum_db::memory_store::MemoryStore;
+
+    let store = MemoryStore::new(db);
+
+    match action {
+        MemoryAction::List {
+            repo,
+            category,
+            limit,
+        } => {
+            let entries = if let Some(ref repo_name) = repo {
+                let rn = RepoName::new(repo_name);
+                if category.as_deref() == Some("error") {
+                    store.query_errors_for_repo(&rn, limit)?
+                } else {
+                    let mut all = store.query_for_task(&rn, limit)?;
+                    if let Some(ref cat) = category {
+                        all.retain(|e| e.category.label() == cat.as_str());
+                    }
+                    all
+                }
+            } else {
+                // No repo filter: query all entries (use a high limit, then filter)
+                // MemoryStore doesn't have a "list all" — iterate manually
+                let read_txn = db.begin_read()?;
+                let table = read_txn.open_table(thrum_db::memory_store::MEMORY_TABLE)?;
+                let mut entries = Vec::new();
+                for item in table.iter()? {
+                    let (_, value) = item?;
+                    let entry: thrum_core::memory::MemoryEntry =
+                        serde_json::from_str(value.value())?;
+                    if let Some(ref cat) = category
+                        && entry.category.label() != cat.as_str()
+                    {
+                        continue;
+                    }
+                    entries.push(entry);
+                }
+                entries.sort_by(|a, b| {
+                    b.relevance_score
+                        .partial_cmp(&a.relevance_score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                entries.truncate(limit);
+                entries
+            };
+
+            if entries.is_empty() {
+                println!("No memory entries found.");
+            } else {
+                println!(
+                    "{:<18} {:<10} {:<10} {:<8} {:<6} CONTENT",
+                    "ID", "REPO", "CATEGORY", "SCORE", "HITS"
+                );
+                println!("{}", "-".repeat(80));
+                for e in &entries {
+                    println!(
+                        "{:<18} {:<10} {:<10} {:<8.3} {:<6} {}",
+                        &e.id.0[..16.min(e.id.0.len())],
+                        e.repo,
+                        e.category.label(),
+                        e.relevance_score,
+                        e.access_count,
+                        e.content.chars().take(50).collect::<String>(),
+                    );
+                }
+                println!("\n({} entries)", entries.len());
+            }
+        }
+        MemoryAction::Show { id } => {
+            let memory_id = thrum_core::memory::MemoryId(id);
+            match store.get(&memory_id)? {
+                Some(entry) => {
+                    println!("{}", serde_json::to_string_pretty(&entry)?);
+                }
+                None => {
+                    println!("Memory entry not found: {}", memory_id);
+                }
+            }
+        }
+        MemoryAction::Decay {
+            half_life,
+            prune_threshold,
+        } => {
+            let decayed = store.decay_all(half_life)?;
+            let pruned = store.prune_below(prune_threshold)?;
+            println!(
+                "Decayed {decayed} entries (half-life: {half_life}h), pruned {pruned} below {prune_threshold}"
+            );
+        }
+        MemoryAction::Clear { repo } => {
+            if let Some(ref repo_name) = repo {
+                let rn = RepoName::new(repo_name);
+                // Get all entries for this repo, then remove them
+                let entries = store.query_for_task(&rn, usize::MAX)?;
+                let write_txn = db.begin_write()?;
+                {
+                    let mut table = write_txn.open_table(thrum_db::memory_store::MEMORY_TABLE)?;
+                    for entry in &entries {
+                        table.remove(entry.id.0.as_str())?;
+                    }
+                }
+                write_txn.commit()?;
+                println!(
+                    "Cleared {} memory entries for repo '{repo_name}'",
+                    entries.len()
+                );
+            } else {
+                // Clear all entries
+                let write_txn = db.begin_write()?;
+                {
+                    let mut table = write_txn.open_table(thrum_db::memory_store::MEMORY_TABLE)?;
+                    let keys: Vec<String> = table
+                        .iter()?
+                        .map(|item| {
+                            let (key, _) = item.unwrap();
+                            key.value().to_string()
+                        })
+                        .collect();
+                    let count = keys.len();
+                    for key in &keys {
+                        table.remove(key.as_str())?;
+                    }
+                    println!("Cleared {count} memory entries");
+                }
+                write_txn.commit()?;
+            }
         }
     }
 
