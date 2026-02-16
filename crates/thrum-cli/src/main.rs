@@ -919,6 +919,8 @@ async fn cmd_run(
             .into_iter()
             .next()
         {
+            // Note: exponential backoff is applied inside retry_task_pipeline
+            // (see RETRY_BACKOFF_SECS). No extra delay needed here.
             tracing::info!(
                 task_id = %task.id,
                 retry = task.retry_count,

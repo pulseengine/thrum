@@ -614,8 +614,8 @@ async fn tasks_partial(State(state): State<Arc<ApiState>>) -> Result<Html<String
 
     let mut html = String::with_capacity(4096);
 
-    // Action result banner
-    html.push_str("<div id=\"task-action-result\"></div>");
+    // Note: #task-action-result lives in the static HTML (dashboard.html)
+    // OUTSIDE the morphed container, so action results persist across morph cycles.
 
     // Bulk approve bar for awaiting-approval tasks
     let awaiting: Vec<_> = tasks.iter().filter(|t| t.status.needs_human()).collect();

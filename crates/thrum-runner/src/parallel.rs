@@ -132,6 +132,11 @@ pub async fn run_parallel(
         ),
     });
 
+    // Recover stuck tasks from a previous engine run.
+    // Tasks in "claimed", "implementing", or "integrating" state with no
+    // corresponding agent are orphaned — reset them to a dispatchable state.
+    recover_stuck_tasks(&ctx.db, &ctx.event_bus)?;
+
     loop {
         if shutdown.is_cancelled() {
             tracing::info!("shutdown requested, stopping dispatch");
@@ -539,6 +544,71 @@ async fn run_agent_task(
     result
 }
 
+/// Recover tasks stuck in transient states from a previous engine run.
+///
+/// On engine startup, any tasks in "claimed", "implementing", or "integrating"
+/// state are orphaned (their agent is no longer running). This function resets
+/// them to a re-dispatchable state so they don't stay stuck forever.
+fn recover_stuck_tasks(db: &redb::Database, event_bus: &crate::event_bus::EventBus) -> Result<()> {
+    let task_store = TaskStore::new(db);
+    let all_tasks = task_store.list(None, None)?;
+    let mut recovered = 0;
+
+    for mut task in all_tasks {
+        let reset_to = match &task.status {
+            thrum_core::task::TaskStatus::Claimed { .. }
+            | thrum_core::task::TaskStatus::Implementing { .. } => {
+                // Agent was working on this but the engine stopped.
+                // Reset to Pending so it gets re-dispatched.
+                Some(thrum_core::task::TaskStatus::Pending)
+            }
+            thrum_core::task::TaskStatus::Integrating => {
+                // Post-approval integration was in progress.
+                // Reset to Approved so it re-enters the integration path.
+                Some(thrum_core::task::TaskStatus::Approved)
+            }
+            thrum_core::task::TaskStatus::Reviewing { .. } => {
+                // Review was in progress — implementation is done, just re-run review.
+                // Reset to Pending to run the full pipeline again (safe, gates will catch issues).
+                Some(thrum_core::task::TaskStatus::Pending)
+            }
+            _ => None,
+        };
+
+        if let Some(new_status) = reset_to {
+            let old_label = task.status.label().to_string();
+            let new_label = new_status.label();
+            tracing::warn!(
+                task_id = %task.id,
+                from = old_label,
+                to = new_label,
+                "recovering stuck task from previous engine run"
+            );
+            task.status = new_status;
+            task.updated_at = chrono::Utc::now();
+            task_store.update(&task)?;
+            recovered += 1;
+
+            event_bus.emit(EventKind::TaskStateChange {
+                task_id: task.id.clone(),
+                repo: task.repo.clone(),
+                from: old_label,
+                to: task.status.label().to_string(),
+            });
+        }
+    }
+
+    if recovered > 0 {
+        tracing::info!(count = recovered, "recovered stuck tasks");
+        event_bus.emit(EventKind::EngineLog {
+            level: thrum_core::event::LogLevel::Info,
+            message: format!("recovered {recovered} stuck tasks from previous run"),
+        });
+    }
+
+    Ok(())
+}
+
 /// Pipeline functions extracted for sharing between sequential and parallel paths.
 pub mod pipeline {
     use crate::backend::{AiBackend, AiRequest, AiResponse, BackendRegistry};
@@ -561,6 +631,45 @@ pub mod pipeline {
     use thrum_db::session_store::SessionStore;
     use thrum_db::task_store::TaskStore;
     use tokio::sync::Mutex;
+
+    /// Base backoff delay (seconds) for the first retry. Scales exponentially.
+    /// retry 1: 30s, retry 2: 120s, retry 3+: 300s
+    const RETRY_BACKOFF_SECS: [u64; 4] = [0, 30, 120, 300];
+
+    /// Extra cooldown (seconds) when a rate limit is detected.
+    const RATE_LIMIT_COOLDOWN_SECS: u64 = 300;
+
+    /// Check if an agent invocation result looks like an API rate limit.
+    ///
+    /// Heuristics:
+    /// - Non-zero exit code (not timeout)
+    /// - Content is empty/very short OR contains rate-limit keywords
+    fn is_likely_rate_limited(result: &AiResponse) -> bool {
+        let failed = result.exit_code.is_some_and(|c| c != 0) && !result.timed_out;
+        if !failed {
+            return false;
+        }
+
+        let content_lower = result.content.to_lowercase();
+        let rate_limit_patterns = [
+            "rate limit",
+            "usage limit",
+            "hit your limit",
+            "too many requests",
+            "429",
+            "quota exceeded",
+            "overloaded",
+        ];
+
+        // Very short output with error exit is suspicious
+        if result.content.len() < 200 {
+            return true;
+        }
+
+        rate_limit_patterns
+            .iter()
+            .any(|p| content_lower.contains(p))
+    }
 
     /// Emit a task state change event.
     fn emit_state_change(event_bus: &EventBus, task: &Task, from: &str, to: &str) {
@@ -819,6 +928,31 @@ pub mod pipeline {
                 exit_code = ?result.exit_code,
                 "implementation session had issues"
             );
+        }
+
+        // Detect API rate limit early. If the agent hit a usage limit, cool down
+        // before failing. This gives the limit time to reset and prevents the
+        // retry from immediately hitting the same wall.
+        if is_likely_rate_limited(&result) {
+            tracing::warn!(
+                task_id = %task.id,
+                exit_code = ?result.exit_code,
+                content_len = result.content.len(),
+                "API rate limit likely hit — cooling down for {}s",
+                RATE_LIMIT_COOLDOWN_SECS
+            );
+            event_bus.emit(EventKind::EngineLog {
+                level: thrum_core::event::LogLevel::Warn,
+                message: format!(
+                    "TASK-{:04} rate limit detected (exit {:?}, {}B output). \
+                     Cooling down {}s before marking as failed.",
+                    task.id.0,
+                    result.exit_code,
+                    result.content.len(),
+                    RATE_LIMIT_COOLDOWN_SECS,
+                ),
+            });
+            tokio::time::sleep(std::time::Duration::from_secs(RATE_LIMIT_COOLDOWN_SECS)).await;
         }
 
         // Check if the implementation actually produced any changes.
@@ -1417,6 +1551,29 @@ pub mod pipeline {
             "retrying with convergence-aware strategy"
         );
 
+        // Exponential backoff: wait before retrying to avoid rapid churn.
+        // This prevents burning through all retries in seconds when hitting
+        // rate limits or transient API errors.
+        {
+            let backoff_secs = RETRY_BACKOFF_SECS[task.retry_count.min(3) as usize];
+            if backoff_secs > 0 {
+                tracing::info!(
+                    task_id = %task.id,
+                    retry = task.retry_count,
+                    backoff_secs,
+                    "applying exponential backoff before retry"
+                );
+                event_bus.emit(EventKind::EngineLog {
+                    level: thrum_core::event::LogLevel::Info,
+                    message: format!(
+                        "TASK-{:04} retry {}/{}: backing off {}s before next attempt",
+                        task.id.0, task.retry_count, MAX_RETRIES, backoff_secs
+                    ),
+                });
+                tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+            }
+        }
+
         // Query failure-specific memories for context-aware retries.
         // These are error-category memories from the same repo, surfacing
         // patterns like "cargo fmt failed" or "proof obligation missing"
@@ -1896,6 +2053,75 @@ pub mod pipeline {
             prompt,
             repeated_count: analysis.repeated_signatures.len() as u32,
             max_occurrence,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn make_response(exit_code: Option<i32>, content: &str, timed_out: bool) -> AiResponse {
+            AiResponse {
+                content: content.to_string(),
+                model: "test".into(),
+                input_tokens: None,
+                output_tokens: None,
+                timed_out,
+                exit_code,
+                session_id: None,
+            }
+        }
+
+        #[test]
+        fn rate_limit_empty_output_with_error() {
+            let r = make_response(Some(1), "", false);
+            assert!(is_likely_rate_limited(&r));
+        }
+
+        #[test]
+        fn rate_limit_short_output_with_error() {
+            let r = make_response(Some(1), "Error occurred", false);
+            assert!(is_likely_rate_limited(&r));
+        }
+
+        #[test]
+        fn rate_limit_keyword_in_long_output() {
+            let long = "x".repeat(300) + " You've hit your limit for today.";
+            let r = make_response(Some(1), &long, false);
+            assert!(is_likely_rate_limited(&r));
+        }
+
+        #[test]
+        fn rate_limit_429_keyword() {
+            let r = make_response(Some(1), "HTTP 429 Too Many Requests", false);
+            assert!(is_likely_rate_limited(&r));
+        }
+
+        #[test]
+        fn not_rate_limited_on_success() {
+            let r = make_response(Some(0), "", false);
+            assert!(!is_likely_rate_limited(&r));
+        }
+
+        #[test]
+        fn not_rate_limited_on_timeout() {
+            let r = make_response(Some(-1), "", true);
+            assert!(!is_likely_rate_limited(&r));
+        }
+
+        #[test]
+        fn not_rate_limited_long_real_output() {
+            let long = "Implementation complete. ".repeat(50);
+            let r = make_response(Some(1), &long, false);
+            assert!(!is_likely_rate_limited(&r));
+        }
+
+        #[test]
+        fn backoff_schedule() {
+            assert_eq!(RETRY_BACKOFF_SECS[0], 0); // initial (no backoff)
+            assert_eq!(RETRY_BACKOFF_SECS[1], 30); // first retry
+            assert_eq!(RETRY_BACKOFF_SECS[2], 120); // second retry
+            assert_eq!(RETRY_BACKOFF_SECS[3], 300); // third retry
         }
     }
 }

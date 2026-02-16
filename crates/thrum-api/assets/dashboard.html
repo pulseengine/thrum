@@ -40,6 +40,8 @@
         <!-- Task Queue — polls every 15s, morph preserves dropdowns/checkboxes -->
         <div class="section">
             <h2>Task Queue</h2>
+            <!-- Action result lives OUTSIDE the morphed container so morph cycles don't clear it -->
+            <div id="task-action-result"></div>
             <div id="task-table"
                  hx-get="/dashboard/partials/tasks"
                  hx-trigger="load, every 15s, refreshNow"
@@ -395,6 +397,19 @@
         }
         log.scrollTop = log.scrollHeight;
     }
+
+    // ── Auto-clear action results after 5s ──────────────────────
+    document.body.addEventListener('htmx:afterSwap', function(event) {
+        if (event.detail.target.id === 'task-action-result') {
+            setTimeout(function() {
+                var el = document.getElementById('task-action-result');
+                if (el) el.innerHTML = '';
+            }, 5000);
+            // Also refresh the task table to reflect the change
+            htmx.trigger(document.getElementById('task-table'), 'refreshNow');
+            htmx.trigger(document.getElementById('status-counts'), 'refreshNow');
+        }
+    });
 
     // ── Helpers ─────────────────────────────────────────────────
     function cssId(s) {
