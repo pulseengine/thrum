@@ -625,6 +625,26 @@ header .version {
     font-size: 11px;
 }
 
+.btn-retry {
+    background: transparent;
+    color: var(--amber);
+    border: 1px solid var(--amber);
+}
+
+.btn-retry:hover {
+    background: var(--amber);
+    color: var(--bg);
+}
+
+.retry-exhausted {
+    color: var(--red);
+    font-weight: 600;
+}
+
+.retry-warn {
+    color: var(--amber);
+}
+
 .input-sm {
     background: var(--surface-raised);
     color: var(--text);

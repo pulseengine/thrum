@@ -825,6 +825,10 @@ pub mod pipeline {
         // If the branch has no commits beyond main, the agent returned empty
         // (e.g., due to rate limits, API errors, or permission issues).
         // Fail early instead of passing an empty diff through gates.
+        //
+        // IMPORTANT: default to has_changes=true on ANY error. It's better to
+        // run gates on unchanged code than to silently discard real agent work.
+        // Git status can fail due to index lock contention between concurrent agents.
         let work_dir = repo_config.path.join(format!(
             "worktrees/{}",
             task.branch_name().replace('/', "_")
@@ -832,17 +836,66 @@ pub mod pipeline {
         let has_changes = if work_dir.exists() {
             match crate::git::GitRepo::open(&work_dir) {
                 Ok(g) => {
-                    let dirty = !g.is_clean().unwrap_or(true);
-                    let commits = g.has_commits_beyond_main().unwrap_or(false);
+                    // Retry once after a short delay if git status fails
+                    // (transient index lock from concurrent agents).
+                    let clean_result = g.is_clean().or_else(|e| {
+                        tracing::warn!(
+                            task_id = %task.id,
+                            error = %e,
+                            "git status failed, retrying after 1s (likely index lock)"
+                        );
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                        g.is_clean()
+                    });
+                    let dirty = match clean_result {
+                        Ok(clean) => !clean,
+                        Err(e) => {
+                            tracing::error!(
+                                task_id = %task.id,
+                                error = %e,
+                                "git status failed twice — assuming dirty (fail-safe)"
+                            );
+                            true // fail-safe: assume dirty
+                        }
+                    };
+                    let commits = match g.has_commits_beyond_main() {
+                        Ok(v) => v,
+                        Err(e) => {
+                            tracing::warn!(
+                                task_id = %task.id,
+                                error = %e,
+                                "has_commits_beyond_main failed — ignoring (dirty check is primary)"
+                            );
+                            false
+                        }
+                    };
                     dirty || commits
                 }
-                Err(_) => false,
+                Err(e) => {
+                    tracing::error!(
+                        task_id = %task.id,
+                        error = %e,
+                        work_dir = %work_dir.display(),
+                        "failed to open worktree git repo — assuming has changes (fail-safe)"
+                    );
+                    true // fail-safe: assume changes exist
+                }
             }
         } else {
             // Fallback: check if branch has commits beyond main in main repo
-            crate::git::GitRepo::open(&repo_config.path)
+            match crate::git::GitRepo::open(&repo_config.path)
                 .and_then(|g| g.branch_has_commits_beyond_main(&task.branch_name()))
-                .unwrap_or(false)
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        task_id = %task.id,
+                        error = %e,
+                        "branch_has_commits_beyond_main failed — assuming no changes"
+                    );
+                    false
+                }
+            }
         };
 
         if !has_changes {

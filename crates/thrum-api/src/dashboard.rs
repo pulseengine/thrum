@@ -60,6 +60,7 @@ pub fn dashboard_router() -> Router<Arc<ApiState>> {
         .route("/dashboard/tasks/{id}/edit", post(edit_task_action))
         .route("/dashboard/tasks/{id}/status", post(set_status_action))
         .route("/dashboard/tasks/{id}/delete", post(delete_task_action))
+        .route("/dashboard/tasks/{id}/retry", post(retry_task_action))
         .route("/dashboard/tasks/bulk-approve", post(bulk_approve_action))
         .route("/dashboard/tasks/{id}/review", get(review_page))
         .route(
@@ -1077,6 +1078,26 @@ async fn delete_task_action(
     }
 }
 
+async fn retry_task_action(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<i64>,
+) -> Result<Html<String>, DashboardError> {
+    let db = state.db();
+    let store = TaskStore::new(db);
+    let mut task = store
+        .get(&TaskId(id))?
+        .ok_or_else(|| DashboardError(format!("task {id} not found")))?;
+    let old_status = task.status.label().to_string();
+    task.retry_count = 0;
+    task.status = TaskStatus::Pending;
+    task.updated_at = Utc::now();
+    store.update(&task)?;
+    Ok(Html(format!(
+        "<div class=\"action-result success\">\
+         TASK-{id:04} reset for retry (was {old_status}, retries cleared)</div>"
+    )))
+}
+
 #[derive(Deserialize)]
 struct BulkApproveForm {
     #[serde(default)]
@@ -1345,7 +1366,25 @@ fn render_task_row_into(buf: &mut String, task: &thrum_core::task::Task) {
     let repo = escape_html(&task.repo.to_string());
     let title = escape_html(&task.title);
     let retries = task.retry_count;
+    let max_retries = thrum_core::task::MAX_RETRIES;
+    let exhausted = retries >= max_retries;
     let timeline = render_inline_timeline(&task.status);
+
+    let is_failed = matches!(
+        task.status,
+        TaskStatus::Gate1Failed { .. }
+            | TaskStatus::Gate2Failed { .. }
+            | TaskStatus::Gate3Failed { .. }
+            | TaskStatus::Rejected { .. }
+    );
+
+    let retry_class = if exhausted && is_failed {
+        "retry-exhausted"
+    } else if retries > 0 {
+        "retry-warn"
+    } else {
+        ""
+    };
 
     let _ = write!(
         buf,
@@ -1355,7 +1394,8 @@ fn render_task_row_into(buf: &mut String, task: &thrum_core::task::Task) {
          <td>{title}</td>\
          <td><span class=\"badge badge-{label}\">{label}</span></td>\
          <td><div class=\"timeline\">{timeline}</div></td>\
-         <td>{retries}</td>\
+         <td><span class=\"{retry_class}\" title=\"{retries} of {max_retries} retries used\">\
+         {retries}/{max_retries}</span></td>\
          <td><div class=\"actions\">",
     );
 
@@ -1364,6 +1404,18 @@ fn render_task_row_into(buf: &mut String, task: &thrum_core::task::Task) {
         let _ = write!(
             buf,
             "<a href=\"/dashboard/tasks/{id}/review\" class=\"btn btn-approve btn-sm\">Review</a>",
+        );
+    }
+
+    // Retry button for failed/rejected tasks
+    if is_failed {
+        let _ = write!(
+            buf,
+            "<button class=\"btn btn-retry btn-sm\" \
+             hx-post=\"/dashboard/tasks/{id}/retry\" \
+             hx-target=\"#task-action-result\" \
+             hx-swap=\"innerHTML\" \
+             title=\"Reset to pending and clear retry count\">\u{21bb} Retry</button>",
         );
     }
 

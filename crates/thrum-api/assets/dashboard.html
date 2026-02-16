@@ -8,8 +8,9 @@
     <script src="https://unpkg.com/htmx.org@2.0.4"
             integrity="sha384-HGfztofotfshcF7+8n44JQL2oJmowVChPTg48S+jvZoztPfvwD79OC/LTtG6dMp+"
             crossorigin="anonymous"></script>
+    <script src="https://unpkg.com/idiomorph@0.3.0/dist/idiomorph-ext.min.js"></script>
 </head>
-<body>
+<body hx-ext="morph">
     <div class="container">
         <header>
             <h1>thrum</h1>
@@ -20,26 +21,29 @@
             </div>
         </header>
 
-        <!-- Budget Usage — polls every 10s -->
+        <!-- Budget Usage — polls every 15s, morph preserves form state -->
         <div id="budget-bar"
              hx-get="/dashboard/partials/budget"
-             hx-trigger="load, every 10s"
+             hx-trigger="load, every 15s"
+             hx-swap="morph:innerHTML"
              hx-indicator="#poll-indicator">
         </div>
 
-        <!-- Status Counts — polls every 5s -->
+        <!-- Status Counts — polls every 10s -->
         <div id="status-counts"
              hx-get="/dashboard/partials/status"
-             hx-trigger="load, every 5s"
+             hx-trigger="load, every 10s, refreshNow"
+             hx-swap="morph:innerHTML"
              hx-indicator="#poll-indicator">
         </div>
 
-        <!-- Task Queue — polls every 5s, clickable rows -->
+        <!-- Task Queue — polls every 15s, morph preserves dropdowns/checkboxes -->
         <div class="section">
             <h2>Task Queue</h2>
             <div id="task-table"
                  hx-get="/dashboard/partials/tasks"
-                 hx-trigger="load, every 5s"
+                 hx-trigger="load, every 15s, refreshNow"
+                 hx-swap="morph:innerHTML"
                  hx-indicator="#poll-indicator">
             </div>
         </div>
@@ -52,12 +56,13 @@
             </div>
         </div>
 
-        <!-- Memory Entries — polls on demand -->
+        <!-- Memory Entries — polls every 30s, morph preserves form inputs -->
         <div class="section">
             <h2>Memory</h2>
             <div id="memory-section"
                  hx-get="/dashboard/partials/memory"
-                 hx-trigger="load, every 15s"
+                 hx-trigger="load, every 30s"
+                 hx-swap="morph:innerHTML"
                  hx-indicator="#poll-indicator">
             </div>
         </div>
@@ -67,7 +72,8 @@
             <h2>Activity Log</h2>
             <div id="activity-log"
                  hx-get="/dashboard/partials/activity"
-                 hx-trigger="load, every 5s"
+                 hx-trigger="load, every 10s"
+                 hx-swap="morph:innerHTML"
                  hx-indicator="#poll-indicator">
             </div>
             <div id="event-log" class="event-log"></div>
@@ -177,6 +183,9 @@
                 }
             }
             appendLog('info', d.task_id + ' (' + d.repo + '): ' + d.from + ' \u2192 ' + d.to);
+            // Refresh task table and status counts immediately on state change
+            htmx.trigger(document.getElementById('task-table'), 'refreshNow');
+            htmx.trigger(document.getElementById('status-counts'), 'refreshNow');
         }
         else if (kind.GateStarted) {
             var d = kind.GateStarted;
