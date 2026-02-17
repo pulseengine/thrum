@@ -4,7 +4,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt;
 
 /// Maximum number of automatic retries before requiring human intervention.
-pub const MAX_RETRIES: u32 = 3;
+pub const MAX_RETRIES: u32 = 10;
 
 /// Unique task identifier.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]

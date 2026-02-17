@@ -11,7 +11,7 @@
 [engine]
 per_repo_limit = 3
 worktrees_dir = "worktrees"
-max_retries = 3  # Reset via dashboard retry button to give a task another round
+max_retries = 10  # Reset via dashboard retry button to give a task another round
 
 # ── Gate 1: Code Quality ──────────────────────────────────────────────
 # Runs fmt, clippy, and test checks against each repo.
