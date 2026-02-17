@@ -1119,7 +1119,10 @@ pub mod pipeline {
             "\n\nIMPORTANT: You are running inside an isolated git worktree. \
              Your current working directory IS the repo root — all files are here. \
              Do NOT navigate to any other directory or absolute path. \
-             Stay in your current working directory for all operations."
+             Stay in your current working directory for all operations.\
+             \n\nCRITICAL: Before you finish, you MUST commit your work with \
+             `git add -A && git commit --no-verify -m \"your message\"`. \
+             If you do not commit, ALL your work will be lost."
         } else {
             ""
         };

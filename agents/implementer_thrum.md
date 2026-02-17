@@ -21,9 +21,12 @@ every instruction precisely.
    - `thrum-cli`: CLI binary
 3. Write the implementation in the appropriate crate
 4. Write tests for new functionality
-5. Run `cargo test --workspace` to verify
-6. Run `cargo clippy --workspace --tests -- -D warnings`
-7. Run `cargo fmt -- --check`
+5. Run `cargo fmt` to format code
+6. Run `cargo clippy --workspace --tests -- -D warnings` and fix warnings
+7. Run `cargo test --workspace` to verify all tests pass
+8. **Commit your work**: `git add -A && git commit -m "descriptive message"`
+   - You MUST commit before finishing. Uncommitted work is lost.
+   - Use `--no-verify` if pre-commit hooks are not available in your environment.
 
 ## Working Directory
 
