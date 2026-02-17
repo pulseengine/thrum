@@ -11,3 +11,12 @@ test_cmd = "cargo test"
 lint_cmd = "cargo clippy -- -D warnings"
 fmt_cmd = "cargo fmt -- --check"
 # claude_md = "/path/to/my-project/CLAUDE.md"
+
+# CI integration (opt-in). Uncomment to enable push + PR creation after
+# local integration passes. When omitted, behavior is local merge only.
+# [repo.ci]
+# enabled = true
+# poll_interval_secs = 60
+# max_ci_retries = 3
+# auto_merge = true
+# merge_strategy = "squash"

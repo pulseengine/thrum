@@ -1469,6 +1469,41 @@ fn render_task_row_into(buf: &mut String, task: &thrum_core::task::Task) {
          <td><div class=\"actions\">",
     );
 
+    // PR link for AwaitingCI and CIFailed tasks
+    match &task.status {
+        TaskStatus::AwaitingCI {
+            pr_number,
+            pr_url,
+            ci_attempts,
+            ..
+        } => {
+            let url = escape_html(pr_url);
+            let _ = write!(
+                buf,
+                "<a href=\"{url}\" target=\"_blank\" rel=\"noopener\" \
+                 class=\"btn btn-pr btn-sm\" \
+                 title=\"PR #{pr_number} (CI attempt {ci_attempts})\">\
+                 PR #{pr_number}</a>",
+            );
+        }
+        TaskStatus::CIFailed {
+            pr_number,
+            pr_url,
+            ci_attempts,
+            ..
+        } => {
+            let url = escape_html(pr_url);
+            let _ = write!(
+                buf,
+                "<a href=\"{url}\" target=\"_blank\" rel=\"noopener\" \
+                 class=\"btn btn-pr btn-sm\" \
+                 title=\"PR #{pr_number} (CI failed after {ci_attempts} attempts)\">\
+                 PR #{pr_number}</a>",
+            );
+        }
+        _ => {}
+    }
+
     // Review link for AwaitingApproval tasks
     if task.status.needs_human() {
         let _ = write!(

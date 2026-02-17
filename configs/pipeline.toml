@@ -185,10 +185,10 @@ timeout_secs = 600
 #   "docker"    — Docker container isolation
 
 [sandbox]
-backend = "observe"
+backend = "os-native"
 memory_limit_mb = 4096
 cpu_limit = 2.0
-network = false
+network = true
 
 # ── Subsampling ───────────────────────────────────────────────────────
 # Run a fraction of gate checks to speed up iteration.

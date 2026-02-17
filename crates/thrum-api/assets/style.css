@@ -568,6 +568,8 @@ header .version {
 .badge-gate2-failed,
 .badge-gate3-failed      { background: #2a1a1a; color: var(--red); }
 .badge-rejected          { background: #2a1a1a; color: var(--red); border: 1px solid var(--red); }
+.badge-awaiting-ci       { background: #1a2a2a; color: var(--cyan); border: 1px solid var(--cyan); }
+.badge-ci-failed         { background: #2a1a1a; color: var(--red); border: 1px solid var(--red); }
 .badge-normal            { background: #1a2a3a; color: var(--cyan); }
 .badge-expanded-context  { background: #2a2a1a; color: var(--amber); }
 .badge-different-approach { background: #2a1a1a; color: var(--red); }
@@ -633,6 +635,18 @@ header .version {
 
 .btn-retry:hover {
     background: var(--amber);
+    color: var(--bg);
+}
+
+.btn-pr {
+    background: transparent;
+    color: var(--cyan);
+    border: 1px solid var(--cyan);
+    text-decoration: none;
+}
+
+.btn-pr:hover {
+    background: var(--cyan);
     color: var(--bg);
 }
 

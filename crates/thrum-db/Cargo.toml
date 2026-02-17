@@ -18,6 +18,7 @@ tracing = { workspace = true }
 tempfile = "3"
 loom = { workspace = true }
 criterion = { workspace = true }
+toml = { workspace = true }
 
 [[bench]]
 name = "task_store"

@@ -634,4 +634,108 @@ mod tests {
         let s = event.to_string();
         assert!(s.contains("shared[api_version] = v2"));
     }
+
+    #[test]
+    fn ci_polling_started_display() {
+        let event = PipelineEvent::new(EventKind::CIPollingStarted {
+            task_id: TaskId(23),
+            repo: RepoName::new("loom"),
+            pr_number: 42,
+            pr_url: "https://github.com/org/loom/pull/42".into(),
+        });
+        let s = event.to_string();
+        assert!(s.contains("TASK-0023"));
+        assert!(s.contains("CI polling started"));
+        assert!(s.contains("PR #42"));
+    }
+
+    #[test]
+    fn ci_check_update_display() {
+        let event = PipelineEvent::new(EventKind::CICheckUpdate {
+            task_id: TaskId(23),
+            repo: RepoName::new("loom"),
+            pr_number: 42,
+            status: "pending".into(),
+            summary: "2 passed, 0 failed, 1 pending (total: 3)".into(),
+        });
+        let s = event.to_string();
+        assert!(s.contains("TASK-0023"));
+        assert!(s.contains("PR #42"));
+        assert!(s.contains("status=pending"));
+    }
+
+    #[test]
+    fn ci_passed_display() {
+        let event = PipelineEvent::new(EventKind::CIPassed {
+            task_id: TaskId(23),
+            repo: RepoName::new("loom"),
+            pr_number: 42,
+        });
+        let s = event.to_string();
+        assert!(s.contains("TASK-0023"));
+        assert!(s.contains("PR #42 PASSED"));
+    }
+
+    #[test]
+    fn ci_failed_display() {
+        let event = PipelineEvent::new(EventKind::CIFailed {
+            task_id: TaskId(23),
+            repo: RepoName::new("loom"),
+            pr_number: 42,
+            attempt: 2,
+            max_attempts: 3,
+            failure_summary: "test_neon failed".into(),
+        });
+        let s = event.to_string();
+        assert!(s.contains("TASK-0023"));
+        assert!(s.contains("PR #42 FAILED"));
+        assert!(s.contains("attempt 2/3"));
+        assert!(s.contains("test_neon failed"));
+    }
+
+    #[test]
+    fn ci_fix_pushed_display() {
+        let event = PipelineEvent::new(EventKind::CIFixPushed {
+            task_id: TaskId(23),
+            repo: RepoName::new("loom"),
+            pr_number: 42,
+            attempt: 1,
+        });
+        let s = event.to_string();
+        assert!(s.contains("TASK-0023"));
+        assert!(s.contains("CI fix pushed"));
+        assert!(s.contains("PR #42"));
+    }
+
+    #[test]
+    fn ci_escalated_display() {
+        let event = PipelineEvent::new(EventKind::CIEscalated {
+            task_id: TaskId(23),
+            repo: RepoName::new("loom"),
+            pr_number: 42,
+            attempts: 3,
+            failure_summary: "build failed".into(),
+        });
+        let s = event.to_string();
+        assert!(s.contains("TASK-0023"));
+        assert!(s.contains("CI ESCALATED"));
+        assert!(s.contains("PR #42"));
+        assert!(s.contains("3 attempts"));
+    }
+
+    #[test]
+    fn ci_event_serialize_roundtrip() {
+        let event = PipelineEvent::new(EventKind::CIPollingStarted {
+            task_id: TaskId(10),
+            repo: RepoName::new("synth"),
+            pr_number: 99,
+            pr_url: "https://github.com/org/synth/pull/99".into(),
+        });
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: PipelineEvent = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed.kind,
+            EventKind::CIPollingStarted { pr_number: 99, .. }
+        ));
+    }
 }
