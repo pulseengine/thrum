@@ -7,7 +7,7 @@
 //! appends the session flag (e.g., `-s {id}` for OpenCode) to resume context.
 
 use crate::backend::{AiBackend, AiRequest, AiResponse, BackendCapability};
-use crate::subprocess::run_cmd;
+use crate::subprocess::{run_cmd, run_cmd_with_sandbox};
 use anyhow::Result;
 use async_trait::async_trait;
 use std::path::PathBuf;
@@ -105,7 +105,9 @@ impl AiBackend for CliAgentBackend {
             "invoking CLI agent"
         );
 
-        let output = run_cmd(&cmd, cwd, self.timeout).await?;
+        let output =
+            run_cmd_with_sandbox(&cmd, cwd, self.timeout, request.sandbox_profile.as_deref())
+                .await?;
 
         Ok(AiResponse {
             content: output.stdout,

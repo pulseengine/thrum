@@ -494,6 +494,48 @@ async fn run_agent_task(
     // or main repo path (single-agent mode).
     let work_dir = worktree.map(|wt| wt.path.clone());
 
+    // Set up seatbelt sandbox for macOS when sandbox backend is "os-native".
+    // Creates a per-task scratch dir and writes a restrictive seatbelt profile
+    // that limits agent filesystem writes to the worktree + scratch dir.
+    let sandbox_profile = if cfg!(target_os = "macos")
+        && ctx
+            .sandbox_config
+            .as_ref()
+            .is_some_and(|s| s.backend == "os-native")
+    {
+        let effective_dir = work_dir
+            .clone()
+            .or_else(|| ctx.repos_config.get(&task.repo).map(|rc| rc.path.clone()))
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+
+        let task_slug = format!("TASK-{:04}", task.id.0);
+        match crate::sandbox::create_scratch_dir(&ctx.worktrees_dir, &task_slug) {
+            Ok(scratch_dir) => {
+                match crate::sandbox::write_seatbelt_profile(&effective_dir, &scratch_dir) {
+                    Ok(profile) => {
+                        tracing::info!(
+                            task_id = %task.id,
+                            profile = %profile.display(),
+                            scratch = %scratch_dir.display(),
+                            "seatbelt sandbox enabled for agent"
+                        );
+                        Some(profile)
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to write seatbelt profile, running unsandboxed");
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to create scratch dir, running unsandboxed");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Start file watcher for real-time change detection
     let agent_id = AgentId::generate(&task.repo, &task.id);
     let repo_config = ctx.repos_config.get(&task.repo);
@@ -530,6 +572,7 @@ async fn run_agent_task(
                 ctx.subsample.as_ref(),
                 task,
                 work_dir.as_deref(),
+                sandbox_profile.as_deref(),
             )
             .await
         }
@@ -558,6 +601,7 @@ async fn run_agent_task(
                 ctx.subsample.as_ref(),
                 task,
                 work_dir.as_deref(),
+                sandbox_profile.as_deref(),
             )
             .await
         }
@@ -566,6 +610,13 @@ async fn run_agent_task(
     // Stop the file watcher now that the pipeline is done.
     if let Some(w) = watcher {
         w.stop().await;
+    }
+
+    // Clean up the seatbelt profile temp file.
+    if let Some(ref profile) = sandbox_profile
+        && let Err(e) = std::fs::remove_file(profile)
+    {
+        tracing::debug!(error = %e, "seatbelt profile cleanup (non-fatal)");
     }
 
     result
@@ -810,6 +861,7 @@ pub mod pipeline {
         subsample: Option<&SubsampleConfig>,
         mut task: Task,
         work_dir: Option<&Path>,
+        sandbox_profile: Option<&Path>,
     ) -> Result<()> {
         let base_repo_config = repos_config
             .get(&task.repo)
@@ -950,6 +1002,9 @@ pub mod pipeline {
             .with_cwd(repo_config.path.clone());
         if let Some(sid) = resume_sid {
             request = request.with_resume_session(sid);
+        }
+        if let Some(profile) = sandbox_profile {
+            request = request.with_sandbox_profile(profile.to_path_buf());
         }
 
         let result = agent.invoke(&request).await?;
@@ -1574,6 +1629,7 @@ pub mod pipeline {
         subsample: Option<&SubsampleConfig>,
         mut task: Task,
         work_dir: Option<&Path>,
+        sandbox_profile: Option<&Path>,
     ) -> Result<()> {
         use thrum_core::convergence::RetryStrategy;
 
@@ -1727,6 +1783,7 @@ pub mod pipeline {
             subsample,
             task,
             work_dir,
+            sandbox_profile,
         )
         .await
     }

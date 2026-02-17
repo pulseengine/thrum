@@ -62,6 +62,9 @@ pub struct AiRequest {
     /// Session ID from a previous invocation, used to resume the session.
     /// Claude Code uses `--resume {id}`, OpenCode uses `-s {id}`.
     pub resume_session_id: Option<String>,
+    /// Path to a macOS seatbelt profile for sandbox-exec isolation.
+    /// When set, agent subprocesses are wrapped with `sandbox-exec -f <path>`.
+    pub sandbox_profile: Option<PathBuf>,
 }
 
 impl AiRequest {
@@ -73,6 +76,7 @@ impl AiRequest {
             max_tokens: None,
             temperature: None,
             resume_session_id: None,
+            sandbox_profile: None,
         }
     }
 
@@ -93,6 +97,11 @@ impl AiRequest {
 
     pub fn with_resume_session(mut self, session_id: String) -> Self {
         self.resume_session_id = Some(session_id);
+        self
+    }
+
+    pub fn with_sandbox_profile(mut self, profile: PathBuf) -> Self {
+        self.sandbox_profile = Some(profile);
         self
     }
 }

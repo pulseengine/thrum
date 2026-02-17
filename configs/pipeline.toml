@@ -173,7 +173,7 @@ timeout_secs = 300
 # backend: "none" (no isolation), "docker", "nsjail", etc.
 
 [sandbox]
-backend = "none"
+backend = "os-native"
 memory_limit_mb = 4096
 cpu_limit = 2.0
 network = false

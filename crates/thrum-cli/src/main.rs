@@ -937,6 +937,7 @@ async fn cmd_run(
                 subsample.as_ref(),
                 task,
                 None, // sequential mode: no worktree
+                None, // no sandbox in sequential mode
             )
             .await;
             if let Err(e) = result {
@@ -1082,6 +1083,7 @@ async fn cmd_run(
             subsample.as_ref(),
             task,
             None, // sequential mode: no worktree
+            None, // no sandbox in sequential mode
         )
         .await;
 

@@ -23,18 +23,52 @@ impl SubprocessOutput {
 
 /// Run a shell command with a timeout (non-streaming, original behavior).
 pub async fn run_cmd(cmd: &str, cwd: &Path, timeout: Duration) -> Result<SubprocessOutput> {
-    tracing::debug!(cmd, ?cwd, ?timeout, "spawning subprocess");
+    run_cmd_with_sandbox(cmd, cwd, timeout, None).await
+}
 
-    let child = Command::new("sh")
-        .arg("-c")
-        .arg(cmd)
-        .current_dir(cwd)
-        // Allow Claude CLI subprocess to run inside a parent Claude session.
-        .env_remove("CLAUDECODE")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .context(format!("failed to spawn: {cmd}"))?;
+/// Run a shell command with optional macOS seatbelt sandbox isolation.
+///
+/// When `sandbox_profile` is `Some`, wraps the command with `sandbox-exec -f <profile>`.
+/// On non-macOS platforms, the profile is ignored.
+pub async fn run_cmd_with_sandbox(
+    cmd: &str,
+    cwd: &Path,
+    timeout: Duration,
+    sandbox_profile: Option<&Path>,
+) -> Result<SubprocessOutput> {
+    tracing::debug!(
+        cmd,
+        ?cwd,
+        ?timeout,
+        sandbox = sandbox_profile.is_some(),
+        "spawning subprocess"
+    );
+
+    let child = if let Some(profile) = sandbox_profile.filter(|_| cfg!(target_os = "macos")) {
+        tracing::info!(profile = %profile.display(), "sandboxing with seatbelt");
+        Command::new("sandbox-exec")
+            .arg("-f")
+            .arg(profile)
+            .arg("sh")
+            .arg("-c")
+            .arg(cmd)
+            .current_dir(cwd)
+            .env_remove("CLAUDECODE")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .context(format!("failed to spawn sandboxed: {cmd}"))?
+    } else {
+        Command::new("sh")
+            .arg("-c")
+            .arg(cmd)
+            .current_dir(cwd)
+            .env_remove("CLAUDECODE")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .context(format!("failed to spawn: {cmd}"))?
+    };
 
     match tokio::time::timeout(timeout, child.wait_with_output()).await {
         Ok(Ok(output)) => {

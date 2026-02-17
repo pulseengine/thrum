@@ -8,7 +8,7 @@
 //! the existing session, preserving agent context across retries.
 
 use crate::backend::{AiBackend, AiRequest, AiResponse, BackendCapability};
-use crate::subprocess::{SubprocessOutput, run_cmd};
+use crate::subprocess::{SubprocessOutput, run_cmd, run_cmd_with_sandbox};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
@@ -86,7 +86,9 @@ impl AiBackend for ClaudeCliBackend {
         let cmd = cmd_parts.join(" ");
         tracing::info!(prompt_len = request.prompt.len(), cwd = %cwd.display(), "invoking claude CLI");
 
-        let output = run_cmd(&cmd, cwd, self.timeout).await?;
+        let output =
+            run_cmd_with_sandbox(&cmd, cwd, self.timeout, request.sandbox_profile.as_deref())
+                .await?;
         let (content, session_id) = parse_claude_output(&output);
 
         Ok(AiResponse {

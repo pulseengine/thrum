@@ -385,6 +385,123 @@ pub async fn create_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
     }
 }
 
+/// Write a macOS seatbelt profile to a temp file for sandbox-exec.
+///
+/// The profile restricts the agent to:
+/// - **Write**: only `work_dir`, `scratch_dir`, `/tmp`
+/// - **Read**: system paths, Rust toolchain, agent configs, and the above
+/// - **Network**: allowed (agents need API access)
+/// - **Process**: exec and fork allowed
+///
+/// Returns the path to the profile file (caller cleans up).
+pub fn write_seatbelt_profile(work_dir: &Path, scratch_dir: &Path) -> Result<PathBuf> {
+    // sandbox-exec requires absolute paths in subpath rules.
+    let work_dir = std::fs::canonicalize(work_dir)
+        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default().join(work_dir));
+    let scratch_dir = std::fs::canonicalize(scratch_dir).unwrap_or_else(|_| {
+        std::env::current_dir()
+            .unwrap_or_default()
+            .join(scratch_dir)
+    });
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/nobody".into());
+    let profile = format!(
+        r#"(version 1)
+(deny default)
+
+;; Process execution
+(allow process-exec)
+(allow process-fork)
+(allow signal)
+
+;; macOS IPC (required for system frameworks)
+(allow sysctl-read)
+(allow mach-lookup)
+(allow mach-register)
+(allow ipc-posix-shm-read*)
+(allow ipc-posix-shm-write-data)
+
+;; Network (agents need API access for LLM calls)
+(allow network*)
+
+;; Read access — system, toolchain, and working directories
+(allow file-read*
+    (subpath "/usr")
+    (subpath "/bin")
+    (subpath "/sbin")
+    (subpath "/opt/homebrew")
+    (subpath "/Library")
+    (subpath "/System")
+    (subpath "/private/etc")
+    (subpath "/private/var")
+    (subpath "/private/tmp")
+    (subpath "/dev")
+    (subpath "/etc")
+    (subpath "/var")
+    (subpath "/tmp")
+    (subpath "/nix")
+    ;; Rust toolchain
+    (subpath "{home}/.cargo")
+    (subpath "{home}/.rustup")
+    ;; Agent config
+    (subpath "{home}/.config")
+    (subpath "{home}/.claude")
+    ;; Working directories (worktree + scratch)
+    (subpath "{work_dir}")
+    (subpath "{scratch_dir}")
+)
+
+;; Write access — only worktree, scratch, and temp
+(allow file-write*
+    (subpath "{work_dir}")
+    (subpath "{scratch_dir}")
+    (subpath "/private/tmp")
+    (subpath "/tmp")
+    (subpath "/dev/null")
+    (subpath "/dev/tty")
+    ;; Cargo build cache (shared across agents)
+    (subpath "{home}/.cargo/registry")
+    (subpath "{home}/.cargo/git")
+    ;; Claude session state
+    (subpath "{home}/.claude")
+)
+"#,
+        home = home,
+        work_dir = work_dir.display(),
+        scratch_dir = scratch_dir.display(),
+    );
+
+    let profile_path = std::env::temp_dir().join(format!(
+        "thrum-seatbelt-{}-{}.sb",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    ));
+    std::fs::write(&profile_path, &profile).context("failed to write seatbelt profile")?;
+
+    tracing::debug!(
+        profile = %profile_path.display(),
+        work_dir = %work_dir.display(),
+        scratch_dir = %scratch_dir.display(),
+        "wrote seatbelt sandbox profile"
+    );
+
+    Ok(profile_path)
+}
+
+/// Create a scratch directory for a task.
+///
+/// Returns the path to the scratch directory (e.g., `scratch/TASK-0042/`).
+pub fn create_scratch_dir(base_dir: &Path, task_slug: &str) -> Result<PathBuf> {
+    let scratch = base_dir.join("scratch").join(task_slug);
+    std::fs::create_dir_all(&scratch).context(format!(
+        "failed to create scratch dir: {}",
+        scratch.display()
+    ))?;
+    Ok(scratch)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -414,5 +531,26 @@ mod tests {
         let config = SandboxConfig::default();
         let sandbox = create_sandbox(&config).await;
         assert_eq!(sandbox.name(), "none");
+    }
+
+    #[test]
+    fn seatbelt_profile_written_to_disk() {
+        let work = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let path = write_seatbelt_profile(work.path(), scratch.path()).unwrap();
+        assert!(path.exists(), "profile file should be written");
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("(version 1)"));
+        assert!(content.contains(&work.path().display().to_string()));
+        assert!(content.contains(&scratch.path().display().to_string()));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn scratch_dir_created() {
+        let base = tempfile::tempdir().unwrap();
+        let scratch = create_scratch_dir(base.path(), "TASK-0042").unwrap();
+        assert!(scratch.exists());
+        assert!(scratch.ends_with("scratch/TASK-0042"));
     }
 }

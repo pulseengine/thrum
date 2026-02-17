@@ -20,6 +20,8 @@ impl Worktree {
     /// Create a new worktree for the given branch.
     ///
     /// Runs `git worktree add <base_dir>/<branch_slug> <branch>`.
+    /// If a stale worktree already exists at the target path, it is
+    /// cleaned up automatically before re-creating.
     pub fn create(repo_path: &Path, branch: &str, base_dir: &Path) -> Result<Self> {
         let slug: String = branch
             .chars()
@@ -34,6 +36,47 @@ impl Worktree {
         let worktree_path = base_dir.join(&slug);
 
         std::fs::create_dir_all(base_dir).context("failed to create worktree base directory")?;
+
+        // If a stale worktree exists from a previous crash, clean it up first.
+        if worktree_path.exists() {
+            tracing::warn!(
+                worktree = %worktree_path.display(),
+                branch,
+                "stale worktree directory found — cleaning up before re-creating"
+            );
+            // Try git worktree remove first (handles git metadata cleanly).
+            let _ = Command::new("git")
+                .args([
+                    "worktree",
+                    "remove",
+                    "--force",
+                    worktree_path.to_str().unwrap(),
+                ])
+                .current_dir(repo_path)
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_INDEX_FILE")
+                .env_remove("GIT_WORK_TREE")
+                .output();
+
+            // Prune any dangling worktree metadata.
+            let _ = Command::new("git")
+                .args(["worktree", "prune"])
+                .current_dir(repo_path)
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_INDEX_FILE")
+                .env_remove("GIT_WORK_TREE")
+                .output();
+
+            // If the directory still exists (broken state), force-remove it.
+            if worktree_path.exists() {
+                std::fs::remove_dir_all(&worktree_path)
+                    .context("failed to remove stale worktree directory")?;
+                tracing::info!(
+                    worktree = %worktree_path.display(),
+                    "force-removed stale worktree directory"
+                );
+            }
+        }
 
         let output = Command::new("git")
             .args(["worktree", "add", worktree_path.to_str().unwrap(), branch])
@@ -177,5 +220,23 @@ mod tests {
             })
             .collect();
         assert_eq!(slug, "auto_TASK-42_foo_bar");
+    }
+
+    #[test]
+    fn create_recovers_from_stale_worktree() {
+        let repo_dir = init_test_repo();
+        let base = tempfile::tempdir().unwrap();
+
+        // Create a worktree then simulate a crash by leaking it (no cleanup).
+        let wt = Worktree::create(repo_dir.path(), "test-branch", base.path()).unwrap();
+        let path = wt.path.clone();
+        assert!(path.exists());
+        // Leak the worktree without cleanup — simulates engine crash.
+        std::mem::forget(wt);
+
+        // Creating the same worktree again should succeed (auto-cleans stale).
+        let wt2 = Worktree::create(repo_dir.path(), "test-branch", base.path()).unwrap();
+        assert!(wt2.path.exists());
+        assert_eq!(wt2.path, path);
     }
 }
