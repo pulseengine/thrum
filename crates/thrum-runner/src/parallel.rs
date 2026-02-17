@@ -179,14 +179,41 @@ pub async fn run_parallel(
         }
     }
 
-    // Graceful drain: wait for all in-flight agents
+    // Graceful drain: give in-flight agents a short window to finish,
+    // then abort them. Without this, Ctrl+C blocks for 20+ minutes
+    // waiting for long-running Claude invocations to complete.
     if !join_set.is_empty() {
         tracing::info!(
             count = join_set.len(),
-            "waiting for in-flight agents to complete"
+            "waiting up to 10s for in-flight agents to complete (Ctrl+C again to force quit)"
         );
-        while let Some(result) = join_set.join_next().await {
-            reap_agent_result(result, &ctx.event_bus);
+        let drain_deadline = tokio::time::sleep(Duration::from_secs(10));
+        tokio::pin!(drain_deadline);
+        loop {
+            tokio::select! {
+                result = join_set.join_next() => {
+                    match result {
+                        Some(r) => reap_agent_result(r, &ctx.event_bus),
+                        None => break, // all done
+                    }
+                }
+                _ = &mut drain_deadline => {
+                    tracing::warn!(
+                        remaining = join_set.len(),
+                        "drain timeout — aborting remaining agents"
+                    );
+                    join_set.abort_all();
+                    // Collect the abort results
+                    while let Some(r) = join_set.join_next().await {
+                        if let Err(e) = r
+                            && !e.is_cancelled()
+                        {
+                            tracing::warn!(error = %e, "agent task error during abort");
+                        }
+                    }
+                    break;
+                }
+            }
         }
     }
 
@@ -877,27 +904,51 @@ pub mod pipeline {
         );
 
         // Look up a previous session ID for session continuation on retries.
-        // If this task was retried, the session store may contain the session
-        // ID from the prior (timed-out or failed) invocation.
+        // Only resume if the prior invocation was interrupted (timeout or error).
+        // Do NOT resume sessions that exited 0 — the agent thinks it's "done"
+        // and will just re-confirm without redoing work on a clean worktree.
         let session_store = SessionStore::new(task_store.db());
         let resume_session_id = session_store.get(&task.id).unwrap_or(None);
-        if let Some(ref sid) = resume_session_id {
+
+        // Determine if the previous attempt was interrupted mid-work.
+        // Gate1Failed with exit_code=0 means agent thought it finished but
+        // produced nothing — resuming would repeat the same empty exit.
+        let was_interrupted = task.retry_count > 0
+            && matches!(
+                &task.status,
+                thrum_core::task::TaskStatus::Gate1Failed { report }
+                    if report.checks.iter().any(|c| c.exit_code != 0)
+            )
+            || matches!(
+                &task.status,
+                thrum_core::task::TaskStatus::Gate2Failed { .. }
+                    | thrum_core::task::TaskStatus::Gate3Failed { .. }
+            );
+
+        let resume_sid = resume_session_id.filter(|_| was_interrupted);
+        if let Some(ref sid) = resume_sid {
             tracing::info!(
                 task_id = %task.id,
                 session_id = sid,
-                "found previous session ID for continuation"
+                "resuming previous session (interrupted attempt)"
             );
             event_bus.emit(EventKind::SessionContinued {
                 task_id: task.id.clone(),
                 repo: task.repo.clone(),
                 session_id: sid.clone(),
             });
+        } else if task.retry_count > 0 {
+            tracing::info!(
+                task_id = %task.id,
+                "starting fresh session (previous attempt exited cleanly)"
+            );
+            let _ = session_store.remove(&task.id);
         }
 
         let mut request = AiRequest::new(&prompt)
             .with_system(system_prompt)
             .with_cwd(repo_config.path.clone());
-        if let Some(sid) = resume_session_id {
+        if let Some(sid) = resume_sid {
             request = request.with_resume_session(sid);
         }
 
