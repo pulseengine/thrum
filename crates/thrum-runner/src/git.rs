@@ -44,14 +44,19 @@ impl GitRepo {
         Ok(())
     }
 
-    /// Create a branch ref without checking it out.
+    /// Create a branch ref without checking it out, or update it to HEAD if
+    /// it already exists.
     ///
     /// Used when creating worktrees: the branch must exist as a ref but must
     /// NOT be checked out in the main working directory, otherwise
     /// `git worktree add` will fail with "already used by worktree".
+    ///
+    /// Uses `force=true` so that existing branches (e.g. from a previous run)
+    /// are updated to the current HEAD instead of silently keeping a stale
+    /// commit pointer.
     pub fn create_branch_detached(&self, name: &str) -> Result<()> {
         let head_commit = self.repo.head()?.peel_to_commit()?;
-        self.repo.branch(name, &head_commit, false)?;
+        self.repo.branch(name, &head_commit, true)?;
         Ok(())
     }
 
@@ -386,5 +391,32 @@ mod tests {
         let committed = git.salvage_uncommitted("WIP: after lock cleanup").unwrap();
         assert!(committed);
         assert!(!lock_path.exists());
+    }
+
+    #[test]
+    fn create_branch_detached_updates_existing_branch_to_head() {
+        let (dir, git) = init_test_repo();
+
+        // Create a detached branch at the initial commit.
+        git.create_branch_detached("feature-x").unwrap();
+        let initial_sha = git.head_sha().unwrap();
+
+        // Advance HEAD with a new commit on main.
+        std::fs::write(dir.path().join("new.txt"), "content").unwrap();
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "-m", "second"]);
+        let advanced_sha = git.head_sha().unwrap();
+        assert_ne!(initial_sha, advanced_sha);
+
+        // Calling create_branch_detached again must update the branch to the
+        // new HEAD, not leave it pointing at the old commit.
+        git.create_branch_detached("feature-x").unwrap();
+
+        let branch = git
+            .repo
+            .find_branch("feature-x", BranchType::Local)
+            .unwrap();
+        let branch_sha = branch.get().target().unwrap().to_string();
+        assert_eq!(branch_sha, advanced_sha);
     }
 }

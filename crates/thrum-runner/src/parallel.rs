@@ -373,7 +373,13 @@ async fn dispatch_batch(
                 // Use create_branch_detached to avoid checking out the branch
                 // in the main working directory — git won't allow the same branch
                 // to be checked out in two worktrees simultaneously.
-                let _ = git.create_branch_detached(&branch);
+                if let Err(e) = git.create_branch_detached(&branch) {
+                    tracing::warn!(
+                        branch,
+                        error = %e,
+                        "failed to create/update branch ref — worktree may use stale code"
+                    );
+                }
 
                 let wt = git.create_worktree(&branch, &ctx.worktrees_dir)?;
                 let path = wt.path.clone();
