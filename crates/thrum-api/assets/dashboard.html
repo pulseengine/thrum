@@ -98,6 +98,41 @@
     </div>
 
     <script>
+    // ── Task Actions (via fetch, not hx-post — morph-safe) ─────
+    // Buttons rendered inside the morphed #task-table use onclick+fetch
+    // because idiomorph morph cycles don't reliably bind hx-* attributes.
+
+    function taskAction(url, body) {
+        var opts = { method: 'POST' };
+        if (body) {
+            opts.headers = { 'Content-Type': 'application/x-www-form-urlencoded' };
+            opts.body = body;
+        }
+        fetch(url, opts)
+            .then(function(r) { return r.text(); })
+            .then(function(html) {
+                var el = document.getElementById('task-action-result');
+                el.innerHTML = html;
+                setTimeout(function() { el.innerHTML = ''; }, 5000);
+                htmx.trigger(document.getElementById('task-table'), 'refreshNow');
+                htmx.trigger(document.getElementById('status-counts'), 'refreshNow');
+            });
+    }
+
+    function retryTask(taskId) {
+        taskAction('/dashboard/tasks/' + taskId + '/retry');
+    }
+
+    function setTaskStatus(taskId, status) {
+        taskAction('/dashboard/tasks/' + taskId + '/status', 'status=' + encodeURIComponent(status));
+    }
+
+    function deleteTask(taskId) {
+        if (confirm('Delete TASK-' + String(taskId).padStart(4, '0') + '?')) {
+            taskAction('/dashboard/tasks/' + taskId + '/delete');
+        }
+    }
+
     // ── Reject Modal ────────────────────────────────────────────
     function openRejectModal(taskId) {
         document.getElementById('reject-task-id').value = taskId;

@@ -1407,26 +1407,23 @@ fn render_task_row_into(buf: &mut String, task: &thrum_core::task::Task) {
         );
     }
 
-    // Retry button for failed/rejected tasks
+    // Retry button for failed/rejected tasks.
+    // Uses onclick+fetch instead of hx-post because idiomorph morph cycles
+    // don't reliably call htmx.process() on new elements in this version.
     if is_failed {
         let _ = write!(
             buf,
             "<button class=\"btn btn-retry btn-sm\" \
-             hx-post=\"/dashboard/tasks/{id}/retry\" \
-             hx-target=\"#task-action-result\" \
-             hx-swap=\"innerHTML\" \
+             onclick=\"retryTask({id})\" \
              title=\"Reset to pending and clear retry count\">\u{21bb} Retry</button>",
         );
     }
 
-    // Status dropdown
+    // Status dropdown — uses onchange+fetch (morph-safe)
     let _ = write!(
         buf,
         "<select class=\"status-select\" name=\"status\" \
-         hx-post=\"/dashboard/tasks/{id}/status\" \
-         hx-target=\"#task-action-result\" \
-         hx-swap=\"innerHTML\" \
-         hx-include=\"this\">\
+         onchange=\"setTaskStatus({id}, this.value); this.selectedIndex=0;\">\
          <option value=\"\" selected disabled>\u{2699}</option>\
          <option value=\"pending\">Reset to Pending</option>\
          <option value=\"approved\">Set Approved</option>\
@@ -1435,14 +1432,12 @@ fn render_task_row_into(buf: &mut String, task: &thrum_core::task::Task) {
          </select>",
     );
 
-    // Delete button
+    // Delete button — uses onclick+fetch (morph-safe)
     let _ = write!(
         buf,
         "<button class=\"btn btn-reject btn-sm\" \
-         hx-post=\"/dashboard/tasks/{id}/delete\" \
-         hx-target=\"#task-action-result\" \
-         hx-swap=\"innerHTML\" \
-         hx-confirm=\"Delete TASK-{id:04}?\">\u{2715}</button>",
+         onclick=\"deleteTask({id})\" \
+         title=\"Delete TASK-{id:04}\">\u{2715}</button>",
     );
 
     buf.push_str("</div></td></tr>");
