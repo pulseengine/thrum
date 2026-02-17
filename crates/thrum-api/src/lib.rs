@@ -289,6 +289,8 @@ struct TaskResponse {
     requirement_id: Option<String>,
     acceptance_criteria: Vec<String>,
     tagged_criteria: Vec<thrum_core::verification::TaggedCriterion>,
+    /// Structured plan produced by the planner agent (if planning phase completed).
+    plan: Option<thrum_core::task::PlannerOutput>,
     created_at: String,
     updated_at: String,
 }
@@ -305,6 +307,7 @@ impl From<Task> for TaskResponse {
             requirement_id: t.requirement_id,
             acceptance_criteria: t.acceptance_criteria,
             tagged_criteria: t.tagged_criteria,
+            plan: t.plan,
             created_at: t.created_at.to_rfc3339(),
             updated_at: t.updated_at.to_rfc3339(),
         }

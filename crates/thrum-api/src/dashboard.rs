@@ -619,8 +619,10 @@ async fn status_partial(
     html.push_str("<div class=\"status-grid\">");
 
     // Group counts into meaningful categories
-    let pending = counts.get("pending").copied().unwrap_or(0);
+    let pending =
+        counts.get("pending").copied().unwrap_or(0) + counts.get("planned").copied().unwrap_or(0);
     let active = counts.get("claimed").copied().unwrap_or(0)
+        + counts.get("planning").copied().unwrap_or(0)
         + counts.get("implementing").copied().unwrap_or(0)
         + counts.get("reviewing").copied().unwrap_or(0)
         + counts.get("integrating").copied().unwrap_or(0);
@@ -943,6 +945,67 @@ async fn task_detail_partial(
         html.push_str("</ul>");
     }
 
+    // Display the plan if available
+    if let Some(ref plan) = task.plan {
+        html.push_str("<div class=\"plan-section\" style=\"margin-top:12px;padding:8px;background:var(--bg-secondary);border-radius:6px;\">");
+        html.push_str("<h5 style=\"margin:0 0 8px 0;font-size:12px;text-transform:uppercase;letter-spacing:1px;color:var(--text-muted);\">Implementation Plan</h5>");
+
+        if !plan.approach.is_empty() {
+            let approach_esc = escape_html(&plan.approach);
+            let _ = write!(
+                html,
+                "<p style=\"margin:4px 0;font-size:13px;\">{approach_esc}</p>"
+            );
+        }
+
+        if !plan.files_to_modify.is_empty() {
+            html.push_str(
+                "<div style=\"margin:4px 0;\"><strong style=\"font-size:11px;\">Files:</strong> ",
+            );
+            for (i, f) in plan.files_to_modify.iter().enumerate() {
+                if i > 0 {
+                    html.push_str(", ");
+                }
+                let _ = write!(
+                    html,
+                    "<code style=\"font-size:11px;\">{}</code>",
+                    escape_html(f)
+                );
+            }
+            html.push_str("</div>");
+        }
+
+        // Risk indicators
+        let risk = &plan.risk_assessment;
+        let mut risk_flags = Vec::new();
+        if risk.touches_high_risk_files {
+            risk_flags.push("high-risk files");
+        }
+        if risk.changes_public_api {
+            risk_flags.push("public API");
+        }
+        if risk.affects_harness {
+            risk_flags.push("harness");
+        }
+        if !risk_flags.is_empty() {
+            let _ = write!(
+                html,
+                "<div style=\"margin:4px 0;font-size:11px;color:#ef4444;\">&#x26a0; Risk: {}</div>",
+                risk_flags.join(", ")
+            );
+        }
+
+        if !plan.estimated_complexity.is_empty() {
+            let _ = write!(
+                html,
+                "<div style=\"margin:4px 0;font-size:11px;color:var(--text-muted);\">Complexity: {}</div>",
+                escape_html(&plan.estimated_complexity)
+            );
+        }
+
+        html.push_str("</div>");
+    }
+
     html.push_str("</div>");
     Ok(Html(html))
 }
@@ -1103,6 +1166,7 @@ async fn set_status_action(
         .ok_or_else(|| DashboardError(format!("task {id} not found")))?;
     task.status = match form.status.as_str() {
         "pending" => TaskStatus::Pending,
+        "planned" => TaskStatus::Planned,
         "approved" => TaskStatus::Approved,
         "integrating" => TaskStatus::Integrating,
         "merged" => TaskStatus::Merged {
@@ -1389,18 +1453,20 @@ fn render_inline_timeline(status: &TaskStatus) -> String {
     let stage = match status {
         TaskStatus::Pending => 0,
         TaskStatus::Claimed { .. } => 0,
-        TaskStatus::Implementing { .. } => 1,
-        TaskStatus::Gate1Failed { .. } => 2,
-        TaskStatus::Reviewing { .. } => 3,
-        TaskStatus::Gate2Failed { .. } => 4,
-        TaskStatus::AwaitingApproval { .. } => 5,
-        TaskStatus::Approved => 5,
-        TaskStatus::Rejected { .. } => 5,
-        TaskStatus::Integrating => 6,
-        TaskStatus::Gate3Failed { .. } => 6,
-        TaskStatus::AwaitingCI { .. } => 7,
-        TaskStatus::CIFailed { .. } => 7,
-        TaskStatus::Merged { .. } => 8,
+        TaskStatus::Planning { .. } => 1,
+        TaskStatus::Planned => 2,
+        TaskStatus::Implementing { .. } => 3,
+        TaskStatus::Gate1Failed { .. } => 4,
+        TaskStatus::Reviewing { .. } => 5,
+        TaskStatus::Gate2Failed { .. } => 6,
+        TaskStatus::AwaitingApproval { .. } => 7,
+        TaskStatus::Approved => 7,
+        TaskStatus::Rejected { .. } => 7,
+        TaskStatus::Integrating => 8,
+        TaskStatus::Gate3Failed { .. } => 8,
+        TaskStatus::AwaitingCI { .. } => 9,
+        TaskStatus::CIFailed { .. } => 9,
+        TaskStatus::Merged { .. } => 10,
     };
 
     let is_failed = matches!(
@@ -1412,7 +1478,9 @@ fn render_inline_timeline(status: &TaskStatus) -> String {
             | TaskStatus::Rejected { .. }
     );
 
-    let steps = ["P", "I", "G1", "R", "G2", "A", "Int", "CI", "M"];
+    let steps = [
+        "P", "Plan", "Pld", "I", "G1", "R", "G2", "A", "Int", "CI", "M",
+    ];
     let mut out = String::with_capacity(256);
     for (i, &step) in steps.iter().enumerate() {
         let class = if i < stage {
@@ -1531,6 +1599,7 @@ fn render_task_row_into(buf: &mut String, task: &thrum_core::task::Task) {
          onchange=\"setTaskStatus({id}, this.value); this.selectedIndex=0;\">\
          <option value=\"\" selected disabled>\u{2699}</option>\
          <option value=\"pending\">Reset to Pending</option>\
+         <option value=\"planned\">Set Planned</option>\
          <option value=\"approved\">Set Approved</option>\
          <option value=\"merged\">Mark Merged</option>\
          <option value=\"rejected\">Mark Rejected</option>\

@@ -99,6 +99,8 @@ impl A2aTaskState {
         match status {
             TaskStatus::Pending => A2aTaskState::Submitted,
             TaskStatus::Claimed { .. } => A2aTaskState::Submitted,
+            TaskStatus::Planning { .. } => A2aTaskState::Working,
+            TaskStatus::Planned => A2aTaskState::Submitted,
             TaskStatus::Implementing { .. } => A2aTaskState::Working,
             TaskStatus::Gate1Failed { .. } => A2aTaskState::Failed,
             TaskStatus::Reviewing { .. } => A2aTaskState::Working,

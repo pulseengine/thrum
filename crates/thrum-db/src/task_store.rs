@@ -4,14 +4,16 @@ use redb::{Database, ReadableTable, TableDefinition};
 use thrum_core::task::{RepoName, Task, TaskId, TaskStatus};
 
 /// Priority category for claiming the next task.
-/// Checked in order: retryable failures first, then approved, then pending.
+/// Checked in order: retryable failures first, then approved, then planned, then pending.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClaimCategory {
     /// Gate1/Gate2 failures that can be retried.
     RetryableFailed,
     /// Tasks approved by a human, ready for integration.
     Approved,
-    /// New pending tasks.
+    /// Tasks that have been planned and are ready for implementation.
+    Planned,
+    /// New pending tasks (will go through planning first).
     Pending,
 }
 
@@ -131,6 +133,12 @@ impl<'a> TaskStore<'a> {
         Ok(tasks.into_iter().next())
     }
 
+    /// Get the next planned task ready for implementation (FIFO by ID).
+    pub fn next_planned(&self, repo_filter: Option<&RepoName>) -> Result<Option<Task>> {
+        let tasks = self.list(Some("planned"), repo_filter)?;
+        Ok(tasks.into_iter().next())
+    }
+
     /// Get tasks in a failed gate state that can be retried.
     pub fn retryable_failures(&self, repo_filter: Option<&RepoName>) -> Result<Vec<Task>> {
         let mut result = Vec::new();
@@ -181,6 +189,7 @@ impl<'a> TaskStore<'a> {
                             task.status.is_claimable_retry() && task.can_retry()
                         }
                         ClaimCategory::Approved => task.status.is_claimable_approved(),
+                        ClaimCategory::Planned => task.status.is_claimable_planned(),
                         ClaimCategory::Pending => task.status.is_claimable_pending(),
                     };
 

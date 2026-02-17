@@ -108,7 +108,7 @@ pub struct CheckpointSummary {
 /// Task status as a state machine.
 ///
 /// Transitions:
-///   Pending -> Implementing -> Gate1Failed | Reviewing
+///   Pending -> Planning -> Planned -> Implementing -> Gate1Failed | Reviewing
 ///   Reviewing -> Gate2Failed | AwaitingApproval
 ///   AwaitingApproval -> Approved | Rejected
 ///   Approved -> Integrating -> Gate3Failed | AwaitingCI | Merged
@@ -123,6 +123,13 @@ pub enum TaskStatus {
         agent_id: String,
         claimed_at: DateTime<Utc>,
     },
+    /// Planner agent is producing a structured mini-spec.
+    Planning {
+        agent_id: String,
+        started_at: DateTime<Utc>,
+    },
+    /// Plan has been produced and is ready for implementation (or human review).
+    Planned,
     Implementing {
         branch: String,
         started_at: DateTime<Utc>,
@@ -181,6 +188,8 @@ impl TaskStatus {
         match self {
             TaskStatus::Pending => "pending",
             TaskStatus::Claimed { .. } => "claimed",
+            TaskStatus::Planning { .. } => "planning",
+            TaskStatus::Planned => "planned",
             TaskStatus::Implementing { .. } => "implementing",
             TaskStatus::Gate1Failed { .. } => "gate1-failed",
             TaskStatus::Reviewing { .. } => "reviewing",
@@ -239,6 +248,144 @@ impl TaskStatus {
     pub fn is_awaiting_ci(&self) -> bool {
         matches!(self, TaskStatus::AwaitingCI { .. })
     }
+
+    /// Whether this status is a planned task ready for implementation.
+    pub fn is_claimable_planned(&self) -> bool {
+        matches!(self, TaskStatus::Planned)
+    }
+}
+
+/// Structured plan produced by the planner agent before implementation.
+///
+/// Ensures every task has a "how" before the "what", giving the implementer
+/// a structured spec rather than just a title and description.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlannerOutput {
+    /// Files the implementation is expected to modify or create.
+    pub files_to_modify: Vec<String>,
+    /// Files the implementation is expected to create (subset of files_to_modify or additional).
+    #[serde(default)]
+    pub files_to_create: Vec<String>,
+    /// Mapping of each acceptance criterion to a verification method.
+    pub verification_plan: Vec<VerificationMapping>,
+    /// Risk assessment for the planned changes.
+    pub risk_assessment: RiskAssessment,
+    /// Estimated complexity (e.g. "low", "medium", "high").
+    #[serde(default)]
+    pub estimated_complexity: String,
+    /// Potential conflicts with other in-flight tasks.
+    #[serde(default)]
+    pub potential_conflicts: Vec<String>,
+    /// High-level implementation approach.
+    #[serde(default)]
+    pub approach: String,
+}
+
+/// Maps an acceptance criterion to how it will be verified.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerificationMapping {
+    /// The acceptance criterion text.
+    pub criterion: String,
+    /// How this criterion will be verified (e.g. "unit test", "integration test", "manual review").
+    pub verification_method: String,
+    /// Specific details about the verification approach.
+    #[serde(default)]
+    pub details: String,
+}
+
+/// Risk assessment for planned changes.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RiskAssessment {
+    /// Does this touch high-risk files (e.g. core state machine, public API)?
+    pub touches_high_risk_files: bool,
+    /// Does this change public APIs?
+    pub changes_public_api: bool,
+    /// Does this affect the harness/pipeline itself?
+    pub affects_harness: bool,
+    /// Free-text risk notes.
+    #[serde(default)]
+    pub notes: String,
+}
+
+impl PlannerOutput {
+    /// Generate a Markdown representation for inclusion in agent prompts.
+    pub fn to_markdown(&self) -> String {
+        let mut md = String::new();
+        md.push_str("## Implementation Plan\n\n");
+
+        if !self.approach.is_empty() {
+            md.push_str(&format!("### Approach\n\n{}\n\n", self.approach));
+        }
+
+        if !self.files_to_modify.is_empty() {
+            md.push_str("### Files to Modify\n\n");
+            for f in &self.files_to_modify {
+                md.push_str(&format!("- `{f}`\n"));
+            }
+            md.push('\n');
+        }
+
+        if !self.files_to_create.is_empty() {
+            md.push_str("### Files to Create\n\n");
+            for f in &self.files_to_create {
+                md.push_str(&format!("- `{f}`\n"));
+            }
+            md.push('\n');
+        }
+
+        if !self.verification_plan.is_empty() {
+            md.push_str("### Verification Plan\n\n");
+            for v in &self.verification_plan {
+                md.push_str(&format!("- **{}**: {}", v.criterion, v.verification_method));
+                if !v.details.is_empty() {
+                    md.push_str(&format!(" — {}", v.details));
+                }
+                md.push('\n');
+            }
+            md.push('\n');
+        }
+
+        md.push_str("### Risk Assessment\n\n");
+        md.push_str(&format!(
+            "- High-risk files: {}\n- Public API changes: {}\n- Affects harness: {}\n",
+            if self.risk_assessment.touches_high_risk_files {
+                "yes"
+            } else {
+                "no"
+            },
+            if self.risk_assessment.changes_public_api {
+                "yes"
+            } else {
+                "no"
+            },
+            if self.risk_assessment.affects_harness {
+                "yes"
+            } else {
+                "no"
+            },
+        ));
+        if !self.risk_assessment.notes.is_empty() {
+            md.push_str(&format!("- Notes: {}\n", self.risk_assessment.notes));
+        }
+        md.push('\n');
+
+        if !self.estimated_complexity.is_empty() {
+            md.push_str(&format!(
+                "### Complexity: {}\n\n",
+                self.estimated_complexity
+            ));
+        }
+
+        if !self.potential_conflicts.is_empty() {
+            md.push_str("### Potential Conflicts\n\n");
+            for c in &self.potential_conflicts {
+                md.push_str(&format!("- {c}\n"));
+            }
+            md.push('\n');
+        }
+
+        md
+    }
 }
 
 /// A task in the autonomous development pipeline.
@@ -259,6 +406,10 @@ pub struct Task {
     /// Structured specification (SDD). If present, used instead of free-text description.
     #[serde(default)]
     pub spec: Option<Spec>,
+    /// Structured plan produced by the planner agent before implementation.
+    /// Contains file list, verification plan, risk assessment, and complexity estimate.
+    #[serde(default)]
+    pub plan: Option<PlannerOutput>,
     /// How many times this task has been retried after gate failure.
     #[serde(default)]
     pub retry_count: u32,
@@ -288,6 +439,7 @@ impl Task {
             safety_classification: None,
             context_id: None,
             spec: None,
+            plan: None,
             retry_count: 0,
             tagged_criteria: Vec::new(),
             created_at: now,
@@ -409,6 +561,16 @@ mod tests {
     #[test]
     fn status_labels() {
         assert_eq!(TaskStatus::Pending.label(), "pending");
+        assert_eq!(
+            TaskStatus::Planning {
+                agent_id: "a".into(),
+                started_at: Utc::now(),
+            }
+            .label(),
+            "planning"
+        );
+        assert_eq!(TaskStatus::Planned.label(), "planned");
+        assert!(TaskStatus::Planned.is_claimable_planned());
         assert!(
             TaskStatus::Merged {
                 commit_sha: "abc".into()
@@ -431,6 +593,57 @@ mod tests {
             }
             .needs_human()
         );
+    }
+
+    #[test]
+    fn planner_output_to_markdown() {
+        let plan = PlannerOutput {
+            files_to_modify: vec!["src/lib.rs".into(), "src/task.rs".into()],
+            files_to_create: vec!["src/plan.rs".into()],
+            verification_plan: vec![VerificationMapping {
+                criterion: "Tests pass".into(),
+                verification_method: "cargo test".into(),
+                details: "Run full test suite".into(),
+            }],
+            risk_assessment: RiskAssessment {
+                touches_high_risk_files: true,
+                changes_public_api: false,
+                affects_harness: false,
+                notes: "Modifies state machine".into(),
+            },
+            estimated_complexity: "medium".into(),
+            potential_conflicts: vec!["TASK-0025 also modifies task.rs".into()],
+            approach: "Add new variants to TaskStatus enum".into(),
+        };
+        let md = plan.to_markdown();
+        assert!(md.contains("## Implementation Plan"));
+        assert!(md.contains("`src/lib.rs`"));
+        assert!(md.contains("`src/plan.rs`"));
+        assert!(md.contains("Tests pass"));
+        assert!(md.contains("High-risk files: yes"));
+        assert!(md.contains("medium"));
+        assert!(md.contains("TASK-0025"));
+    }
+
+    #[test]
+    fn planner_output_serde_roundtrip() {
+        let plan = PlannerOutput {
+            files_to_modify: vec!["src/lib.rs".into()],
+            files_to_create: vec![],
+            verification_plan: vec![VerificationMapping {
+                criterion: "Tests pass".into(),
+                verification_method: "cargo test".into(),
+                details: String::new(),
+            }],
+            risk_assessment: RiskAssessment::default(),
+            estimated_complexity: "low".into(),
+            potential_conflicts: vec![],
+            approach: "Simple change".into(),
+        };
+        let json = serde_json::to_string(&plan).unwrap();
+        let parsed: PlannerOutput = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.files_to_modify.len(), 1);
+        assert_eq!(parsed.estimated_complexity, "low");
     }
 
     #[test]

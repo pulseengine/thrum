@@ -56,11 +56,16 @@ cp examples/minimal/pipeline.toml configs/pipeline.toml
 ## Task State Machine
 
 ```
-Pending -> Implementing -> Gate1(Quality) -> Reviewing -> Gate2(Proof)
+Pending -> Planning -> Planned -> Implementing -> Gate1(Quality) -> Reviewing -> Gate2(Proof)
 -> AwaitingApproval -> Approved -> Integrating -> Gate3(Integration) -> Merged
 ```
 
-Failed gates and rejections cycle back to Implementing.
+Every task goes through a mandatory **Planning** phase where a planner agent produces
+a structured mini-spec (file list, verification plan, risk assessment) before
+implementation begins. The plan is stored in task metadata and passed to the
+implementer as structured context.
+
+Failed gates and rejections cycle back to Implementing (plan is preserved).
 
 ## Key Conventions
 - All config in `configs/repos.toml` and `configs/pipeline.toml`

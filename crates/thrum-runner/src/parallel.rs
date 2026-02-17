@@ -400,6 +400,7 @@ async fn dispatch_batch(
     let categories = [
         ClaimCategory::RetryableFailed,
         ClaimCategory::Approved,
+        ClaimCategory::Planned,
         ClaimCategory::Pending,
     ];
 
@@ -550,6 +551,7 @@ fn unclaim_task(db: &redb::Database, task: &Task, category: ClaimCategory) -> Re
     // Restore to the appropriate pre-claim status
     t.status = match category {
         ClaimCategory::Pending => thrum_core::task::TaskStatus::Pending,
+        ClaimCategory::Planned => thrum_core::task::TaskStatus::Planned,
         ClaimCategory::Approved => thrum_core::task::TaskStatus::Approved,
         ClaimCategory::RetryableFailed => {
             // We can't perfectly restore the old report, so leave it as Pending
@@ -707,8 +709,27 @@ async fn run_agent_task(
             )
             .await
         }
-        ClaimCategory::Pending => {
+        ClaimCategory::Planned => {
+            // Task already has a plan — go directly to implementation pipeline.
             crate::parallel::pipeline::run_task_pipeline(
+                &task_store,
+                &gate_store,
+                &ctx.repos_config,
+                &ctx.agents_dir,
+                &ctx.registry,
+                roles_ref,
+                &ctx.event_bus,
+                &ctx.budget,
+                ctx.subsample.as_ref(),
+                task,
+                work_dir.as_deref(),
+                sandbox_profile.as_deref(),
+            )
+            .await
+        }
+        ClaimCategory::Pending => {
+            // New task — run planning phase first, then implementation.
+            crate::parallel::pipeline::planning_then_implement_pipeline(
                 &task_store,
                 &gate_store,
                 &ctx.repos_config,
@@ -771,11 +792,27 @@ fn recover_stuck_tasks(db: &redb::Database, event_bus: &crate::event_bus::EventB
 
     for mut task in all_tasks {
         let reset_to = match &task.status {
-            thrum_core::task::TaskStatus::Claimed { .. }
-            | thrum_core::task::TaskStatus::Implementing { .. } => {
-                // Agent was working on this but the engine stopped.
-                // Reset to Pending so it gets re-dispatched.
+            thrum_core::task::TaskStatus::Claimed { .. } => {
+                // Agent was claimed but not started. If it already has a plan,
+                // reset to Planned so implementation can proceed directly.
+                if task.plan.is_some() {
+                    Some(thrum_core::task::TaskStatus::Planned)
+                } else {
+                    Some(thrum_core::task::TaskStatus::Pending)
+                }
+            }
+            thrum_core::task::TaskStatus::Planning { .. } => {
+                // Planner agent was interrupted. Reset to Pending to re-plan.
                 Some(thrum_core::task::TaskStatus::Pending)
+            }
+            thrum_core::task::TaskStatus::Implementing { .. } => {
+                // Agent was working on this but the engine stopped.
+                // If it has a plan, reset to Planned (skip re-planning).
+                if task.plan.is_some() {
+                    Some(thrum_core::task::TaskStatus::Planned)
+                } else {
+                    Some(thrum_core::task::TaskStatus::Pending)
+                }
             }
             thrum_core::task::TaskStatus::Integrating => {
                 // Post-approval integration was in progress.
@@ -784,8 +821,12 @@ fn recover_stuck_tasks(db: &redb::Database, event_bus: &crate::event_bus::EventB
             }
             thrum_core::task::TaskStatus::Reviewing { .. } => {
                 // Review was in progress — implementation is done, just re-run review.
-                // Reset to Pending to run the full pipeline again (safe, gates will catch issues).
-                Some(thrum_core::task::TaskStatus::Pending)
+                // Reset to Planned (has a plan) or Pending to run the full pipeline again.
+                if task.plan.is_some() {
+                    Some(thrum_core::task::TaskStatus::Planned)
+                } else {
+                    Some(thrum_core::task::TaskStatus::Pending)
+                }
             }
             _ => None,
         };
@@ -1854,6 +1895,244 @@ pub mod pipeline {
         Ok(())
     }
 
+    /// Build the planner prompt for producing a structured plan.
+    fn build_planning_prompt(task: &Task) -> String {
+        let criteria_text = if task.tagged_criteria.is_empty() {
+            task.acceptance_criteria
+                .iter()
+                .map(|c| format!("- {c}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            task.tagged_criteria
+                .iter()
+                .map(|tc| format!("- {} ({})", tc.description, tc.tag.as_tag_str()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        format!(
+            "Produce a structured implementation plan for the following task.\n\n\
+             **Title**: {title}\n\
+             **Description**: {desc}\n\
+             **Acceptance Criteria**:\n{criteria}\n\n\
+             Respond with ONLY a JSON object (no markdown fences) matching this schema:\n\
+             {{\n\
+               \"files_to_modify\": [\"path/to/file.rs\", ...],\n\
+               \"files_to_create\": [\"path/to/new_file.rs\", ...],\n\
+               \"verification_plan\": [\n\
+                 {{\"criterion\": \"...\", \"verification_method\": \"...\", \"details\": \"...\"}}\n\
+               ],\n\
+               \"risk_assessment\": {{\n\
+                 \"touches_high_risk_files\": true/false,\n\
+                 \"changes_public_api\": true/false,\n\
+                 \"affects_harness\": true/false,\n\
+                 \"notes\": \"...\"\n\
+               }},\n\
+               \"estimated_complexity\": \"low|medium|high\",\n\
+               \"potential_conflicts\": [\"...\"],\n\
+               \"approach\": \"High-level description of the implementation approach\"\n\
+             }}",
+            title = task.title,
+            desc = task.description,
+            criteria = criteria_text,
+        )
+    }
+
+    /// Parse planner agent output into a PlannerOutput struct.
+    ///
+    /// Attempts to find and parse JSON from the agent's response text.
+    /// Falls back to a minimal plan if parsing fails.
+    fn parse_planner_output(raw: &str, task: &Task) -> thrum_core::task::PlannerOutput {
+        // Try to find JSON in the output (may be wrapped in markdown fences)
+        let json_str = if let Some(start) = raw.find('{') {
+            if let Some(end) = raw.rfind('}') {
+                &raw[start..=end]
+            } else {
+                raw
+            }
+        } else {
+            raw
+        };
+
+        match serde_json::from_str::<thrum_core::task::PlannerOutput>(json_str) {
+            Ok(plan) => plan,
+            Err(e) => {
+                tracing::warn!(
+                    task_id = %task.id,
+                    error = %e,
+                    "failed to parse planner output as JSON, using fallback plan"
+                );
+                // Fallback: create a minimal plan from what we have
+                thrum_core::task::PlannerOutput {
+                    files_to_modify: Vec::new(),
+                    files_to_create: Vec::new(),
+                    verification_plan: task
+                        .acceptance_criteria
+                        .iter()
+                        .map(|c| thrum_core::task::VerificationMapping {
+                            criterion: c.clone(),
+                            verification_method: "automated test".into(),
+                            details: String::new(),
+                        })
+                        .collect(),
+                    risk_assessment: thrum_core::task::RiskAssessment::default(),
+                    estimated_complexity: "medium".into(),
+                    potential_conflicts: Vec::new(),
+                    approach: raw.chars().take(500).collect(),
+                }
+            }
+        }
+    }
+
+    /// Full pipeline with mandatory planning phase:
+    /// Pending → Planning → Planned → Implementing → Gates → Review → Approval.
+    ///
+    /// This is dispatched for newly pending tasks. It runs the planner agent
+    /// first to produce a structured plan, then hands off to `run_task_pipeline`
+    /// for implementation.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn planning_then_implement_pipeline(
+        task_store: &TaskStore<'_>,
+        gate_store: &GateStore<'_>,
+        repos_config: &ReposConfig,
+        agents_dir: &Path,
+        registry: &BackendRegistry,
+        roles: Option<&thrum_core::role::RolesConfig>,
+        event_bus: &EventBus,
+        budget: &Arc<Mutex<BudgetTracker>>,
+        subsample: Option<&SubsampleConfig>,
+        mut task: Task,
+        work_dir: Option<&Path>,
+        sandbox_profile: Option<&Path>,
+    ) -> Result<()> {
+        let base_repo_config = repos_config
+            .get(&task.repo)
+            .context(format!("no config for repo {}", task.repo))?;
+
+        let repo_config = match work_dir {
+            Some(dir) => base_repo_config.with_work_dir(dir.to_path_buf()),
+            None => base_repo_config.clone(),
+        };
+
+        // --- Planning Phase ---
+        let prev_status = task.status.label().to_string();
+        let agent_id = format!("planner-{}", task.id);
+        task.status = TaskStatus::Planning {
+            agent_id: agent_id.clone(),
+            started_at: Utc::now(),
+        };
+        task.updated_at = Utc::now();
+        task_store.update(&task)?;
+        emit_state_change(event_bus, &task, &prev_status, "planning");
+
+        // Resolve planner backend from roles config
+        let (planner_backend, planner_budget_usd) = if let Some(roles) = roles {
+            let planner_role = roles.planner();
+            let backend = registry
+                .resolve_role(&planner_role)
+                .or_else(|| registry.chat())
+                .context("no backend available for planner role")?;
+            let budget_usd = planner_role.budget_usd.unwrap_or(1.0);
+            (backend, budget_usd)
+        } else {
+            let backend = registry
+                .chat()
+                .or_else(|| registry.agent())
+                .context("no backend available for planning")?;
+            (backend, 1.0)
+        };
+
+        // Budget check for planning phase
+        {
+            let tracker = budget.lock().await;
+            if !tracker.can_afford(planner_budget_usd) {
+                tracing::warn!(
+                    task_id = %task.id,
+                    "budget exhausted, skipping planning phase"
+                );
+                // Reset to pending so it can be picked up later
+                task.status = TaskStatus::Pending;
+                task.updated_at = Utc::now();
+                task_store.update(&task)?;
+                return Ok(());
+            }
+        }
+
+        // Load planner prompt template
+        let planner_prompt_file = agents_dir.join(format!("planner_{}.md", task.repo));
+        let fallback_file = agents_dir.join("planner.md");
+        let system_prompt = if planner_prompt_file.exists() {
+            load_agent_prompt(&planner_prompt_file, repo_config.claude_md.as_deref())
+                .await
+                .unwrap_or_default()
+        } else {
+            load_agent_prompt(&fallback_file, repo_config.claude_md.as_deref())
+                .await
+                .unwrap_or_default()
+        };
+
+        let planning_prompt = build_planning_prompt(&task);
+
+        let request = AiRequest::new(&planning_prompt)
+            .with_system(system_prompt)
+            .with_cwd(repo_config.path.clone());
+
+        tracing::info!(
+            task_id = %task.id,
+            backend = planner_backend.name(),
+            "dispatching planner agent"
+        );
+
+        let result = planner_backend.invoke(&request).await?;
+
+        // Record planning cost
+        record_invocation_cost(
+            budget,
+            task.id.0,
+            budget::SessionType::Review, // closest existing session type
+            &result,
+            planner_budget_usd,
+        )
+        .await;
+
+        // Parse planner output
+        let plan = parse_planner_output(&result.content, &task);
+
+        tracing::info!(
+            task_id = %task.id,
+            files_to_modify = plan.files_to_modify.len(),
+            verification_items = plan.verification_plan.len(),
+            complexity = %plan.estimated_complexity,
+            "planner produced structured plan"
+        );
+
+        // Store plan in task metadata
+        task.plan = Some(plan);
+        let prev_status = task.status.label().to_string();
+        task.status = TaskStatus::Planned;
+        task.updated_at = Utc::now();
+        task_store.update(&task)?;
+        emit_state_change(event_bus, &task, &prev_status, "planned");
+
+        // --- Implementation Phase (delegate to existing pipeline) ---
+        run_task_pipeline(
+            task_store,
+            gate_store,
+            repos_config,
+            agents_dir,
+            registry,
+            roles,
+            event_bus,
+            budget,
+            subsample,
+            task,
+            work_dir,
+            sandbox_profile,
+        )
+        .await
+    }
+
     /// Retry a failed task with convergence-aware strategy rotation.
     ///
     /// Instead of blind retries, analyzes failure history to detect convergence
@@ -2302,9 +2581,15 @@ pub mod pipeline {
     }
 
     pub fn build_implementation_prompt(task: &Task, branch: &str) -> String {
+        let plan_context = if let Some(ref plan) = task.plan {
+            format!("\n\n{}", plan.to_markdown())
+        } else {
+            String::new()
+        };
+
         if let Some(ref spec) = task.spec {
             format!(
-                "Implement the following specification on branch '{branch}':\n\n{}\n\n\
+                "Implement the following specification on branch '{branch}':\n\n{}{plan_context}\n\n\
                  Follow the CLAUDE.md conventions for this repo exactly.",
                 spec.to_markdown()
             )
@@ -2313,7 +2598,7 @@ pub mod pipeline {
                 "Implement the following task on branch '{branch}':\n\n\
                  **Title**: {}\n\
                  **Description**: {}\n\
-                 **Acceptance Criteria**:\n{}\n\n\
+                 **Acceptance Criteria**:\n{}{plan_context}\n\n\
                  Follow the CLAUDE.md conventions for this repo exactly.",
                 task.title,
                 task.description,

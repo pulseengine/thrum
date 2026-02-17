@@ -1086,12 +1086,43 @@ async fn cmd_run(
             }
         }
 
-        // Phase C: Pick next pending task
+        // Phase C-1: Pick next planned task (already has a plan, skip to implementation)
+        if let Some(task) = task_store.next_planned(repo_filter.as_ref())? {
+            tracing::info!(task_id = %task.id, title = %task.title, repo = %task.repo, "implementing planned task");
+
+            let result = thrum_runner::parallel::pipeline::run_task_pipeline(
+                &task_store,
+                &gate_store,
+                repos_config,
+                agents_dir,
+                &registry,
+                None,
+                &event_bus,
+                &budget,
+                subsample.as_ref(),
+                task,
+                None,
+                None,
+            )
+            .await;
+
+            match result {
+                Ok(()) => tracing::info!("planned task pipeline completed successfully"),
+                Err(e) => tracing::error!("planned task pipeline failed: {e:#}"),
+            }
+
+            if once {
+                break;
+            }
+            continue;
+        }
+
+        // Phase C-2: Pick next pending task (needs planning first)
         let task = match task_store.next_pending(repo_filter.as_ref())? {
             Some(t) => t,
             None => {
                 // Phase D: No pending tasks — invoke planner if queue empty
-                tracing::info!("no pending tasks, invoking planner");
+                tracing::info!("no pending or planned tasks, invoking planner");
                 let planned = invoke_planner(
                     &task_store,
                     repos_config,
@@ -1117,9 +1148,9 @@ async fn cmd_run(
             }
         };
 
-        tracing::info!(task_id = %task.id, title = %task.title, repo = %task.repo, "starting task");
+        tracing::info!(task_id = %task.id, title = %task.title, repo = %task.repo, "starting task (with planning)");
 
-        let result = thrum_runner::parallel::pipeline::run_task_pipeline(
+        let result = thrum_runner::parallel::pipeline::planning_then_implement_pipeline(
             &task_store,
             &gate_store,
             repos_config,
@@ -1620,6 +1651,7 @@ fn cmd_task(db: &redb::Database, action: TaskAction, trace_dir: &Path) -> Result
 
             task.status = match status.as_str() {
                 "pending" => TaskStatus::Pending,
+                "planned" => TaskStatus::Planned,
                 "merged" => TaskStatus::Merged {
                     commit_sha: "manually-set".into(),
                 },
@@ -1633,7 +1665,7 @@ fn cmd_task(db: &redb::Database, action: TaskAction, trace_dir: &Path) -> Result
                 },
                 other => {
                     anyhow::bail!(
-                        "unsupported status '{other}'. Use: pending, approved, merged, awaiting-ci"
+                        "unsupported status '{other}'. Use: pending, planned, approved, merged, awaiting-ci"
                     )
                 }
             };
