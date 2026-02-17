@@ -972,6 +972,54 @@ async fn cmd_run(
             continue;
         }
 
+        // Phase B¾: Process AwaitingCI tasks (poll CI, handle pass/fail)
+        {
+            let all_tasks = task_store.list(None, None)?;
+            let mut handled_ci = false;
+            for ci_task in all_tasks {
+                if !ci_task.status.is_awaiting_ci() {
+                    continue;
+                }
+                if let Some(ref filter) = repo_filter
+                    && &ci_task.repo != filter
+                {
+                    continue;
+                }
+                let repo_config = repos_config.get(&ci_task.repo);
+                let ci_enabled = repo_config
+                    .and_then(|rc| rc.ci.as_ref())
+                    .is_some_and(|ci| ci.enabled);
+                if !ci_enabled {
+                    continue;
+                }
+                let repo_path = repo_config.map(|rc| rc.path.clone()).unwrap_or_default();
+                tracing::info!(task_id = %ci_task.id, "processing AwaitingCI task");
+                let result = thrum_runner::ci::run_ci_loop(
+                    &task_store,
+                    &event_bus,
+                    &repo_path,
+                    agents_dir,
+                    &registry,
+                    None,
+                    &std::path::PathBuf::from("worktrees"),
+                    ci_task,
+                )
+                .await;
+                match result {
+                    Ok(()) => tracing::info!("CI loop completed"),
+                    Err(e) => tracing::error!("CI loop failed: {e:#}"),
+                }
+                handled_ci = true;
+                break; // Process one CI task per iteration
+            }
+            if handled_ci {
+                if once {
+                    break;
+                }
+                continue;
+            }
+        }
+
         // Phase B½: Resume tasks with checkpoints (if --resume flag is set)
         if resume {
             let checkpoint_store = thrum_db::checkpoint_store::CheckpointStore::new(db);
@@ -1207,7 +1255,12 @@ async fn invoke_planner(
         }
         let mut task = Task::new(repo_name, pt.title, pt.description);
         task.requirement_id = pt.requirement_id;
-        task.acceptance_criteria = pt.acceptance_criteria;
+        // Enrich criteria with verification tags if not already tagged
+        task.acceptance_criteria =
+            thrum_core::verification::enrich_criteria(&pt.acceptance_criteria);
+        // Pre-parse tagged criteria for storage
+        let audit = thrum_core::verification::audit_criteria(&task.acceptance_criteria);
+        task.tagged_criteria = audit.tagged_criteria;
         task_store.insert(task)?;
         created += 1;
     }
@@ -1490,9 +1543,15 @@ fn cmd_task(db: &redb::Database, action: TaskAction, trace_dir: &Path) -> Result
                 let content = std::fs::read_to_string(&spec_path)
                     .context(format!("failed to read spec: {}", spec_path.display()))?;
                 let parsed_spec = Spec::from_toml(&content)?;
-                task.acceptance_criteria = parsed_spec.acceptance_criteria.clone();
+                // Enrich spec criteria with verification tags
+                task.acceptance_criteria =
+                    thrum_core::verification::enrich_criteria(&parsed_spec.acceptance_criteria);
                 task.spec = Some(parsed_spec);
             }
+
+            // Pre-parse tagged criteria for storage
+            let audit = thrum_core::verification::audit_criteria(&task.acceptance_criteria);
+            task.tagged_criteria = audit.tagged_criteria;
 
             let task = store.insert(task)?;
             println!("Created {}: {}", task.id, task.title);
@@ -1565,8 +1624,17 @@ fn cmd_task(db: &redb::Database, action: TaskAction, trace_dir: &Path) -> Result
                     commit_sha: "manually-set".into(),
                 },
                 "approved" => TaskStatus::Approved,
+                "awaiting-ci" => TaskStatus::AwaitingCI {
+                    pr_number: 0,
+                    pr_url: "manually-set".into(),
+                    branch: task.branch_name(),
+                    started_at: Utc::now(),
+                    ci_attempts: 0,
+                },
                 other => {
-                    anyhow::bail!("unsupported status '{other}'. Use: pending, approved, merged")
+                    anyhow::bail!(
+                        "unsupported status '{other}'. Use: pending, approved, merged, awaiting-ci"
+                    )
                 }
             };
             task.updated_at = Utc::now();

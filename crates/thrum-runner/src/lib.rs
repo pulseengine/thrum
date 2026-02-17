@@ -1,5 +1,6 @@
 pub mod anthropic;
 pub mod backend;
+pub mod ci;
 pub mod claude;
 pub mod cli_agent;
 pub mod coordination_hub;

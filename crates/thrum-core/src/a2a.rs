@@ -107,6 +107,8 @@ impl A2aTaskState {
             TaskStatus::Approved => A2aTaskState::Working,
             TaskStatus::Integrating => A2aTaskState::Working,
             TaskStatus::Gate3Failed { .. } => A2aTaskState::Failed,
+            TaskStatus::AwaitingCI { .. } => A2aTaskState::Working,
+            TaskStatus::CIFailed { .. } => A2aTaskState::Failed,
             TaskStatus::Merged { .. } => A2aTaskState::Completed,
             TaskStatus::Rejected { .. } => A2aTaskState::Rejected,
         }

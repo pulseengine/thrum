@@ -148,6 +148,10 @@ pub async fn run_parallel(
             reap_agent_result(result, &ctx.event_bus);
         }
 
+        // Process AwaitingCI tasks: poll their CI status and handle pass/fail.
+        // This runs each iteration but tasks self-manage their polling interval.
+        let ci_dispatched = dispatch_ci_tasks(&ctx, repo_filter.as_ref(), &mut join_set).await?;
+
         // Dispatch batch: try to claim and spawn agents
         let dispatched = dispatch_batch(
             &ctx,
@@ -159,12 +163,14 @@ pub async fn run_parallel(
         )
         .await?;
 
-        if dispatched == 0 && join_set.is_empty() {
+        let total_dispatched = dispatched + ci_dispatched;
+
+        if total_dispatched == 0 && join_set.is_empty() {
             tracing::info!("no tasks to dispatch and no agents in flight, exiting");
             break;
         }
 
-        if dispatched == 0 {
+        if total_dispatched == 0 {
             // Nothing new to dispatch; wait for an agent to finish or poll interval
             tokio::select! {
                 _ = shutdown.cancelled() => {
@@ -293,6 +299,87 @@ fn reap_agent_result(result: Result<AgentResult, tokio::task::JoinError>, event_
             tracing::error!(error = %e, "agent task panicked");
         }
     }
+}
+
+/// Check for tasks in AwaitingCI status and spawn CI polling loops for them.
+///
+/// Returns the number of CI tasks dispatched. CI tasks run asynchronously
+/// and don't consume the global agent semaphore — they primarily wait on
+/// external CI systems and only briefly use compute when dispatching
+/// ci_fixer agents.
+async fn dispatch_ci_tasks(
+    ctx: &Arc<PipelineContext>,
+    repo_filter: Option<&RepoName>,
+    join_set: &mut JoinSet<AgentResult>,
+) -> Result<usize> {
+    let task_store = TaskStore::new(&ctx.db);
+    let all_tasks = task_store.list(None, None)?;
+    let mut dispatched = 0;
+
+    for task in all_tasks {
+        if !task.status.is_awaiting_ci() {
+            continue;
+        }
+
+        // Apply repo filter
+        if let Some(filter) = repo_filter
+            && &task.repo != filter
+        {
+            continue;
+        }
+
+        // Get the repo config
+        let repo_config = match ctx.repos_config.get(&task.repo) {
+            Some(rc) => rc,
+            None => continue,
+        };
+
+        // CI must be enabled
+        if !repo_config.ci.as_ref().is_some_and(|ci| ci.enabled) {
+            continue;
+        }
+
+        let agent_id = thrum_core::agent::AgentId(format!("ci-poller-{}", task.id));
+        let repo_path = repo_config.path.clone();
+        let agents_dir = ctx.agents_dir.clone();
+        let roles = ctx.roles.clone();
+        let worktrees_dir = ctx.worktrees_dir.clone();
+        let ctx_clone = Arc::clone(ctx);
+
+        let session = thrum_core::agent::AgentSession::new(
+            agent_id,
+            task.id.clone(),
+            task.repo.clone(),
+            repo_path.clone(),
+        );
+
+        tracing::info!(
+            task_id = %task.id,
+            "dispatching CI polling task"
+        );
+
+        join_set.spawn(async move {
+            let mut session = session;
+            let task_store = TaskStore::new(&ctx_clone.db);
+            let outcome = crate::ci::run_ci_loop(
+                &task_store,
+                &ctx_clone.event_bus,
+                &repo_path,
+                &agents_dir,
+                &ctx_clone.registry,
+                roles.as_deref(),
+                &worktrees_dir,
+                task,
+            )
+            .await;
+            session.finish();
+            AgentResult { session, outcome }
+        });
+
+        dispatched += 1;
+    }
+
+    Ok(dispatched)
 }
 
 /// Try to dispatch agents for each claim category in priority order.
@@ -500,44 +587,70 @@ async fn run_agent_task(
     // or main repo path (single-agent mode).
     let work_dir = worktree.map(|wt| wt.path.clone());
 
-    // Set up seatbelt sandbox for macOS when sandbox backend is "os-native".
-    // Creates a per-task scratch dir and writes a restrictive seatbelt profile
-    // that limits agent filesystem writes to the worktree + scratch dir.
-    let sandbox_profile = if cfg!(target_os = "macos")
-        && ctx
-            .sandbox_config
-            .as_ref()
-            .is_some_and(|s| s.backend == "os-native")
-    {
-        let effective_dir = work_dir
-            .clone()
-            .or_else(|| ctx.repos_config.get(&task.repo).map(|rc| rc.path.clone()))
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    // Set up seatbelt sandbox for macOS.
+    //
+    // "os-native": enforce the seatbelt profile (wraps agent with sandbox-exec).
+    // "observe":   run without enforcement, but write the profile and audit
+    //              filesystem writes after execution to log would-be violations.
+    let sandbox_backend = ctx
+        .sandbox_config
+        .as_ref()
+        .map(|s| s.backend.as_str())
+        .unwrap_or("none");
+    let observe_mode = sandbox_backend == "observe";
 
-        let task_slug = format!("TASK-{:04}", task.id.0);
-        match crate::sandbox::create_scratch_dir(&ctx.worktrees_dir, &task_slug) {
-            Ok(scratch_dir) => {
-                match crate::sandbox::write_seatbelt_profile(&effective_dir, &scratch_dir) {
-                    Ok(profile) => {
-                        tracing::info!(
-                            task_id = %task.id,
-                            profile = %profile.display(),
-                            scratch = %scratch_dir.display(),
-                            "seatbelt sandbox enabled for agent"
-                        );
-                        Some(profile)
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "failed to write seatbelt profile, running unsandboxed");
-                        None
-                    }
+    let effective_dir = work_dir
+        .clone()
+        .or_else(|| ctx.repos_config.get(&task.repo).map(|rc| rc.path.clone()))
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let task_slug = format!("TASK-{:04}", task.id.0);
+
+    // Create scratch dir for both os-native and observe modes.
+    let scratch_dir =
+        if cfg!(target_os = "macos") && (sandbox_backend == "os-native" || observe_mode) {
+            crate::sandbox::create_scratch_dir(&ctx.worktrees_dir, &task_slug).ok()
+        } else {
+            None
+        };
+
+    let sandbox_profile = if cfg!(target_os = "macos") && sandbox_backend == "os-native" {
+        if let Some(ref scratch) = scratch_dir {
+            match crate::sandbox::write_seatbelt_profile(&effective_dir, scratch) {
+                Ok(profile) => {
+                    tracing::info!(
+                        task_id = %task.id,
+                        profile = %profile.display(),
+                        scratch = %scratch.display(),
+                        "seatbelt sandbox enabled for agent"
+                    );
+                    Some(profile)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to write seatbelt profile, running unsandboxed");
+                    None
                 }
             }
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to create scratch dir, running unsandboxed");
-                None
+        } else {
+            None
+        }
+    } else if observe_mode {
+        // Write the profile for reference but don't enforce it.
+        if let Some(ref scratch) = scratch_dir {
+            match crate::sandbox::write_seatbelt_profile(&effective_dir, scratch) {
+                Ok(profile) => {
+                    tracing::info!(
+                        task_id = %task.id,
+                        profile = %profile.display(),
+                        "sandbox OBSERVE mode: profile written for reference (not enforced)"
+                    );
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, "observe mode: could not write reference profile");
+                }
             }
         }
+        // Return None so the agent runs without sandbox-exec.
+        None
     } else {
         None
     };
@@ -616,6 +729,24 @@ async fn run_agent_task(
     // Stop the file watcher now that the pipeline is done.
     if let Some(w) = watcher {
         w.stop().await;
+    }
+
+    // Observe mode: audit filesystem writes for would-be violations.
+    if observe_mode {
+        let audit_dir = work_dir.as_ref().unwrap_or(&effective_dir);
+        let scratch = scratch_dir
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| ctx.worktrees_dir.join("scratch").join(&task_slug));
+        let violations = crate::sandbox::audit_observe_violations(audit_dir, &scratch);
+        if !violations.is_empty() {
+            tracing::warn!(
+                task_id = %task_slug,
+                count = violations.len(),
+                "sandbox observe: {} write(s) would be denied under enforcement",
+                violations.len()
+            );
+        }
     }
 
     // Clean up the seatbelt profile temp file.
@@ -917,6 +1048,33 @@ pub mod pipeline {
             }
         }
 
+        // --- Pre-dispatch audit: validate verification-tagged criteria ---
+        if !task.acceptance_criteria.is_empty() {
+            let audit = thrum_core::verification::audit_criteria(&task.acceptance_criteria);
+            if audit.passed {
+                // Populate tagged_criteria from the audit result
+                task.tagged_criteria = audit.tagged_criteria;
+                tracing::info!(
+                    task_id = %task.id,
+                    criteria_count = task.tagged_criteria.len(),
+                    "pre-dispatch audit passed — all criteria have verification tags"
+                );
+            } else {
+                // Auto-enrich: add suggested tags so the task can proceed
+                tracing::warn!(
+                    task_id = %task.id,
+                    feedback = ?audit.feedback,
+                    "pre-dispatch audit found untagged criteria — auto-enriching"
+                );
+                let enriched = thrum_core::verification::enrich_criteria(&task.acceptance_criteria);
+                task.acceptance_criteria = enriched;
+                let re_audit = thrum_core::verification::audit_criteria(&task.acceptance_criteria);
+                task.tagged_criteria = re_audit.tagged_criteria;
+            }
+            task.updated_at = Utc::now();
+            task_store.update(&task)?;
+        }
+
         // --- Implement ---
         let branch = task.branch_name();
         let prev_status = task.status.label().to_string();
@@ -956,10 +1114,16 @@ pub mod pipeline {
             }
         };
 
-        let prompt = format!(
-            "{}{memory_context}",
-            build_implementation_prompt(&task, &branch)
-        );
+        let base_prompt = build_implementation_prompt(&task, &branch);
+        let containment_note = if work_dir.is_some() {
+            "\n\nIMPORTANT: You are running inside an isolated git worktree. \
+             Your current working directory IS the repo root — all files are here. \
+             Do NOT navigate to any other directory or absolute path. \
+             Stay in your current working directory for all operations."
+        } else {
+            ""
+        };
+        let prompt = format!("{base_prompt}{containment_note}{memory_context}");
 
         // Look up a previous session ID for session continuation on retries.
         // Only resume if the prior invocation was interrupted (timeout or error).
@@ -1289,6 +1453,21 @@ pub mod pipeline {
             return Ok(());
         }
 
+        // --- Map Gate 1 results to tagged criteria ---
+        if !task.tagged_criteria.is_empty() {
+            task.tagged_criteria =
+                thrum_core::verification::map_gate_results(&task.tagged_criteria, &gate1.checks);
+            let (verified, failed, pending, total) =
+                thrum_core::verification::verification_summary(&task.tagged_criteria);
+            tracing::info!(
+                task_id = %task.id,
+                verified, failed, pending, total,
+                "mapped Gate 1 results to tagged criteria"
+            );
+            task.updated_at = Utc::now();
+            task_store.update(&task)?;
+        }
+
         // --- Checkpoint: Gate 1 passed ---
         {
             let mut cp = Checkpoint::after_implementation(
@@ -1433,6 +1612,21 @@ pub mod pipeline {
             record_convergence_failures(task_store.db(), &task.id, &gate2);
 
             return Ok(());
+        }
+
+        // --- Map Gate 2 results to tagged criteria ---
+        if !task.tagged_criteria.is_empty() {
+            task.tagged_criteria =
+                thrum_core::verification::map_gate_results(&task.tagged_criteria, &gate2.checks);
+            let (verified, failed, pending, total) =
+                thrum_core::verification::verification_summary(&task.tagged_criteria);
+            tracing::info!(
+                task_id = %task.id,
+                verified, failed, pending, total,
+                "mapped Gate 2 results to tagged criteria"
+            );
+            task.updated_at = Utc::now();
+            task_store.update(&task)?;
         }
 
         // --- Checkpoint: Gate 2 passed ---
@@ -1583,31 +1777,76 @@ pub mod pipeline {
             return Ok(());
         }
 
-        // --- Merge ---
+        // --- CI or local merge ---
         let branch = task.branch_name();
-        tracing::info!(branch = %branch, "merging branch to main");
-        let git = GitRepo::open(&repo_config.path)?;
-        let commit_sha = git
-            .merge_branch_to_main(&branch)
-            .context("failed to merge branch")?;
 
-        emit_state_change(event_bus, &task, "integrating", "merged");
-        task.status = TaskStatus::Merged {
-            commit_sha: commit_sha.clone(),
-        };
-        task.updated_at = Utc::now();
-        task_store.update(&task)?;
+        // Check if CI integration is configured for this repo
+        let ci_enabled = base_repo_config.ci.as_ref().is_some_and(|ci| ci.enabled);
 
-        // Clean up any stale checkpoint and session for this task
-        let checkpoint_store = CheckpointStore::new(task_store.db());
-        remove_checkpoint(&checkpoint_store, &task);
-        let _ = SessionStore::new(task_store.db()).remove(&task.id);
+        if ci_enabled {
+            // Push branch and create PR, then transition to AwaitingCI
+            tracing::info!(
+                task_id = %task.id,
+                branch = %branch,
+                "CI integration enabled — pushing branch and creating PR"
+            );
 
-        tracing::info!(
-            task_id = %task.id,
-            commit = %commit_sha,
-            "task merged successfully"
-        );
+            crate::ci::push_branch(&repo_config.path, &branch)
+                .context("failed to push branch to remote")?;
+
+            let pr_title = format!("[thrum] {}", task.title);
+            let pr_body = format!(
+                "## {}\n\n{}\n\n---\n*Created by thrum ({}).*",
+                task.title, task.description, task.id
+            );
+
+            let (pr_number, pr_url) =
+                crate::ci::create_pr(&repo_config.path, &branch, &pr_title, &pr_body)
+                    .context("failed to create PR")?;
+
+            emit_state_change(event_bus, &task, "integrating", "awaiting-ci");
+            task.status = TaskStatus::AwaitingCI {
+                pr_number,
+                pr_url: pr_url.clone(),
+                branch: branch.clone(),
+                started_at: Utc::now(),
+                ci_attempts: 0,
+            };
+            task.updated_at = Utc::now();
+            task_store.update(&task)?;
+
+            tracing::info!(
+                task_id = %task.id,
+                pr_number,
+                pr_url = %pr_url,
+                "PR created, transitioning to AwaitingCI"
+            );
+        } else {
+            // Local merge (original behavior)
+            tracing::info!(branch = %branch, "merging branch to main");
+            let git = GitRepo::open(&repo_config.path)?;
+            let commit_sha = git
+                .merge_branch_to_main(&branch)
+                .context("failed to merge branch")?;
+
+            emit_state_change(event_bus, &task, "integrating", "merged");
+            task.status = TaskStatus::Merged {
+                commit_sha: commit_sha.clone(),
+            };
+            task.updated_at = Utc::now();
+            task_store.update(&task)?;
+
+            // Clean up any stale checkpoint and session for this task
+            let checkpoint_store = CheckpointStore::new(task_store.db());
+            remove_checkpoint(&checkpoint_store, &task);
+            let _ = SessionStore::new(task_store.db()).remove(&task.id);
+
+            tracing::info!(
+                task_id = %task.id,
+                commit = %commit_sha,
+                "task merged successfully"
+            );
+        }
 
         Ok(())
     }

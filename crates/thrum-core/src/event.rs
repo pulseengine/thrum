@@ -156,6 +156,63 @@ pub enum EventKind {
         /// How many times the worst-case failure signature has been seen.
         repeated_count: u32,
     },
+
+    // -- CI status events --
+    /// CI polling started for a PR.
+    CIPollingStarted {
+        task_id: TaskId,
+        repo: RepoName,
+        pr_number: u64,
+        pr_url: String,
+    },
+
+    /// CI check status update (from polling).
+    CICheckUpdate {
+        task_id: TaskId,
+        repo: RepoName,
+        pr_number: u64,
+        /// Overall status: "pending", "pass", "fail".
+        status: String,
+        /// Summary of individual check results.
+        summary: String,
+    },
+
+    /// All CI checks passed — PR will be merged.
+    CIPassed {
+        task_id: TaskId,
+        repo: RepoName,
+        pr_number: u64,
+    },
+
+    /// CI checks failed — dispatching ci_fixer agent.
+    CIFailed {
+        task_id: TaskId,
+        repo: RepoName,
+        pr_number: u64,
+        /// Which attempt this is (1-based).
+        attempt: u32,
+        /// Max attempts allowed.
+        max_attempts: u32,
+        /// Summary of the CI failure.
+        failure_summary: String,
+    },
+
+    /// CI fixer agent pushed a fix commit and is waiting for CI re-run.
+    CIFixPushed {
+        task_id: TaskId,
+        repo: RepoName,
+        pr_number: u64,
+        attempt: u32,
+    },
+
+    /// CI retries exhausted — escalating to human review.
+    CIEscalated {
+        task_id: TaskId,
+        repo: RepoName,
+        pr_number: u64,
+        attempts: u32,
+        failure_summary: String,
+    },
 }
 
 /// What kind of file system change was detected.
@@ -342,6 +399,64 @@ impl std::fmt::Display for PipelineEvent {
             } => write!(
                 f,
                 "[{ts}] {task_id}: convergence detected (strategy={strategy}, repeats={repeated_count})"
+            ),
+
+            EventKind::CIPollingStarted {
+                task_id,
+                repo,
+                pr_number,
+                ..
+            } => write!(
+                f,
+                "[{ts}] {task_id} ({repo}): CI polling started for PR #{pr_number}"
+            ),
+
+            EventKind::CICheckUpdate {
+                task_id,
+                pr_number,
+                status,
+                summary,
+                ..
+            } => write!(
+                f,
+                "[{ts}] {task_id}: CI PR #{pr_number} status={status}: {summary}"
+            ),
+
+            EventKind::CIPassed {
+                task_id, pr_number, ..
+            } => write!(f, "[{ts}] {task_id}: CI PR #{pr_number} PASSED"),
+
+            EventKind::CIFailed {
+                task_id,
+                pr_number,
+                attempt,
+                max_attempts,
+                failure_summary,
+                ..
+            } => write!(
+                f,
+                "[{ts}] {task_id}: CI PR #{pr_number} FAILED (attempt {attempt}/{max_attempts}): {failure_summary}"
+            ),
+
+            EventKind::CIFixPushed {
+                task_id,
+                pr_number,
+                attempt,
+                ..
+            } => write!(
+                f,
+                "[{ts}] {task_id}: CI fix pushed for PR #{pr_number} (attempt {attempt})"
+            ),
+
+            EventKind::CIEscalated {
+                task_id,
+                pr_number,
+                attempts,
+                failure_summary,
+                ..
+            } => write!(
+                f,
+                "[{ts}] {task_id}: CI ESCALATED for PR #{pr_number} after {attempts} attempts: {failure_summary}"
             ),
         }
     }

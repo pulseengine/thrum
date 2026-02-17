@@ -102,6 +102,16 @@ impl RolesConfig {
             timeout_secs: Some(300),
         })
     }
+
+    /// Get the ci_fixer role, falling back to defaults.
+    pub fn ci_fixer(&self) -> AgentRole {
+        self.roles.get("ci_fixer").cloned().unwrap_or(AgentRole {
+            backend: "opus".into(),
+            prompt_template: "agents/ci_fixer.md".into(),
+            budget_usd: Some(3.0),
+            timeout_secs: Some(600),
+        })
+    }
 }
 
 impl Default for RolesConfig {

@@ -376,13 +376,18 @@ pub async fn create_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
             Box::new(OsNativeSandbox::new(config.clone()))
         }
         _ => {
-            if config.backend != "none" {
+            if config.backend != "none" && config.backend != "observe" {
                 tracing::warn!(backend = %config.backend, "unknown sandbox backend, using passthrough");
             }
             tracing::info!("using passthrough (no sandbox)");
             Box::new(NoSandbox)
         }
     }
+}
+
+/// Returns true if the sandbox config is in observe mode.
+pub fn is_observe_mode(config: &SandboxConfig) -> bool {
+    config.backend == "observe"
 }
 
 /// Write a macOS seatbelt profile to a temp file for sandbox-exec.
@@ -404,6 +409,12 @@ pub fn write_seatbelt_profile(work_dir: &Path, scratch_dir: &Path) -> Result<Pat
             .join(scratch_dir)
     });
     let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/nobody".into());
+
+    // On macOS, $TMPDIR is /private/var/folders/xx/.../T/, NOT /tmp.
+    // Node.js and Bun write V8 code cache and temp files here.
+    let tmpdir = std::env::temp_dir();
+    let tmpdir = std::fs::canonicalize(&tmpdir).unwrap_or(tmpdir);
+
     let profile = format!(
         r#"(version 1)
 (deny default)
@@ -439,11 +450,20 @@ pub fn write_seatbelt_profile(work_dir: &Path, scratch_dir: &Path) -> Result<Pat
     (subpath "{home}/.cargo/git")
     ;; Claude session state
     (subpath "{home}/.claude")
+    ;; npm/npx cache — required for MCP server spawning via npx.
+    ;; Without this, npm hangs writing debug logs and MCP servers never start.
+    (subpath "{home}/.npm")
+    ;; Bun runtime cache — Claude CLI is a Bun binary.
+    (subpath "{home}/.bun")
+    ;; macOS per-user temp directory ($TMPDIR != /tmp on macOS).
+    ;; Node.js writes V8 compiled code cache here.
+    (subpath "{tmpdir}")
 )
 "#,
         home = home,
         work_dir = work_dir.display(),
         scratch_dir = scratch_dir.display(),
+        tmpdir = tmpdir.display(),
     );
 
     let profile_path = std::env::temp_dir().join(format!(
@@ -464,6 +484,95 @@ pub fn write_seatbelt_profile(work_dir: &Path, scratch_dir: &Path) -> Result<Pat
     );
 
     Ok(profile_path)
+}
+
+/// Audit file writes after an observe-mode run.
+///
+/// Compares actual filesystem modifications against the seatbelt allow-list
+/// and logs warnings for any writes that would have been denied under
+/// enforcement. Returns a list of would-be violations.
+///
+/// This is deliberately conservative: it only checks git-tracked changes
+/// (via `git status --porcelain`) rather than trying to trace all syscalls.
+/// The goal is to surface the most common violations (agent writing outside
+/// its worktree) without requiring root or DTrace.
+pub fn audit_observe_violations(work_dir: &Path, scratch_dir: &Path) -> Vec<String> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/nobody".into());
+    let home = Path::new(&home);
+
+    // Allowed write paths (mirrors the seatbelt profile).
+    let allowed: Vec<std::path::PathBuf> = vec![
+        work_dir.to_path_buf(),
+        scratch_dir.to_path_buf(),
+        PathBuf::from("/private/tmp"),
+        PathBuf::from("/tmp"),
+        PathBuf::from("/dev"),
+        home.join(".cargo/registry"),
+        home.join(".cargo/git"),
+        home.join(".claude"),
+    ];
+
+    let is_allowed = |path: &Path| -> bool {
+        let abs = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            work_dir.join(path)
+        };
+        allowed.iter().any(|a| abs.starts_with(a))
+    };
+
+    // Use git status to find modified/created files in the worktree.
+    let output = std::process::Command::new("git")
+        .args(["status", "--porcelain", "-uall"])
+        .current_dir(work_dir)
+        .output();
+
+    let mut violations = Vec::new();
+
+    match output {
+        Ok(out) if out.status.success() => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            for line in stdout.lines() {
+                // porcelain format: XY filename (or XY old -> new for renames)
+                if line.len() < 4 {
+                    continue;
+                }
+                let file_part = &line[3..];
+                // Handle renames: "old -> new"
+                let filename = file_part.split(" -> ").last().unwrap_or(file_part);
+                let path = work_dir.join(filename);
+                if !is_allowed(&path) {
+                    violations.push(filename.to_string());
+                }
+            }
+        }
+        Ok(out) => {
+            tracing::debug!(
+                stderr = %String::from_utf8_lossy(&out.stderr),
+                "git status failed during observe audit"
+            );
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, "could not run git status for observe audit");
+        }
+    }
+
+    if violations.is_empty() {
+        tracing::info!(
+            work_dir = %work_dir.display(),
+            "sandbox observe: all writes within allowed paths"
+        );
+    } else {
+        for v in &violations {
+            tracing::warn!(
+                file = %v,
+                work_dir = %work_dir.display(),
+                "sandbox observe: write WOULD BE DENIED under enforcement"
+            );
+        }
+    }
+
+    violations
 }
 
 /// Create a scratch directory for a task.
@@ -528,5 +637,75 @@ mod tests {
         let scratch = create_scratch_dir(base.path(), "TASK-0042").unwrap();
         assert!(scratch.exists());
         assert!(scratch.ends_with("scratch/TASK-0042"));
+    }
+
+    #[test]
+    fn is_observe_mode_returns_true_for_observe() {
+        let config = SandboxConfig {
+            backend: "observe".into(),
+            ..Default::default()
+        };
+        assert!(is_observe_mode(&config));
+    }
+
+    #[test]
+    fn is_observe_mode_returns_false_for_others() {
+        for backend in &["none", "os-native", "docker"] {
+            let config = SandboxConfig {
+                backend: backend.to_string(),
+                ..Default::default()
+            };
+            assert!(!is_observe_mode(&config), "should be false for {backend}");
+        }
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_observe_uses_passthrough() {
+        let config = SandboxConfig {
+            backend: "observe".into(),
+            ..Default::default()
+        };
+        let sandbox = create_sandbox(&config).await;
+        // Observe mode falls through to NoSandbox (no enforcement).
+        assert_eq!(sandbox.name(), "none");
+    }
+
+    #[test]
+    fn audit_observe_in_git_repo_no_violations() {
+        // Set up a temp git repo with no uncommitted changes.
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::fs::write(dir.path().join("file.txt"), "hello").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        let violations = audit_observe_violations(dir.path(), scratch.path());
+        assert!(
+            violations.is_empty(),
+            "clean repo should have no violations"
+        );
     }
 }

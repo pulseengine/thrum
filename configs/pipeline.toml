@@ -9,7 +9,7 @@
 # agents can work concurrently on the same repo without index conflicts.
 
 [engine]
-per_repo_limit = 3
+per_repo_limit = 4
 worktrees_dir = "worktrees"
 max_retries = 10  # Reset via dashboard retry button to give a task another round
 
@@ -168,12 +168,24 @@ prompt_template = "agents/planner.md"
 budget_usd = 1.0
 timeout_secs = 300
 
+[roles.ci_fixer]
+backend = "opus"
+prompt_template = "agents/ci_fixer.md"
+budget_usd = 3.0
+timeout_secs = 600
+
 # ── Sandbox ───────────────────────────────────────────────────────────
 # Resource limits for agent subprocess execution.
-# backend: "none" (no isolation), "docker", "nsjail", etc.
+# backend:
+#   "none"      — no isolation (passthrough)
+#   "os-native" — enforce seatbelt (macOS) / bubblewrap (Linux)
+#   "observe"   — run without enforcement, audit writes after execution
+#                  and log which operations WOULD be denied. Useful for
+#                  debugging sandbox profiles before enabling enforcement.
+#   "docker"    — Docker container isolation
 
 [sandbox]
-backend = "os-native"
+backend = "observe"
 memory_limit_mb = 4096
 cpu_limit = 2.0
 network = false

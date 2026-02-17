@@ -19,6 +19,64 @@ pub struct RepoConfig {
     pub claude_md: Option<PathBuf>,
     /// Functional safety target for this tool.
     pub safety_target: Option<AsilLevel>,
+    /// CI integration configuration (opt-in).
+    #[serde(default)]
+    pub ci: Option<CIConfig>,
+}
+
+/// CI integration configuration for a repository.
+///
+/// When present, the post-approval pipeline will push the branch,
+/// create a PR, and poll CI status instead of merging locally.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CIConfig {
+    /// Whether CI integration is enabled.
+    #[serde(default = "default_ci_enabled")]
+    pub enabled: bool,
+    /// Polling interval in seconds (default: 60).
+    #[serde(default = "default_ci_poll_interval")]
+    pub poll_interval_secs: u64,
+    /// Maximum number of ci_fixer retries before escalating (default: 3).
+    #[serde(default = "default_max_ci_retries")]
+    pub max_ci_retries: u32,
+    /// Whether to auto-merge on green CI (default: true).
+    #[serde(default = "default_auto_merge")]
+    pub auto_merge: bool,
+    /// Merge strategy: "squash", "merge", "rebase" (default: "squash").
+    #[serde(default = "default_merge_strategy")]
+    pub merge_strategy: String,
+}
+
+fn default_ci_enabled() -> bool {
+    true
+}
+
+fn default_ci_poll_interval() -> u64 {
+    60
+}
+
+fn default_max_ci_retries() -> u32 {
+    3
+}
+
+fn default_auto_merge() -> bool {
+    true
+}
+
+fn default_merge_strategy() -> String {
+    "squash".into()
+}
+
+impl Default for CIConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_ci_enabled(),
+            poll_interval_secs: default_ci_poll_interval(),
+            max_ci_retries: default_max_ci_retries(),
+            auto_merge: default_auto_merge(),
+            merge_strategy: default_merge_strategy(),
+        }
+    }
 }
 
 impl RepoConfig {
@@ -70,6 +128,7 @@ mod tests {
             proofs_cmd: None,
             claude_md: None,
             safety_target: None,
+            ci: None,
         }
     }
 

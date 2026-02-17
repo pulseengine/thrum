@@ -288,6 +288,7 @@ struct TaskResponse {
     retry_count: u32,
     requirement_id: Option<String>,
     acceptance_criteria: Vec<String>,
+    tagged_criteria: Vec<thrum_core::verification::TaggedCriterion>,
     created_at: String,
     updated_at: String,
 }
@@ -303,6 +304,7 @@ impl From<Task> for TaskResponse {
             retry_count: t.retry_count,
             requirement_id: t.requirement_id,
             acceptance_criteria: t.acceptance_criteria,
+            tagged_criteria: t.tagged_criteria,
             created_at: t.created_at.to_rfc3339(),
             updated_at: t.updated_at.to_rfc3339(),
         }
@@ -365,7 +367,10 @@ async fn create_task(
 
     let mut task = Task::new(repo_name, req.title, req.description);
     task.requirement_id = req.requirement_id;
-    task.acceptance_criteria = req.acceptance_criteria;
+    // Enrich criteria with verification tags if not already tagged
+    task.acceptance_criteria = thrum_core::verification::enrich_criteria(&req.acceptance_criteria);
+    let audit = thrum_core::verification::audit_criteria(&task.acceptance_criteria);
+    task.tagged_criteria = audit.tagged_criteria;
 
     let task = store.insert(task)?;
     Ok((StatusCode::CREATED, Json(TaskResponse::from(task))))

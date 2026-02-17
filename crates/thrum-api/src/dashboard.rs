@@ -380,8 +380,53 @@ fn render_description_section(buf: &mut String, task: &thrum_core::task::Task) {
     // Description
     let _ = write!(buf, "<p>{desc_esc}</p>");
 
-    // Acceptance criteria
-    if !task.acceptance_criteria.is_empty() {
+    // Verification-tagged criteria (preferred display)
+    if !task.tagged_criteria.is_empty() {
+        let (verified, failed, pending, total) =
+            thrum_core::verification::verification_summary(&task.tagged_criteria);
+        let _ = write!(
+            buf,
+            "<h4 style=\"margin-top:12px;font-size:12px;color:var(--text-muted);\
+                       text-transform:uppercase;letter-spacing:1px;\">Acceptance Criteria \
+             <span style=\"font-weight:normal;\">({verified}/{total} verified</span>)</h4>\
+             <ul class=\"criteria-list\" style=\"list-style:none;padding-left:0;\">",
+        );
+        let _ = (failed, pending); // used in summary above
+        for tc in &task.tagged_criteria {
+            let (icon, color) = match tc.status_label() {
+                "verified" => ("&#x2705;", "#22c55e"),
+                "failed" => ("&#x274c;", "#ef4444"),
+                _ => ("&#x23f3;", "#a3a3a3"),
+            };
+            let desc_esc = escape_html(&tc.description);
+            let tag = tc.tag.as_tag_str();
+            let _ = write!(
+                buf,
+                "<li style=\"padding:4px 0;\">\
+                 <span style=\"color:{color};\">{icon}</span> \
+                 {desc_esc} \
+                 <span style=\"font-size:11px;padding:1px 6px;border-radius:3px;\
+                              background:var(--bg-secondary);color:var(--text-muted);\">\
+                 {tag}</span>",
+            );
+            // Show verification details if any
+            if !tc.verifications.is_empty() {
+                buf.push_str(
+                    "<ul style=\"margin:2px 0 0 24px;font-size:11px;\
+                                color:var(--text-muted);list-style:none;\">",
+                );
+                for v in &tc.verifications {
+                    let v_icon = if v.passed { "&#x2714;" } else { "&#x2718;" };
+                    let check_esc = escape_html(&v.check_name);
+                    let _ = write!(buf, "<li>{v_icon} {check_esc}</li>");
+                }
+                buf.push_str("</ul>");
+            }
+            buf.push_str("</li>");
+        }
+        buf.push_str("</ul>");
+    } else if !task.acceptance_criteria.is_empty() {
+        // Fallback: plain string criteria (no tags yet)
         buf.push_str(
             "<h4 style=\"margin-top:12px;font-size:12px;color:var(--text-muted);\
                        text-transform:uppercase;letter-spacing:1px;\">Acceptance Criteria</h4>\
@@ -876,7 +921,21 @@ async fn task_detail_partial(
         escape_html(&task.description),
     );
 
-    if !task.acceptance_criteria.is_empty() {
+    // Show verification-tagged criteria with status icons
+    if !task.tagged_criteria.is_empty() {
+        html.push_str("<ul class=\"criteria\" style=\"list-style:none;padding-left:0;\">");
+        for tc in &task.tagged_criteria {
+            let icon = match tc.status_label() {
+                "verified" => "&#x2705;",
+                "failed" => "&#x274c;",
+                _ => "&#x23f3;",
+            };
+            let desc_esc = escape_html(&tc.description);
+            let tag = tc.tag.as_tag_str();
+            let _ = write!(html, "<li>{icon} {desc_esc} <small>{tag}</small></li>");
+        }
+        html.push_str("</ul>");
+    } else if !task.acceptance_criteria.is_empty() {
         html.push_str("<ul class=\"criteria\">");
         for ac in &task.acceptance_criteria {
             let _ = write!(html, "<li>{}</li>", escape_html(ac));
@@ -971,12 +1030,16 @@ async fn create_task_action(
     let store = TaskStore::new(db);
     let repo_name = thrum_core::task::RepoName::new(&form.repo);
     let mut task = thrum_core::task::Task::new(repo_name, form.title, form.description);
-    task.acceptance_criteria = form
+    let raw_criteria: Vec<String> = form
         .acceptance_criteria
         .lines()
         .map(|l| l.trim().to_string())
         .filter(|l| !l.is_empty())
         .collect();
+    // Enrich criteria with verification tags if not already tagged
+    task.acceptance_criteria = thrum_core::verification::enrich_criteria(&raw_criteria);
+    let audit = thrum_core::verification::audit_criteria(&task.acceptance_criteria);
+    task.tagged_criteria = audit.tagged_criteria;
     let task = store.insert(task)?;
     Ok(Html(format!(
         "<div class=\"action-result success\">\
@@ -1006,12 +1069,16 @@ async fn edit_task_action(
         .ok_or_else(|| DashboardError(format!("task {id} not found")))?;
     task.title = form.title;
     task.description = form.description;
-    task.acceptance_criteria = form
+    let raw_criteria: Vec<String> = form
         .acceptance_criteria
         .lines()
         .map(|l| l.trim().to_string())
         .filter(|l| !l.is_empty())
         .collect();
+    // Enrich criteria with verification tags if not already tagged
+    task.acceptance_criteria = thrum_core::verification::enrich_criteria(&raw_criteria);
+    let audit = thrum_core::verification::audit_criteria(&task.acceptance_criteria);
+    task.tagged_criteria = audit.tagged_criteria;
     task.updated_at = Utc::now();
     store.update(&task)?;
     Ok(Html(format!(
@@ -1331,7 +1398,9 @@ fn render_inline_timeline(status: &TaskStatus) -> String {
         TaskStatus::Rejected { .. } => 5,
         TaskStatus::Integrating => 6,
         TaskStatus::Gate3Failed { .. } => 6,
-        TaskStatus::Merged { .. } => 7,
+        TaskStatus::AwaitingCI { .. } => 7,
+        TaskStatus::CIFailed { .. } => 7,
+        TaskStatus::Merged { .. } => 8,
     };
 
     let is_failed = matches!(
@@ -1339,10 +1408,11 @@ fn render_inline_timeline(status: &TaskStatus) -> String {
         TaskStatus::Gate1Failed { .. }
             | TaskStatus::Gate2Failed { .. }
             | TaskStatus::Gate3Failed { .. }
+            | TaskStatus::CIFailed { .. }
             | TaskStatus::Rejected { .. }
     );
 
-    let steps = ["P", "I", "G1", "R", "G2", "A", "Int", "M"];
+    let steps = ["P", "I", "G1", "R", "G2", "A", "Int", "CI", "M"];
     let mut out = String::with_capacity(256);
     for (i, &step) in steps.iter().enumerate() {
         let class = if i < stage {

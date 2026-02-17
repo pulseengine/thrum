@@ -335,6 +335,41 @@ impl WatchApp {
                     }
                 }
             }
+
+            // CI-related events — logged to engine log
+            EventKind::CIPollingStarted {
+                task_id, pr_url, ..
+            } => {
+                self.engine_log
+                    .push(format!("[CI] {task_id} polling started: {pr_url}"));
+            }
+            EventKind::CICheckUpdate {
+                task_id, summary, ..
+            } => {
+                self.engine_log
+                    .push(format!("[CI] {task_id} check update: {summary}"));
+            }
+            EventKind::CIPassed { task_id, .. } => {
+                self.engine_log.push(format!("[CI] {task_id} CI passed"));
+            }
+            EventKind::CIFailed {
+                task_id,
+                failure_summary,
+                ..
+            } => {
+                self.engine_log
+                    .push(format!("[CI] {task_id} CI failed: {failure_summary}"));
+            }
+            EventKind::CIFixPushed {
+                task_id, attempt, ..
+            } => {
+                self.engine_log
+                    .push(format!("[CI] {task_id} fix pushed (attempt {attempt})"));
+            }
+            EventKind::CIEscalated { task_id, .. } => {
+                self.engine_log
+                    .push(format!("[CI] {task_id} escalated to human review"));
+            }
         }
     }
 

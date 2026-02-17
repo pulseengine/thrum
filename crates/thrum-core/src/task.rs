@@ -1,4 +1,5 @@
 use crate::spec::Spec;
+use crate::verification::TaggedCriterion;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt;
@@ -110,7 +111,9 @@ pub struct CheckpointSummary {
 ///   Pending -> Implementing -> Gate1Failed | Reviewing
 ///   Reviewing -> Gate2Failed | AwaitingApproval
 ///   AwaitingApproval -> Approved | Rejected
-///   Approved -> Integrating -> Gate3Failed | Merged
+///   Approved -> Integrating -> Gate3Failed | AwaitingCI | Merged
+///   AwaitingCI -> Merged | CIFailed
+///   CIFailed -> AwaitingCI (ci_fixer retry) | AwaitingApproval (escalation)
 ///   *Failed -> Implementing (retry)
 ///   Rejected -> Implementing (with feedback)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -141,6 +144,29 @@ pub enum TaskStatus {
     Gate3Failed {
         report: GateReport,
     },
+    /// PR created, waiting for CI checks to pass.
+    AwaitingCI {
+        /// PR number (e.g. from `gh pr create`).
+        pr_number: u64,
+        /// Full PR URL for display.
+        pr_url: String,
+        /// Branch that the PR is on.
+        branch: String,
+        /// When the PR was created / CI polling started.
+        started_at: DateTime<Utc>,
+        /// How many times the ci_fixer agent has attempted to fix CI failures.
+        #[serde(default)]
+        ci_attempts: u32,
+    },
+    /// CI failed and the ci_fixer agent could not fix it within max retries.
+    CIFailed {
+        pr_number: u64,
+        pr_url: String,
+        /// Summary of the CI failure.
+        failure_summary: String,
+        /// Number of fix attempts made.
+        ci_attempts: u32,
+    },
     Merged {
         commit_sha: String,
     },
@@ -163,6 +189,8 @@ impl TaskStatus {
             TaskStatus::Approved => "approved",
             TaskStatus::Integrating => "integrating",
             TaskStatus::Gate3Failed { .. } => "gate3-failed",
+            TaskStatus::AwaitingCI { .. } => "awaiting-ci",
+            TaskStatus::CIFailed { .. } => "ci-failed",
             TaskStatus::Merged { .. } => "merged",
             TaskStatus::Rejected { .. } => "rejected",
         }
@@ -173,7 +201,10 @@ impl TaskStatus {
     }
 
     pub fn needs_human(&self) -> bool {
-        matches!(self, TaskStatus::AwaitingApproval { .. })
+        matches!(
+            self,
+            TaskStatus::AwaitingApproval { .. } | TaskStatus::CIFailed { .. }
+        )
     }
 
     /// Whether this task has a reviewable diff (in Reviewing or AwaitingApproval).
@@ -203,6 +234,11 @@ impl TaskStatus {
     pub fn is_claimable_approved(&self) -> bool {
         matches!(self, TaskStatus::Approved)
     }
+
+    /// Whether this task is awaiting CI results.
+    pub fn is_awaiting_ci(&self) -> bool {
+        matches!(self, TaskStatus::AwaitingCI { .. })
+    }
 }
 
 /// A task in the autonomous development pipeline.
@@ -226,6 +262,13 @@ pub struct Task {
     /// How many times this task has been retried after gate failure.
     #[serde(default)]
     pub retry_count: u32,
+    /// Verification-tagged acceptance criteria with tracked results.
+    ///
+    /// Populated from `acceptance_criteria` during pre-dispatch audit.
+    /// Each criterion has a verification tag (TEST, LINT, BENCH, etc.)
+    /// and accumulates verification results as gates run.
+    #[serde(default)]
+    pub tagged_criteria: Vec<TaggedCriterion>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -246,6 +289,7 @@ impl Task {
             context_id: None,
             spec: None,
             retry_count: 0,
+            tagged_criteria: Vec::new(),
             created_at: now,
             updated_at: now,
         }
