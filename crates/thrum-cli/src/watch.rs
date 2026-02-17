@@ -370,6 +370,43 @@ impl WatchApp {
                 self.engine_log
                     .push(format!("[CI] {task_id} escalated to human review"));
             }
+
+            // Sync-related events
+            EventKind::SyncStarted { repo, trigger } => {
+                self.engine_log
+                    .push(format!("[SYNC] {repo} sync started (trigger={trigger})"));
+            }
+            EventKind::SyncMainUpdated {
+                repo,
+                old_sha,
+                new_sha,
+            } => {
+                let short_old = &old_sha[..7.min(old_sha.len())];
+                let short_new = &new_sha[..7.min(new_sha.len())];
+                self.engine_log.push(format!(
+                    "[SYNC] {repo} main updated {short_old}..{short_new}"
+                ));
+            }
+            EventKind::SyncBranchRebased {
+                repo,
+                branch,
+                success,
+                ..
+            } => {
+                let status = if *success { "OK" } else { "CONFLICT" };
+                self.engine_log
+                    .push(format!("[SYNC] {repo} rebase {branch}: {status}"));
+            }
+            EventKind::SyncCompleted {
+                repo,
+                branches_rebased,
+                conflicts,
+                duration_secs,
+            } => {
+                self.engine_log.push(format!(
+                    "[SYNC] {repo} completed: {branches_rebased} rebased, {conflicts} conflicts ({duration_secs:.1}s)"
+                ));
+            }
         }
     }
 

@@ -1,6 +1,37 @@
 use crate::task::{AsilLevel, RepoName};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+
+/// Strategy for synchronizing local branches with remote changes.
+///
+/// After a PR is merged, the engine can fetch remote `main` and rebase
+/// in-flight task branches. The strategy controls when this happens.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SyncStrategy {
+    /// Sync after every PR merge.
+    Eager,
+    /// Sync after N merges have accumulated.
+    Batched,
+    /// Only sync when triggered manually via API or dashboard.
+    Manual,
+}
+
+impl Default for SyncStrategy {
+    fn default() -> Self {
+        Self::Eager
+    }
+}
+
+impl std::fmt::Display for SyncStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Eager => write!(f, "eager"),
+            Self::Batched => write!(f, "batched"),
+            Self::Manual => write!(f, "manual"),
+        }
+    }
+}
 
 /// Configuration for a managed repository.
 #[derive(Debug, Clone, Deserialize)]
@@ -45,6 +76,12 @@ pub struct CIConfig {
     /// Merge strategy: "squash", "merge", "rebase" (default: "squash").
     #[serde(default = "default_merge_strategy")]
     pub merge_strategy: String,
+    /// Remote sync strategy (default: eager).
+    #[serde(default)]
+    pub sync_strategy: SyncStrategy,
+    /// Number of merges before syncing in batched mode (default: 3).
+    #[serde(default = "default_sync_batch_size")]
+    pub sync_batch_size: u32,
 }
 
 fn default_ci_enabled() -> bool {
@@ -67,6 +104,10 @@ fn default_merge_strategy() -> String {
     "squash".into()
 }
 
+fn default_sync_batch_size() -> u32 {
+    3
+}
+
 impl Default for CIConfig {
     fn default() -> Self {
         Self {
@@ -75,6 +116,8 @@ impl Default for CIConfig {
             max_ci_retries: default_max_ci_retries(),
             auto_merge: default_auto_merge(),
             merge_strategy: default_merge_strategy(),
+            sync_strategy: SyncStrategy::default(),
+            sync_batch_size: default_sync_batch_size(),
         }
     }
 }

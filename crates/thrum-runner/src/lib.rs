@@ -11,5 +11,6 @@ pub mod parallel;
 pub mod sandbox;
 pub mod session_export;
 pub mod subprocess;
+pub mod sync;
 pub mod watcher;
 pub mod worktree;

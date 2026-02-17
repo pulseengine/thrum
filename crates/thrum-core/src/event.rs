@@ -213,6 +213,34 @@ pub enum EventKind {
         attempts: u32,
         failure_summary: String,
     },
+
+    // -- Remote sync events --
+    /// Remote sync cycle started for a repository.
+    SyncStarted { repo: RepoName, trigger: String },
+
+    /// Local main branch updated to match remote.
+    SyncMainUpdated {
+        repo: RepoName,
+        old_sha: String,
+        new_sha: String,
+    },
+
+    /// An in-flight task branch was rebased onto updated main.
+    SyncBranchRebased {
+        repo: RepoName,
+        branch: String,
+        task_id: Option<TaskId>,
+        success: bool,
+        conflict_summary: Option<String>,
+    },
+
+    /// Remote sync cycle completed for a repository.
+    SyncCompleted {
+        repo: RepoName,
+        branches_rebased: u32,
+        conflicts: u32,
+        duration_secs: f64,
+    },
 }
 
 /// What kind of file system change was detected.
@@ -457,6 +485,43 @@ impl std::fmt::Display for PipelineEvent {
             } => write!(
                 f,
                 "[{ts}] {task_id}: CI ESCALATED for PR #{pr_number} after {attempts} attempts: {failure_summary}"
+            ),
+
+            EventKind::SyncStarted { repo, trigger } => {
+                write!(f, "[{ts}] SYNC ({repo}): started (trigger={trigger})")
+            }
+
+            EventKind::SyncMainUpdated {
+                repo,
+                old_sha,
+                new_sha,
+            } => {
+                let short_old = &old_sha[..7.min(old_sha.len())];
+                let short_new = &new_sha[..7.min(new_sha.len())];
+                write!(
+                    f,
+                    "[{ts}] SYNC ({repo}): main updated {short_old}..{short_new}"
+                )
+            }
+
+            EventKind::SyncBranchRebased {
+                repo,
+                branch,
+                success,
+                ..
+            } => {
+                let status = if *success { "OK" } else { "CONFLICT" };
+                write!(f, "[{ts}] SYNC ({repo}): rebase {branch} {status}")
+            }
+
+            EventKind::SyncCompleted {
+                repo,
+                branches_rebased,
+                conflicts,
+                duration_secs,
+            } => write!(
+                f,
+                "[{ts}] SYNC ({repo}): completed ({branches_rebased} rebased, {conflicts} conflicts, {duration_secs:.1}s)"
             ),
         }
     }
@@ -721,6 +786,69 @@ mod tests {
         assert!(s.contains("CI ESCALATED"));
         assert!(s.contains("PR #42"));
         assert!(s.contains("3 attempts"));
+    }
+
+    #[test]
+    fn sync_started_display() {
+        let event = PipelineEvent::new(EventKind::SyncStarted {
+            repo: RepoName::new("loom"),
+            trigger: "eager".into(),
+        });
+        let s = event.to_string();
+        assert!(s.contains("SYNC (loom)"));
+        assert!(s.contains("trigger=eager"));
+    }
+
+    #[test]
+    fn sync_main_updated_display() {
+        let event = PipelineEvent::new(EventKind::SyncMainUpdated {
+            repo: RepoName::new("loom"),
+            old_sha: "abc1234def5678".into(),
+            new_sha: "fed8765cba4321".into(),
+        });
+        let s = event.to_string();
+        assert!(s.contains("SYNC (loom)"));
+        assert!(s.contains("main updated"));
+    }
+
+    #[test]
+    fn sync_branch_rebased_display() {
+        let event = PipelineEvent::new(EventKind::SyncBranchRebased {
+            repo: RepoName::new("loom"),
+            branch: "auto/TASK-0001/loom/feature".into(),
+            task_id: Some(TaskId(1)),
+            success: true,
+            conflict_summary: None,
+        });
+        let s = event.to_string();
+        assert!(s.contains("SYNC (loom)"));
+        assert!(s.contains("rebase"));
+        assert!(s.contains("OK"));
+    }
+
+    #[test]
+    fn sync_completed_display() {
+        let event = PipelineEvent::new(EventKind::SyncCompleted {
+            repo: RepoName::new("loom"),
+            branches_rebased: 3,
+            conflicts: 1,
+            duration_secs: 2.5,
+        });
+        let s = event.to_string();
+        assert!(s.contains("SYNC (loom)"));
+        assert!(s.contains("3 rebased"));
+        assert!(s.contains("1 conflicts"));
+    }
+
+    #[test]
+    fn sync_event_serialize_roundtrip() {
+        let event = PipelineEvent::new(EventKind::SyncStarted {
+            repo: RepoName::new("synth"),
+            trigger: "manual".into(),
+        });
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: PipelineEvent = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed.kind, EventKind::SyncStarted { .. }));
     }
 
     #[test]

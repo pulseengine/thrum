@@ -431,6 +431,7 @@ pub async fn run_ci_loop(
     roles: Option<&thrum_core::role::RolesConfig>,
     worktrees_dir: &Path,
     mut task: Task,
+    sync_tracker: Option<&crate::sync::SyncTracker>,
 ) -> Result<()> {
     let (
         pr_number,
@@ -530,6 +531,11 @@ pub async fn run_ci_loop(
                     from: old_label,
                     to: "merged".into(),
                 });
+
+                // Record the merge for sync tracking.
+                if let Some(tracker) = sync_tracker {
+                    tracker.record_merge();
+                }
 
                 tracing::info!(task_id = %task.id, "task merged via CI");
             } else {

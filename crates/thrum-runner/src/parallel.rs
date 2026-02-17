@@ -18,7 +18,7 @@ use thrum_core::agent::{AgentId, AgentSession};
 use thrum_core::budget::BudgetTracker;
 use thrum_core::coordination::ConflictPolicy;
 use thrum_core::event::EventKind;
-use thrum_core::repo::ReposConfig;
+use thrum_core::repo::{RepoConfig, ReposConfig};
 use thrum_core::task::{RepoName, Task};
 use thrum_db::task_store::{ClaimCategory, TaskStore};
 use tokio::sync::{Mutex, Semaphore};
@@ -77,6 +77,8 @@ pub struct PipelineContext {
     pub coordination: CoordinationHub,
     /// Policy for handling file conflicts between concurrent agents.
     pub conflict_policy: ConflictPolicy,
+    /// Per-repo sync trackers for counting PR merges.
+    pub sync_trackers: HashMap<String, crate::sync::SyncTracker>,
 }
 
 /// Result of a single agent run.
@@ -151,6 +153,9 @@ pub async fn run_parallel(
         // Process AwaitingCI tasks: poll their CI status and handle pass/fail.
         // This runs each iteration but tasks self-manage their polling interval.
         let ci_dispatched = dispatch_ci_tasks(&ctx, repo_filter.as_ref(), &mut join_set).await?;
+
+        // Run sync points: fetch remote, rebase in-flight branches.
+        run_sync_point(&ctx, repo_filter.as_ref());
 
         // Dispatch batch: try to claim and spawn agents
         let dispatched = dispatch_batch(
@@ -346,6 +351,12 @@ async fn dispatch_ci_tasks(
         let worktrees_dir = ctx.worktrees_dir.clone();
         let ctx_clone = Arc::clone(ctx);
 
+        // Share the sync tracker's counter with the spawned CI task.
+        let sync_counter = ctx
+            .sync_trackers
+            .get(&task.repo.to_string())
+            .map(|t| t.shared_counter());
+
         let session = thrum_core::agent::AgentSession::new(
             agent_id,
             task.id.clone(),
@@ -361,6 +372,7 @@ async fn dispatch_ci_tasks(
         join_set.spawn(async move {
             let mut session = session;
             let task_store = TaskStore::new(&ctx_clone.db);
+            let tracker = sync_counter.map(crate::sync::SyncTracker::from_shared);
             let outcome = crate::ci::run_ci_loop(
                 &task_store,
                 &ctx_clone.event_bus,
@@ -370,6 +382,7 @@ async fn dispatch_ci_tasks(
                 roles.as_deref(),
                 &worktrees_dir,
                 task,
+                tracker.as_ref(),
             )
             .await;
             session.finish();
@@ -380,6 +393,71 @@ async fn dispatch_ci_tasks(
     }
 
     Ok(dispatched)
+}
+
+/// Run sync points for repos that have pending merges.
+///
+/// This is called each iteration of the main dispatch loop. It checks
+/// each repo's sync tracker and runs a sync cycle if the strategy
+/// threshold is met.
+fn run_sync_point(ctx: &PipelineContext, repo_filter: Option<&RepoName>) {
+    let task_store = TaskStore::new(&ctx.db);
+    let all_tasks = task_store.list(None, None).unwrap_or_default();
+
+    // Build the list of in-flight tasks with their branches
+    let in_flight: Vec<(thrum_core::task::TaskId, String, String)> = all_tasks
+        .into_iter()
+        .filter(|t| crate::sync::is_in_flight(&t.status))
+        .map(|t| {
+            let branch = t.branch_name();
+            let repo = t.repo.to_string();
+            (t.id, branch, repo)
+        })
+        .collect();
+
+    // Filter repos if needed
+    let repos: Vec<&RepoConfig> = ctx
+        .repos_config
+        .repo
+        .iter()
+        .filter(|r| repo_filter.is_none() || repo_filter == Some(&r.name))
+        .collect();
+
+    for repo in repos {
+        let ci = match &repo.ci {
+            Some(ci) if ci.enabled => ci,
+            _ => continue,
+        };
+
+        if let Some(tracker) = ctx.sync_trackers.get(&repo.name.to_string()) {
+            if !crate::sync::should_sync(&ci.sync_strategy, tracker, ci.sync_batch_size) {
+                continue;
+            }
+
+            let repo_tasks: Vec<(thrum_core::task::TaskId, String)> = in_flight
+                .iter()
+                .filter(|(_, _, r)| r == &repo.name.to_string())
+                .map(|(id, branch, _)| (id.clone(), branch.clone()))
+                .collect();
+
+            match crate::sync::sync_repo(repo, &repo_tasks, &ctx.event_bus, "auto") {
+                Ok(_result) => {
+                    tracker.reset();
+                    tracing::info!(
+                        repo = %repo.name,
+                        "sync point completed"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        repo = %repo.name,
+                        error = %e,
+                        "sync point failed"
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// Try to dispatch agents for each claim category in priority order.

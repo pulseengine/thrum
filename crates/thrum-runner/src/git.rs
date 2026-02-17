@@ -267,6 +267,110 @@ impl GitRepo {
         Ok(true)
     }
 
+    /// Fetch from a remote using the git CLI (for SSH agent forwarding).
+    pub fn fetch_remote(&self, remote: &str) -> Result<()> {
+        let workdir = self
+            .repo
+            .workdir()
+            .context("bare repository cannot fetch")?;
+        let output = std::process::Command::new("git")
+            .args(["fetch", remote])
+            .current_dir(workdir)
+            .output()
+            .context("failed to run `git fetch`")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("git fetch {remote} failed: {stderr}");
+        }
+        Ok(())
+    }
+
+    /// Fast-forward or rebase local main to match remote main.
+    ///
+    /// Returns `(old_sha, new_sha)` if main was updated, or `None` if
+    /// already up-to-date.
+    pub fn sync_main_to_remote(&self, remote: &str) -> Result<Option<(String, String)>> {
+        let main = self.default_branch()?;
+        let workdir = self.repo.workdir().context("bare repository cannot sync")?;
+
+        let old_sha = {
+            let main_ref = format!("refs/heads/{main}");
+            self.repo.revparse_single(&main_ref)?.id().to_string()
+        };
+
+        // Use git CLI for the merge/rebase since it handles remote refs better.
+        let output = std::process::Command::new("git")
+            .args(["rebase", &format!("{remote}/{main}"), &main])
+            .current_dir(workdir)
+            .output()
+            .context("failed to rebase main onto remote")?;
+
+        if !output.status.success() {
+            // Abort the failed rebase
+            let _ = std::process::Command::new("git")
+                .args(["rebase", "--abort"])
+                .current_dir(workdir)
+                .output();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("failed to sync main to {remote}: {stderr}");
+        }
+
+        let new_sha = {
+            let main_ref = format!("refs/heads/{main}");
+            // Re-open to see updated refs
+            let repo = Repository::open(workdir)?;
+            repo.revparse_single(&main_ref)?.id().to_string()
+        };
+
+        if old_sha == new_sha {
+            Ok(None)
+        } else {
+            Ok(Some((old_sha, new_sha)))
+        }
+    }
+
+    /// Rebase a branch onto the default branch (main).
+    ///
+    /// Returns `Ok(true)` on success, `Ok(false)` if there were conflicts
+    /// (the rebase is aborted in that case).
+    pub fn rebase_branch_onto_main(&self, branch: &str) -> Result<bool> {
+        let main = self.default_branch()?;
+        let workdir = self
+            .repo
+            .workdir()
+            .context("bare repository cannot rebase")?;
+
+        let output = std::process::Command::new("git")
+            .args(["rebase", &main, branch])
+            .current_dir(workdir)
+            .output()
+            .context("failed to rebase branch")?;
+
+        if !output.status.success() {
+            // Abort the failed rebase
+            let _ = std::process::Command::new("git")
+                .args(["rebase", "--abort"])
+                .current_dir(workdir)
+                .output();
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    /// List all task branches matching the `auto/*` naming convention.
+    pub fn list_task_branches(&self) -> Result<Vec<String>> {
+        let mut branches = Vec::new();
+        for branch in self.repo.branches(Some(BranchType::Local))? {
+            let (branch, _) = branch?;
+            if let Some(name) = branch.name()?
+                && name.starts_with("auto/")
+            {
+                branches.push(name.to_string());
+            }
+        }
+        Ok(branches)
+    }
+
     /// Detect the default branch (main or master).
     fn default_branch(&self) -> Result<String> {
         if self.repo.find_branch("main", BranchType::Local).is_ok() {
@@ -391,6 +495,104 @@ mod tests {
         let committed = git.salvage_uncommitted("WIP: after lock cleanup").unwrap();
         assert!(committed);
         assert!(!lock_path.exists());
+    }
+
+    /// Create a bare "remote" and a clone of it for testing fetch/sync.
+    fn init_remote_and_clone() -> (tempfile::TempDir, tempfile::TempDir, GitRepo) {
+        // Create the "remote" repo
+        let remote_dir = tempfile::tempdir().unwrap();
+        let rp = remote_dir.path();
+        git_in(rp, &["init", "-b", "main"]);
+        git_in(rp, &["config", "user.email", "test@test.com"]);
+        git_in(rp, &["config", "user.name", "Test"]);
+        git_in(rp, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(rp.join("README.md"), "# Test").unwrap();
+        git_in(rp, &["add", "."]);
+        git_in(rp, &["commit", "-m", "initial"]);
+
+        // Clone it
+        let clone_dir = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args([
+                "clone",
+                rp.to_str().unwrap(),
+                clone_dir.path().to_str().unwrap(),
+            ])
+            .env_remove("GIT_DIR")
+            .output()
+            .unwrap();
+        git_in(clone_dir.path(), &["config", "user.email", "test@test.com"]);
+        git_in(clone_dir.path(), &["config", "user.name", "Test"]);
+        git_in(clone_dir.path(), &["config", "commit.gpgsign", "false"]);
+
+        let git = GitRepo::open(clone_dir.path()).unwrap();
+        (remote_dir, clone_dir, git)
+    }
+
+    #[test]
+    fn fetch_remote_succeeds() {
+        let (_remote_dir, _clone_dir, git) = init_remote_and_clone();
+        git.fetch_remote("origin").unwrap();
+    }
+
+    #[test]
+    fn sync_main_to_remote_detects_no_changes() {
+        let (_remote_dir, _clone_dir, git) = init_remote_and_clone();
+        git.fetch_remote("origin").unwrap();
+        let result = git.sync_main_to_remote("origin").unwrap();
+        assert!(result.is_none(), "should be up-to-date");
+    }
+
+    #[test]
+    fn sync_main_to_remote_detects_new_commits() {
+        let (remote_dir, _clone_dir, git) = init_remote_and_clone();
+
+        // Push a new commit to the remote
+        std::fs::write(remote_dir.path().join("new.txt"), "new content").unwrap();
+        git_in(remote_dir.path(), &["add", "."]);
+        git_in(remote_dir.path(), &["commit", "-m", "remote advance"]);
+
+        git.fetch_remote("origin").unwrap();
+        let result = git.sync_main_to_remote("origin").unwrap();
+        assert!(result.is_some(), "should detect new commits");
+        let (old_sha, new_sha) = result.unwrap();
+        assert_ne!(old_sha, new_sha);
+    }
+
+    #[test]
+    fn list_task_branches_filters_auto_prefix() {
+        let (_dir, git) = init_test_repo();
+        git.create_branch_detached("auto/TASK-0001/repo/feature")
+            .unwrap();
+        git.create_branch_detached("auto/TASK-0002/repo/other")
+            .unwrap();
+        git.create_branch_detached("feature/unrelated").unwrap();
+
+        let branches = git.list_task_branches().unwrap();
+        assert_eq!(branches.len(), 2);
+        assert!(branches.iter().all(|b| b.starts_with("auto/")));
+    }
+
+    #[test]
+    fn rebase_branch_onto_main_succeeds_clean() {
+        let (dir, git) = init_test_repo();
+        // Create a branch with a commit
+        git.create_branch("auto/TASK-0001/repo/feat").unwrap();
+        std::fs::write(dir.path().join("branch_file.txt"), "branch work").unwrap();
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "-m", "branch commit"]);
+
+        // Go back to main and add a commit there too
+        git.checkout("main").unwrap();
+        std::fs::write(dir.path().join("main_file.txt"), "main work").unwrap();
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "-m", "main advance"]);
+
+        // Rebase should succeed
+        let result = git
+            .rebase_branch_onto_main("auto/TASK-0001/repo/feat")
+            .unwrap();
+        assert!(result, "clean rebase should succeed");
     }
 
     #[test]

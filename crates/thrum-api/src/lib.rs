@@ -120,6 +120,7 @@ pub fn api_router(state: Arc<ApiState>) -> Router {
         .route("/api/v1/tasks/{id}/diff", get(get_task_diff))
         .route("/api/v1/tasks/{id}/approve", post(approve_task))
         .route("/api/v1/tasks/{id}/reject", post(reject_task))
+        .route("/api/v1/sync", post(trigger_sync))
         .route("/api/v1/traces", get(list_traces))
         // SSE event stream
         .route("/api/v1/events/stream", get(sse::event_stream))
@@ -510,6 +511,90 @@ async fn list_traces(
         "count": json_events.len(),
         "events": json_events,
     })))
+}
+
+// ─── Sync ────────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct SyncRequest {
+    /// Optional repo filter — sync only this repo.
+    repo: Option<String>,
+}
+
+#[derive(Serialize)]
+struct SyncResponse {
+    results: Vec<SyncRepoResult>,
+}
+
+#[derive(Serialize)]
+struct SyncRepoResult {
+    repo: String,
+    main_updated: bool,
+    branches_rebased: usize,
+    conflicts: usize,
+}
+
+async fn trigger_sync(
+    State(state): State<Arc<ApiState>>,
+    Json(req): Json<SyncRequest>,
+) -> Result<Json<SyncResponse>, AppError> {
+    let repos_config = match state.repos_config() {
+        Ok(c) => c,
+        Err(_) => {
+            return Ok(Json(SyncResponse {
+                results: Vec::new(),
+            }));
+        }
+    };
+
+    let task_store = TaskStore::new(state.db());
+    let all_tasks = task_store.list(None, None)?;
+
+    // Build in-flight tasks list
+    let in_flight: Vec<(TaskId, String)> = all_tasks
+        .iter()
+        .filter(|t| thrum_runner::sync::is_in_flight(&t.status))
+        .map(|t| (t.id.clone(), t.branch_name()))
+        .collect();
+
+    let mut results = Vec::new();
+
+    for repo_config in &repos_config.repo {
+        // Apply repo filter if provided
+        if let Some(ref filter) = req.repo
+            && repo_config.name.to_string() != *filter
+        {
+            continue;
+        }
+
+        let repo_tasks: Vec<(TaskId, String)> = in_flight
+            .iter()
+            .filter(|(_, _)| true) // All tasks (we filter by branch prefix matching)
+            .cloned()
+            .collect();
+
+        match thrum_runner::sync::sync_repo(repo_config, &repo_tasks, &state.event_bus, "manual") {
+            Ok(result) => {
+                results.push(SyncRepoResult {
+                    repo: result.repo,
+                    main_updated: result.main_updated,
+                    branches_rebased: result.rebased_branches.len(),
+                    conflicts: result.conflict_branches.len(),
+                });
+            }
+            Err(e) => {
+                tracing::warn!(repo = %repo_config.name, error = %e, "sync failed");
+                results.push(SyncRepoResult {
+                    repo: repo_config.name.to_string(),
+                    main_updated: false,
+                    branches_rebased: 0,
+                    conflicts: 0,
+                });
+            }
+        }
+    }
+
+    Ok(Json(SyncResponse { results }))
 }
 
 #[cfg(test)]
@@ -1179,6 +1264,38 @@ mod tests {
         assert!(rpc_resp["error"].is_null());
         assert_eq!(rpc_resp["result"]["id"], format!("thrum-{task_id}"));
         assert_eq!(rpc_resp["result"]["metadata"]["repo"], "cross-check");
+    }
+
+    #[tokio::test]
+    async fn sync_endpoint_returns_json() {
+        let (state, _dir) = test_state();
+        let app = api_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/sync")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["results"].is_array());
+    }
+
+    #[test]
+    fn sync_strategy_config_defaults() {
+        let config = thrum_core::repo::CIConfig::default();
+        assert_eq!(config.sync_strategy, thrum_core::repo::SyncStrategy::Eager);
+        assert_eq!(config.sync_batch_size, 3);
     }
 
     #[tokio::test]

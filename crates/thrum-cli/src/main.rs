@@ -416,6 +416,13 @@ async fn main() -> Result<()> {
                 conflict_policy,
             );
 
+            let sync_trackers: std::collections::HashMap<String, thrum_runner::sync::SyncTracker> =
+                repos_config
+                    .repo
+                    .iter()
+                    .map(|r| (r.name.to_string(), thrum_runner::sync::SyncTracker::new()))
+                    .collect();
+
             let ctx = Arc::new(PipelineContext {
                 db: shared_db,
                 repos_config: Arc::new(repos_config),
@@ -436,6 +443,7 @@ async fn main() -> Result<()> {
                 worktrees_dir: pipeline.engine.worktrees_dir,
                 coordination,
                 conflict_policy,
+                sync_trackers,
             });
 
             watch::run_watch_tui(ctx).await
@@ -811,6 +819,13 @@ async fn cmd_run_parallel(
     let coordination =
         thrum_runner::coordination_hub::CoordinationHub::new(event_bus.clone(), conflict_policy);
 
+    let sync_trackers: std::collections::HashMap<String, thrum_runner::sync::SyncTracker> =
+        repos_config
+            .repo
+            .iter()
+            .map(|r| (r.name.to_string(), thrum_runner::sync::SyncTracker::new()))
+            .collect();
+
     let ctx = Arc::new(PipelineContext {
         db: shared_db.clone(),
         repos_config: Arc::new(repos_config),
@@ -831,6 +846,7 @@ async fn cmd_run_parallel(
         worktrees_dir: pipeline.engine.worktrees_dir,
         coordination,
         conflict_policy,
+        sync_trackers,
     });
 
     let config = EngineConfig {
@@ -1003,6 +1019,7 @@ async fn cmd_run(
                     None,
                     &std::path::PathBuf::from("worktrees"),
                     ci_task,
+                    None,
                 )
                 .await;
                 match result {

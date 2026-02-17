@@ -72,6 +72,7 @@ pub fn dashboard_router() -> Router<Arc<ApiState>> {
         .route("/dashboard/budget/update", post(update_budget_action))
         .route("/dashboard/partials/config", get(config_partial))
         .route("/dashboard/a2a/send", post(a2a_send_action))
+        .route("/dashboard/sync", post(sync_action))
 }
 
 // ─── Page & Assets ──────────────────────────────────────────────────────
@@ -1380,6 +1381,62 @@ async fn a2a_send_action(
         task.id.0,
         escape_html(&task.title),
     )))
+}
+
+// ─── Sync Action ────────────────────────────────────────────────────────
+
+/// POST /dashboard/sync — trigger manual sync for all repos.
+async fn sync_action(State(state): State<Arc<ApiState>>) -> Result<Html<String>, DashboardError> {
+    let repos_config = match &state.config_path {
+        Some(path) => ReposConfig::load(path).map_err(|e| DashboardError(e.to_string()))?,
+        None => {
+            return Ok(Html(
+                "<div class=\"action-result error\">No repos config</div>".into(),
+            ));
+        }
+    };
+
+    let task_store = TaskStore::new(state.db());
+    let all_tasks = task_store.list(None, None)?;
+
+    let in_flight: Vec<(thrum_core::task::TaskId, String)> = all_tasks
+        .iter()
+        .filter(|t| thrum_runner::sync::is_in_flight(&t.status))
+        .map(|t| (t.id.clone(), t.branch_name()))
+        .collect();
+
+    let mut html = String::with_capacity(1024);
+    html.push_str("<div class=\"action-result success\">Sync results:<ul>");
+
+    for repo in &repos_config.repo {
+        match thrum_runner::sync::sync_repo(repo, &in_flight, &state.event_bus, "manual") {
+            Ok(result) => {
+                let status = if result.main_updated {
+                    "updated"
+                } else {
+                    "up-to-date"
+                };
+                let _ = write!(
+                    html,
+                    "<li>{}: main {status}, {} branches rebased, {} conflicts</li>",
+                    escape_html(&result.repo),
+                    result.rebased_branches.len(),
+                    result.conflict_branches.len(),
+                );
+            }
+            Err(e) => {
+                let _ = write!(
+                    html,
+                    "<li>{}: error — {}</li>",
+                    escape_html(&repo.name.to_string()),
+                    escape_html(&e.to_string()),
+                );
+            }
+        }
+    }
+
+    html.push_str("</ul></div>");
+    Ok(Html(html))
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────

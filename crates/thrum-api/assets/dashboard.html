@@ -37,6 +37,16 @@
              hx-indicator="#poll-indicator">
         </div>
 
+        <!-- Sync Repos — manual trigger -->
+        <div style="margin: 8px 0; display: flex; align-items: center; gap: 12px;">
+            <button class="btn btn-sm"
+                    hx-post="/dashboard/sync"
+                    hx-target="#sync-result"
+                    hx-swap="innerHTML"
+                    hx-indicator="#poll-indicator">Sync Repos</button>
+            <div id="sync-result" style="flex:1;"></div>
+        </div>
+
         <!-- Task Queue — polls every 15s, morph preserves dropdowns/checkboxes -->
         <div class="section">
             <h2>Task Queue</h2>
