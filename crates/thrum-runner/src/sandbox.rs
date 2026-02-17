@@ -415,6 +415,36 @@ pub fn write_seatbelt_profile(work_dir: &Path, scratch_dir: &Path) -> Result<Pat
     let tmpdir = std::env::temp_dir();
     let tmpdir = std::fs::canonicalize(&tmpdir).unwrap_or(tmpdir);
 
+    // Git worktrees: the worktree dir (work_dir) contains a `.git` *file*
+    // pointing to `<repo_root>/.git/worktrees/<name>`. Git commit/branch/ref
+    // operations write to that directory, not the worktree itself. We must
+    // allow writes there or agents cannot commit.
+    let git_worktrees_dir = {
+        let gitdir_file = work_dir.join(".git");
+        if gitdir_file.is_file() {
+            // Read the gitdir pointer: "gitdir: /path/to/.git/worktrees/<name>"
+            std::fs::read_to_string(&gitdir_file)
+                .ok()
+                .and_then(|content| {
+                    content
+                        .strip_prefix("gitdir: ")
+                        .map(|p| PathBuf::from(p.trim()))
+                })
+        } else {
+            None
+        }
+    };
+
+    let git_worktrees_rule = git_worktrees_dir
+        .as_ref()
+        .map(|d| {
+            format!(
+                "    ;; Git worktree metadata (refs, HEAD, index)\n    (subpath \"{}\")",
+                d.display()
+            )
+        })
+        .unwrap_or_default();
+
     let profile = format!(
         r#"(version 1)
 (deny default)
@@ -442,6 +472,7 @@ pub fn write_seatbelt_profile(work_dir: &Path, scratch_dir: &Path) -> Result<Pat
 (allow file-write*
     (subpath "{work_dir}")
     (subpath "{scratch_dir}")
+{git_worktrees_rule}
     (subpath "/private/tmp")
     (subpath "/tmp")
     (subpath "/dev")
@@ -464,6 +495,7 @@ pub fn write_seatbelt_profile(work_dir: &Path, scratch_dir: &Path) -> Result<Pat
         work_dir = work_dir.display(),
         scratch_dir = scratch_dir.display(),
         tmpdir = tmpdir.display(),
+        git_worktrees_rule = git_worktrees_rule,
     );
 
     let profile_path = std::env::temp_dir().join(format!(
