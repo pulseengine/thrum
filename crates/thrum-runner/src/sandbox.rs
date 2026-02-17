@@ -408,56 +408,32 @@ pub fn write_seatbelt_profile(work_dir: &Path, scratch_dir: &Path) -> Result<Pat
         r#"(version 1)
 (deny default)
 
-;; Process execution
-(allow process-exec)
-(allow process-fork)
+;; Process lifecycle
+(allow process*)
 (allow signal)
 
-;; macOS IPC (required for system frameworks)
-(allow sysctl-read)
-(allow mach-lookup)
-(allow mach-register)
-(allow ipc-posix-shm-read*)
-(allow ipc-posix-shm-write-data)
+;; macOS IPC, Mach, sysctl (required for system frameworks, dyld, etc.)
+(allow sysctl*)
+(allow mach*)
+(allow ipc*)
 
 ;; Network (agents need API access for LLM calls)
 (allow network*)
 
-;; Read access — system, toolchain, and working directories
-(allow file-read*
-    (subpath "/usr")
-    (subpath "/bin")
-    (subpath "/sbin")
-    (subpath "/opt/homebrew")
-    (subpath "/Library")
-    (subpath "/System")
-    (subpath "/private/etc")
-    (subpath "/private/var")
-    (subpath "/private/tmp")
-    (subpath "/dev")
-    (subpath "/etc")
-    (subpath "/var")
-    (subpath "/tmp")
-    (subpath "/nix")
-    ;; Rust toolchain
-    (subpath "{home}/.cargo")
-    (subpath "{home}/.rustup")
-    ;; Agent config
-    (subpath "{home}/.config")
-    (subpath "{home}/.claude")
-    ;; Working directories (worktree + scratch)
-    (subpath "{work_dir}")
-    (subpath "{scratch_dir}")
-)
+;; Read access — unrestricted. Restricting reads breaks dyld, system
+;; frameworks, and node/npm in hard-to-predict ways. The security
+;; boundary is on *writes*.
+(allow file-read*)
 
-;; Write access — only worktree, scratch, and temp
+;; Write access — only worktree, scratch, temp, and essential caches.
+;; This is the core sandbox constraint: agents cannot write outside
+;; their designated working area.
 (allow file-write*
     (subpath "{work_dir}")
     (subpath "{scratch_dir}")
     (subpath "/private/tmp")
     (subpath "/tmp")
-    (subpath "/dev/null")
-    (subpath "/dev/tty")
+    (subpath "/dev")
     ;; Cargo build cache (shared across agents)
     (subpath "{home}/.cargo/registry")
     (subpath "{home}/.cargo/git")
