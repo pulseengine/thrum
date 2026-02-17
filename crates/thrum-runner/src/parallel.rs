@@ -955,6 +955,59 @@ pub mod pipeline {
             tokio::time::sleep(std::time::Duration::from_secs(RATE_LIMIT_COOLDOWN_SECS)).await;
         }
 
+        // Salvage uncommitted partial work before checking for changes.
+        // If the agent timed out or errored before committing, there may be
+        // useful partial progress in the worktree. Committing it as WIP
+        // preserves it on the branch so the next retry can continue.
+        let work_dir = repo_config.path.join(format!(
+            "worktrees/{}",
+            task.branch_name().replace('/', "_")
+        ));
+        if work_dir.exists() {
+            match crate::git::GitRepo::open(&work_dir) {
+                Ok(g) => {
+                    let reason = if result.timed_out {
+                        "timed out".to_string()
+                    } else if let Some(code) = result.exit_code {
+                        format!("agent exited with code {code}")
+                    } else {
+                        "agent stopped".to_string()
+                    };
+                    let msg = format!("WIP: partial progress ({})", reason);
+                    match g.salvage_uncommitted(&msg) {
+                        Ok(true) => {
+                            tracing::info!(
+                                task_id = %task.id,
+                                "salvaged uncommitted partial work as WIP commit"
+                            );
+                            event_bus.emit(EventKind::EngineLog {
+                                level: thrum_core::event::LogLevel::Info,
+                                message: format!(
+                                    "TASK-{:04} salvaged partial work as WIP commit ({})",
+                                    task.id.0, reason,
+                                ),
+                            });
+                        }
+                        Ok(false) => {} // clean worktree, nothing to salvage
+                        Err(e) => {
+                            tracing::warn!(
+                                task_id = %task.id,
+                                error = %e,
+                                "failed to salvage partial work — continuing without it"
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        task_id = %task.id,
+                        error = %e,
+                        "could not open worktree for salvage — skipping"
+                    );
+                }
+            }
+        }
+
         // Check if the implementation actually produced any changes.
         // If the branch has no commits beyond main, the agent returned empty
         // (e.g., due to rate limits, API errors, or permission issues).

@@ -221,6 +221,47 @@ impl GitRepo {
         crate::worktree::Worktree::create(repo_path, branch, base_dir)
     }
 
+    /// Salvage uncommitted changes by staging and committing them as WIP.
+    ///
+    /// Returns `Ok(true)` if a WIP commit was created, `Ok(false)` if the
+    /// worktree was clean (nothing to salvage). Errors are non-fatal — the
+    /// caller should log and continue.
+    ///
+    /// This is used to preserve partial agent work when an invocation times
+    /// out or fails before the agent can commit. The WIP commit stays on
+    /// the branch so the next retry has the partial progress.
+    pub fn salvage_uncommitted(&self, message: &str) -> Result<bool> {
+        // Remove stale index.lock left by killed agent processes.
+        if let Some(workdir) = self.repo.workdir() {
+            let lock = workdir.join(".git/index.lock");
+            if lock.exists() {
+                tracing::warn!(path = %lock.display(), "removing stale index.lock");
+                let _ = std::fs::remove_file(&lock);
+            }
+        }
+
+        // Check if there's anything to salvage.
+        let statuses = self.repo.statuses(None)?;
+        if statuses.is_empty() {
+            return Ok(false);
+        }
+
+        // Stage all changes (respects .gitignore).
+        let mut index = self.repo.index()?;
+        index.add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)?;
+        index.write()?;
+        let tree_oid = index.write_tree()?;
+        let tree = self.repo.find_tree(tree_oid)?;
+
+        // Commit.
+        let sig = self.signature()?;
+        let head = self.repo.head()?.peel_to_commit()?;
+        self.repo
+            .commit(Some("HEAD"), &sig, &sig, message, &tree, &[&head])?;
+
+        Ok(true)
+    }
+
     /// Detect the default branch (main or master).
     fn default_branch(&self) -> Result<String> {
         if self.repo.find_branch("main", BranchType::Local).is_ok() {
@@ -302,5 +343,48 @@ mod tests {
         git.create_branch("test-branch").unwrap();
         let branch = git.current_branch().unwrap();
         assert_eq!(branch, "test-branch");
+    }
+
+    #[test]
+    fn salvage_uncommitted_creates_wip_commit() {
+        let (dir, git) = init_test_repo();
+        let initial_sha = git.head_sha().unwrap();
+
+        // Write an uncommitted file
+        std::fs::write(dir.path().join("partial.rs"), "fn wip() {}").unwrap();
+        assert!(!git.is_clean().unwrap());
+
+        // Salvage it
+        let committed = git.salvage_uncommitted("WIP: timed out").unwrap();
+        assert!(committed);
+
+        // Worktree should now be clean
+        assert!(git.is_clean().unwrap());
+
+        // HEAD should have moved
+        let new_sha = git.head_sha().unwrap();
+        assert_ne!(initial_sha, new_sha);
+    }
+
+    #[test]
+    fn salvage_uncommitted_noop_on_clean_worktree() {
+        let (_dir, git) = init_test_repo();
+        let committed = git.salvage_uncommitted("WIP: nothing here").unwrap();
+        assert!(!committed);
+    }
+
+    #[test]
+    fn salvage_uncommitted_removes_stale_index_lock() {
+        let (dir, git) = init_test_repo();
+        let lock_path = dir.path().join(".git/index.lock");
+        std::fs::write(&lock_path, "stale").unwrap();
+        assert!(lock_path.exists());
+
+        // Write a file so there's something to commit
+        std::fs::write(dir.path().join("file.txt"), "content").unwrap();
+
+        let committed = git.salvage_uncommitted("WIP: after lock cleanup").unwrap();
+        assert!(committed);
+        assert!(!lock_path.exists());
     }
 }
