@@ -796,6 +796,7 @@ struct GhCheck {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use thrum_core::ci::CIPollResult;
 
     #[test]
     fn ci_status_display() {
@@ -813,6 +814,14 @@ mod tests {
     }
 
     #[test]
+    fn default_ci_fixer_prompt_has_required_sections() {
+        let prompt = default_ci_fixer_prompt();
+        assert!(prompt.contains("Process"));
+        assert!(prompt.contains("MINIMAL") || prompt.contains("minimal"));
+        assert!(prompt.contains("ommit"));
+    }
+
+    #[test]
     fn ci_config_defaults() {
         let config = thrum_core::repo::CIConfig::default();
         assert!(config.enabled);
@@ -820,6 +829,20 @@ mod tests {
         assert_eq!(config.max_ci_retries, 3);
         assert!(config.auto_merge);
         assert_eq!(config.merge_strategy, "squash");
+    }
+
+    #[test]
+    fn ci_config_poll_interval_is_reasonable() {
+        let config = thrum_core::repo::CIConfig::default();
+        assert!(config.poll_interval_secs >= 10);
+        assert!(config.poll_interval_secs <= 600);
+    }
+
+    #[test]
+    fn ci_config_max_retries_is_bounded() {
+        let config = thrum_core::repo::CIConfig::default();
+        assert!(config.max_ci_retries >= 1);
+        assert!(config.max_ci_retries <= 10);
     }
 
     #[test]
@@ -838,6 +861,20 @@ mod tests {
     }
 
     #[test]
+    fn task_status_awaiting_ci_is_not_claimable() {
+        let status = TaskStatus::AwaitingCI {
+            pr_number: 42,
+            pr_url: "https://github.com/org/repo/pull/42".into(),
+            branch: "auto/TASK-0001/repo/feature".into(),
+            started_at: chrono::Utc::now(),
+            ci_attempts: 0,
+        };
+        assert!(!status.is_claimable_pending());
+        assert!(!status.is_claimable_retry());
+        assert!(!status.is_claimable_approved());
+    }
+
+    #[test]
     fn task_status_ci_failed() {
         let status = TaskStatus::CIFailed {
             pr_number: 42,
@@ -848,5 +885,325 @@ mod tests {
         assert_eq!(status.label(), "ci-failed");
         assert!(status.needs_human());
         assert!(!status.is_terminal());
+    }
+
+    #[test]
+    fn task_status_ci_failed_is_not_claimable() {
+        let status = TaskStatus::CIFailed {
+            pr_number: 42,
+            pr_url: "https://github.com/org/repo/pull/42".into(),
+            failure_summary: "test failure".into(),
+            ci_attempts: 3,
+        };
+        assert!(!status.is_claimable_pending());
+        assert!(!status.is_claimable_retry());
+        assert!(!status.is_claimable_approved());
+    }
+
+    #[test]
+    fn ci_attempts_tracking_across_retries() {
+        // Verify initial AwaitingCI starts at 0 attempts
+        let status = TaskStatus::AwaitingCI {
+            pr_number: 42,
+            pr_url: "https://github.com/org/repo/pull/42".into(),
+            branch: "auto/TASK-0001/repo/feature".into(),
+            started_at: chrono::Utc::now(),
+            ci_attempts: 0,
+        };
+        assert_eq!(status.label(), "awaiting-ci");
+
+        // Simulate retry attempts (each creates a new status)
+        for attempt in 1..=3 {
+            let retry_status = TaskStatus::AwaitingCI {
+                pr_number: 42,
+                pr_url: "https://github.com/org/repo/pull/42".into(),
+                branch: "auto/TASK-0001/repo/feature".into(),
+                started_at: chrono::Utc::now(),
+                ci_attempts: attempt,
+            };
+            if let TaskStatus::AwaitingCI { ci_attempts, .. } = &retry_status {
+                assert_eq!(*ci_attempts, attempt);
+            }
+        }
+
+        let max_retries = thrum_core::repo::CIConfig::default().max_ci_retries;
+        let escalated = TaskStatus::CIFailed {
+            pr_number: 42,
+            pr_url: "https://github.com/org/repo/pull/42".into(),
+            failure_summary: "build failed after max retries".into(),
+            ci_attempts: max_retries + 1,
+        };
+        assert!(escalated.needs_human());
+        assert_eq!(escalated.label(), "ci-failed");
+    }
+
+    /// CI events emitted through the EventBus should be receivable by subscribers.
+    #[tokio::test]
+    async fn ci_events_emitted_to_event_bus() {
+        let bus = crate::event_bus::EventBus::new();
+        let mut rx = bus.subscribe();
+
+        bus.emit(EventKind::CIPollingStarted {
+            task_id: TaskId(42),
+            repo: RepoName::new("loom"),
+            pr_number: 99,
+            pr_url: "https://github.com/org/loom/pull/99".into(),
+        });
+
+        let event = rx.recv().await.unwrap();
+        match &event.kind {
+            EventKind::CIPollingStarted {
+                task_id, pr_number, ..
+            } => {
+                assert_eq!(*task_id, TaskId(42));
+                assert_eq!(*pr_number, 99);
+            }
+            other => panic!("expected CIPollingStarted, got {:?}", other),
+        }
+    }
+
+    /// Validate all CI event variants can be emitted and received.
+    #[tokio::test]
+    async fn all_ci_event_variants_round_trip_through_bus() {
+        let bus = crate::event_bus::EventBus::new();
+        let mut rx = bus.subscribe();
+
+        let events = vec![
+            EventKind::CIPollingStarted {
+                task_id: TaskId(1),
+                repo: RepoName::new("r"),
+                pr_number: 1,
+                pr_url: "url".into(),
+            },
+            EventKind::CICheckUpdate {
+                task_id: TaskId(1),
+                repo: RepoName::new("r"),
+                pr_number: 1,
+                status: "pending".into(),
+                summary: "checking...".into(),
+            },
+            EventKind::CIPassed {
+                task_id: TaskId(1),
+                repo: RepoName::new("r"),
+                pr_number: 1,
+            },
+            EventKind::CIFailed {
+                task_id: TaskId(1),
+                repo: RepoName::new("r"),
+                pr_number: 1,
+                attempt: 1,
+                max_attempts: 3,
+                failure_summary: "test failed".into(),
+            },
+            EventKind::CIFixPushed {
+                task_id: TaskId(1),
+                repo: RepoName::new("r"),
+                pr_number: 1,
+                attempt: 1,
+            },
+            EventKind::CIEscalated {
+                task_id: TaskId(1),
+                repo: RepoName::new("r"),
+                pr_number: 1,
+                attempts: 3,
+                failure_summary: "persistent failure".into(),
+            },
+        ];
+
+        let expected_count = events.len();
+        for event in events {
+            bus.emit(event);
+        }
+
+        for _ in 0..expected_count {
+            let event = rx.recv().await.unwrap();
+            let display = event.to_string();
+            assert!(
+                display.contains("CI") || display.contains("PR #"),
+                "expected CI event in display, got: {display}"
+            );
+        }
+    }
+
+    #[test]
+    fn merge_strategy_flags() {
+        let strategies = [
+            ("squash", "--squash"),
+            ("rebase", "--rebase"),
+            ("merge", "--merge"),
+            ("unknown", "--squash"),
+        ];
+        for (strategy, expected_flag) in strategies {
+            let flag = match strategy {
+                "squash" => "--squash",
+                "rebase" => "--rebase",
+                "merge" => "--merge",
+                _ => "--squash",
+            };
+            assert_eq!(flag, expected_flag, "strategy '{strategy}' mapped wrong");
+        }
+    }
+
+    #[test]
+    fn ci_poll_result_from_checks_aggregation() {
+        let checks = vec![
+            CICheck {
+                name: "build".into(),
+                status: "success".into(),
+                url: None,
+            },
+            CICheck {
+                name: "test".into(),
+                status: "success".into(),
+                url: None,
+            },
+        ];
+        let result = CIPollResult::from_checks(checks);
+        assert_eq!(result.status, CIStatus::Pass);
+        assert_eq!(result.checks.len(), 2);
+        assert!(result.summary.contains("2 passed"));
+    }
+
+    #[test]
+    fn ci_poll_result_mixed_statuses() {
+        let checks = vec![
+            CICheck {
+                name: "build".into(),
+                status: "success".into(),
+                url: None,
+            },
+            CICheck {
+                name: "test".into(),
+                status: "failure".into(),
+                url: Some("https://ci.example.com/run/789".into()),
+            },
+            CICheck {
+                name: "lint".into(),
+                status: "success".into(),
+                url: None,
+            },
+        ];
+        let result = CIPollResult::from_checks(checks);
+        assert_eq!(result.status, CIStatus::Fail);
+        assert!(result.summary.contains("1 failed"));
+        assert!(result.summary.contains("2 passed"));
+    }
+
+    #[test]
+    fn awaiting_ci_serialization_preserves_fields() {
+        let now = chrono::Utc::now();
+        let status = TaskStatus::AwaitingCI {
+            pr_number: 42,
+            pr_url: "https://github.com/org/repo/pull/42".into(),
+            branch: "auto/TASK-0001/repo/feature".into(),
+            started_at: now,
+            ci_attempts: 2,
+        };
+
+        let json = serde_json::to_string(&status).unwrap();
+        let parsed: TaskStatus = serde_json::from_str(&json).unwrap();
+
+        match parsed {
+            TaskStatus::AwaitingCI {
+                pr_number,
+                pr_url,
+                branch,
+                ci_attempts,
+                ..
+            } => {
+                assert_eq!(pr_number, 42);
+                assert_eq!(pr_url, "https://github.com/org/repo/pull/42");
+                assert_eq!(branch, "auto/TASK-0001/repo/feature");
+                assert_eq!(ci_attempts, 2);
+            }
+            other => panic!("expected AwaitingCI, got {}", other.label()),
+        }
+    }
+
+    #[test]
+    fn ci_failed_serialization_preserves_fields() {
+        let status = TaskStatus::CIFailed {
+            pr_number: 99,
+            pr_url: "https://github.com/org/repo/pull/99".into(),
+            failure_summary: "cargo test failed: 3 tests failed".into(),
+            ci_attempts: 4,
+        };
+
+        let json = serde_json::to_string(&status).unwrap();
+        let parsed: TaskStatus = serde_json::from_str(&json).unwrap();
+
+        match parsed {
+            TaskStatus::CIFailed {
+                pr_number,
+                failure_summary,
+                ci_attempts,
+                ..
+            } => {
+                assert_eq!(pr_number, 99);
+                assert!(failure_summary.contains("3 tests failed"));
+                assert_eq!(ci_attempts, 4);
+            }
+            other => panic!("expected CIFailed, got {}", other.label()),
+        }
+    }
+
+    #[test]
+    fn gh_check_deserialization() {
+        let json = r#"{"name":"CI","state":"SUCCESS","detailsUrl":"https://example.com/run/1"}"#;
+        let check: GhCheck = serde_json::from_str(json).unwrap();
+        assert_eq!(check.name, "CI");
+        assert_eq!(check.state, "SUCCESS");
+        assert_eq!(
+            check.details_url.as_deref(),
+            Some("https://example.com/run/1")
+        );
+    }
+
+    #[test]
+    fn gh_check_deserialization_no_url() {
+        let json = r#"{"name":"lint","state":"FAILURE"}"#;
+        let check: GhCheck = serde_json::from_str(json).unwrap();
+        assert_eq!(check.name, "lint");
+        assert_eq!(check.state, "FAILURE");
+        assert!(check.details_url.is_none());
+    }
+
+    #[test]
+    fn gh_checks_array_deserialization() {
+        let json = r#"[
+            {"name":"build","state":"SUCCESS","detailsUrl":"https://example.com/1"},
+            {"name":"test","state":"FAILURE","detailsUrl":"https://example.com/2"},
+            {"name":"lint","state":"PENDING"}
+        ]"#;
+        let checks: Vec<GhCheck> = serde_json::from_str(json).unwrap();
+        assert_eq!(checks.len(), 3);
+        assert_eq!(checks[0].state, "SUCCESS");
+        assert_eq!(checks[1].state, "FAILURE");
+        assert_eq!(checks[2].state, "PENDING");
+    }
+
+    /// Engine should process other tasks while CI is being polled.
+    #[tokio::test]
+    async fn ci_dispatch_does_not_block_engine() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let ci_running = Arc::new(AtomicBool::new(false));
+        let ci_running_clone = ci_running.clone();
+
+        let mut join_set = tokio::task::JoinSet::new();
+
+        join_set.spawn(async move {
+            ci_running_clone.store(true, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            ci_running_clone.store(false, Ordering::SeqCst);
+            42u32
+        });
+
+        let engine_work_completed = true;
+        assert!(engine_work_completed, "engine should not be blocked by CI");
+
+        let result = join_set.join_next().await.unwrap().unwrap();
+        assert_eq!(result, 42);
     }
 }

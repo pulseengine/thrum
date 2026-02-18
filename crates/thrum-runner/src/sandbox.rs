@@ -419,31 +419,59 @@ pub fn write_seatbelt_profile(work_dir: &Path, scratch_dir: &Path) -> Result<Pat
     // pointing to `<repo_root>/.git/worktrees/<name>`. Git commit/branch/ref
     // operations write to that directory, not the worktree itself. We must
     // allow writes there or agents cannot commit.
-    let git_worktrees_dir = {
+    //
+    // Additionally, git worktrees share the main repo's objects/ and refs/
+    // directories. `git add` writes blob objects to .git/objects/ and
+    // `git commit` updates refs in .git/refs/. Without write access to
+    // the common git dir, agents in worktrees cannot commit at all.
+    let (git_worktrees_dir, git_common_dir) = {
         let gitdir_file = work_dir.join(".git");
         if gitdir_file.is_file() {
             // Read the gitdir pointer: "gitdir: /path/to/.git/worktrees/<name>"
-            std::fs::read_to_string(&gitdir_file)
+            let worktree_git_dir = std::fs::read_to_string(&gitdir_file)
                 .ok()
                 .and_then(|content| {
                     content
                         .strip_prefix("gitdir: ")
                         .map(|p| PathBuf::from(p.trim()))
+                });
+
+            // Resolve the common dir (the main .git directory) which contains
+            // the shared objects/ and refs/ directories.
+            let common_dir = worktree_git_dir.as_ref().and_then(|wt_dir| {
+                let commondir_file = wt_dir.join("commondir");
+                std::fs::read_to_string(&commondir_file).ok().map(|rel| {
+                    let rel = rel.trim();
+                    if Path::new(rel).is_absolute() {
+                        PathBuf::from(rel)
+                    } else {
+                        // commondir is relative to the worktree git dir
+                        let resolved = wt_dir.join(rel);
+                        std::fs::canonicalize(&resolved).unwrap_or(resolved)
+                    }
                 })
+            });
+
+            (worktree_git_dir, common_dir)
         } else {
-            None
+            (None, None)
         }
     };
 
-    let git_worktrees_rule = git_worktrees_dir
-        .as_ref()
-        .map(|d| {
-            format!(
-                "    ;; Git worktree metadata (refs, HEAD, index)\n    (subpath \"{}\")",
-                d.display()
-            )
-        })
-        .unwrap_or_default();
+    let mut git_rules = String::new();
+    if let Some(d) = &git_worktrees_dir {
+        git_rules.push_str(&format!(
+            "    ;; Git worktree metadata (refs, HEAD, index)\n    (subpath \"{}\")\n",
+            d.display()
+        ));
+    }
+    if let Some(d) = &git_common_dir {
+        git_rules.push_str(&format!(
+            "    ;; Git common dir (shared objects, refs, packed-refs)\n    (subpath \"{}\")\n",
+            d.display()
+        ));
+    }
+    let git_worktrees_rule = git_rules;
 
     let profile = format!(
         r#"(version 1)

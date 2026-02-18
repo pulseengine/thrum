@@ -145,4 +145,97 @@ mod tests {
         assert_eq!(overridden.lint_cmd, config.lint_cmd);
         assert_eq!(overridden.fmt_cmd, config.fmt_cmd);
     }
+
+    #[test]
+    fn ci_config_default_values() {
+        let ci = CIConfig::default();
+        assert!(ci.enabled, "CI should be enabled by default");
+        assert_eq!(
+            ci.poll_interval_secs, 60,
+            "default poll interval should be 60s"
+        );
+        assert_eq!(ci.max_ci_retries, 3, "default max retries should be 3");
+        assert!(ci.auto_merge, "auto_merge should be true by default");
+        assert_eq!(
+            ci.merge_strategy, "squash",
+            "default merge strategy should be squash"
+        );
+    }
+
+    #[test]
+    fn ci_config_from_toml() {
+        let toml_str = r#"
+            enabled = true
+            poll_interval_secs = 120
+            max_ci_retries = 5
+            auto_merge = false
+            merge_strategy = "rebase"
+        "#;
+        let ci: CIConfig = toml::from_str(toml_str).unwrap();
+        assert!(ci.enabled);
+        assert_eq!(ci.poll_interval_secs, 120);
+        assert_eq!(ci.max_ci_retries, 5);
+        assert!(!ci.auto_merge);
+        assert_eq!(ci.merge_strategy, "rebase");
+    }
+
+    #[test]
+    fn ci_config_from_toml_with_defaults() {
+        let toml_str = r#"
+            poll_interval_secs = 30
+        "#;
+        let ci: CIConfig = toml::from_str(toml_str).unwrap();
+        assert!(ci.enabled);
+        assert_eq!(ci.poll_interval_secs, 30);
+        assert_eq!(ci.max_ci_retries, 3);
+        assert!(ci.auto_merge);
+        assert_eq!(ci.merge_strategy, "squash");
+    }
+
+    #[test]
+    fn repo_config_ci_opt_in() {
+        let config = test_repo_config();
+        let ci_enabled = config.ci.as_ref().is_some_and(|ci| ci.enabled);
+        assert!(!ci_enabled, "CI should be opt-in (disabled when ci=None)");
+    }
+
+    #[test]
+    fn repo_config_with_ci_enabled() {
+        let mut config = test_repo_config();
+        config.ci = Some(CIConfig::default());
+        let ci_enabled = config.ci.as_ref().is_some_and(|ci| ci.enabled);
+        assert!(
+            ci_enabled,
+            "CI should be enabled when section is present with defaults"
+        );
+    }
+
+    #[test]
+    fn repo_config_with_ci_disabled() {
+        let mut config = test_repo_config();
+        config.ci = Some(CIConfig {
+            enabled: false,
+            ..CIConfig::default()
+        });
+        let ci_enabled = config.ci.as_ref().is_some_and(|ci| ci.enabled);
+        assert!(!ci_enabled, "CI should be disabled when enabled=false");
+    }
+
+    #[test]
+    fn with_work_dir_preserves_ci_config() {
+        let mut config = test_repo_config();
+        config.ci = Some(CIConfig {
+            poll_interval_secs: 30,
+            max_ci_retries: 5,
+            ..CIConfig::default()
+        });
+        let overridden = config.with_work_dir(PathBuf::from("/worktree"));
+        assert!(
+            overridden.ci.is_some(),
+            "CI config should be preserved in worktree"
+        );
+        let ci = overridden.ci.unwrap();
+        assert_eq!(ci.poll_interval_secs, 30);
+        assert_eq!(ci.max_ci_retries, 5);
+    }
 }
