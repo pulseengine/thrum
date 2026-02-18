@@ -72,7 +72,7 @@ checksums = "sha256"
 # Overall spending ceiling and per-session timeout for AI agents.
 
 [budget]
-ceiling_usd = 1000.0
+ceiling_usd = 2000.0
 per_session_timeout_secs = 600
 
 [budget.allocation]

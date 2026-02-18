@@ -1357,9 +1357,9 @@ pub mod pipeline {
                     tracing::warn!(
                         task_id = %task.id,
                         error = %e,
-                        "branch_has_commits_beyond_main failed — assuming no changes"
+                        "branch_has_commits_beyond_main failed — assuming changes exist (fail-safe)"
                     );
-                    false
+                    true // fail-safe: don't discard work on git errors
                 }
             }
         };

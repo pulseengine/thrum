@@ -269,11 +269,20 @@ impl GitRepo {
 
     /// Detect the default branch (main or master).
     fn default_branch(&self) -> Result<String> {
-        if self.repo.find_branch("main", BranchType::Local).is_ok() {
-            Ok("main".to_string())
-        } else {
-            Ok("master".to_string())
+        // Check local branches first
+        for name in &["main", "master"] {
+            if self.repo.find_branch(name, BranchType::Local).is_ok() {
+                return Ok(name.to_string());
+            }
         }
+        // In worktrees, local branch lookup can fail. Check refs directly.
+        for name in &["main", "master"] {
+            let refname = format!("refs/heads/{name}");
+            if self.repo.revparse_single(&refname).is_ok() {
+                return Ok(name.to_string());
+            }
+        }
+        anyhow::bail!("no default branch found (tried main, master)")
     }
 
     /// Get or create a signature for commits.

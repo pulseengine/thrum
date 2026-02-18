@@ -79,7 +79,13 @@ impl Worktree {
         }
 
         let output = Command::new("git")
-            .args(["worktree", "add", worktree_path.to_str().unwrap(), branch])
+            .args([
+                "worktree",
+                "add",
+                "--force",
+                worktree_path.to_str().unwrap(),
+                branch,
+            ])
             .current_dir(repo_path)
             .env_remove("GIT_DIR")
             .env_remove("GIT_INDEX_FILE")
