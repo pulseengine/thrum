@@ -55,7 +55,7 @@ Failed gates cycle back to Implementing with retry count incremented (max 3). Re
 | Gate | Checks | Configurable |
 |------|--------|-------------|
 | Gate 1 (Quality) | `cargo fmt --check`, `cargo clippy`, `cargo test` | Yes, per-repo in `repos.toml` |
-| Gate 2 (Proof) | Z3 SMT solver, Rocq/Coq proofs | Yes, optional per-repo |
+| Gate 2 (Proof) | Z3 SMT solver, Rocq proofs | Yes, optional per-repo |
 | Gate 3 (Integration) | Cross-repo pipeline (configurable step sequence) | Yes, in `pipeline.toml` |
 
 ### Backend Swappability
