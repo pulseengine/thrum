@@ -6,7 +6,7 @@ name = "loom"
 ti = "Ti2"      # Optimizer can introduce semantic errors
 td = "Td2"      # Z3 verification + downstream synth checking = medium detection
 is_oss = true
-repository_url = "https://github.com/example/loom"
+repository_url = "https://github.com/pulseengine/loom"
 license = "Apache-2.0"
 
 [tools.classification]
@@ -28,7 +28,7 @@ name = "synth"
 ti = "Ti2"      # Code generator produces final binary
 td = "Td3"      # Last in chain, limited downstream detection
 is_oss = false
-repository_url = "https://github.com/example/synth"
+repository_url = "https://github.com/pulseengine/synth"
 license = "Proprietary"
 
 [tools.classification]
@@ -49,7 +49,7 @@ name = "meld"
 ti = "Ti2"      # Fuser transforms component structure
 td = "Td2"      # loom verification downstream = medium detection
 is_oss = true
-repository_url = "https://github.com/example/meld"
+repository_url = "https://github.com/pulseengine/meld"
 license = "Apache-2.0"
 
 [tools.classification]
